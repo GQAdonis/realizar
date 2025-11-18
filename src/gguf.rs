@@ -132,7 +132,7 @@ impl GGUFModel {
         let metadata = Self::parse_metadata(&mut cursor, header.metadata_count)?;
 
         // Parse tensor info
-        let tensors = Self::parse_tensor_info(&mut cursor, header.tensor_count);
+        let tensors = Self::parse_tensor_info(&mut cursor, header.tensor_count)?;
 
         Ok(Self {
             header,
@@ -416,10 +416,39 @@ impl GGUFModel {
         Ok(f64::from_le_bytes(buf))
     }
 
-    /// Parse tensor info (stub - to be implemented)
-    fn parse_tensor_info(_cursor: &mut Cursor<&[u8]>, _count: u64) -> Vec<TensorInfo> {
-        // TODO: Implement tensor info parsing
-        Vec::new()
+    /// Parse tensor info
+    fn parse_tensor_info(cursor: &mut Cursor<&[u8]>, count: u64) -> Result<Vec<TensorInfo>> {
+        let mut tensors = Vec::new();
+
+        for _ in 0..count {
+            // Read tensor name (string)
+            let name = Self::read_string(cursor)?;
+
+            // Read n_dims (u32)
+            let n_dims = Self::read_u32(cursor)?;
+
+            // Read dimensions array
+            let mut dims = Vec::with_capacity(n_dims as usize);
+            for _ in 0..n_dims {
+                dims.push(Self::read_u64(cursor)?);
+            }
+
+            // Read quantization type (u32)
+            let qtype = Self::read_u32(cursor)?;
+
+            // Read offset (u64)
+            let offset = Self::read_u64(cursor)?;
+
+            tensors.push(TensorInfo {
+                name,
+                n_dims,
+                dims,
+                qtype,
+                offset,
+            });
+        }
+
+        Ok(tensors)
     }
 }
 
@@ -578,5 +607,99 @@ mod tests {
             model.metadata.get("arch"),
             Some(&GGUFValue::String("llama".to_string()))
         );
+    }
+
+    #[test]
+    fn test_parse_single_tensor_info() {
+        // GGUF header with 1 tensor
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
+
+        // Tensor: name = "weight", n_dims = 2, dims = [128, 256], qtype = 0, offset = 1024
+        let name = "weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes()); // n_dims = 2
+        data.extend_from_slice(&128u64.to_le_bytes()); // dim[0] = 128
+        data.extend_from_slice(&256u64.to_le_bytes()); // dim[1] = 256
+        data.extend_from_slice(&0u32.to_le_bytes()); // qtype = 0
+        data.extend_from_slice(&1024u64.to_le_bytes()); // offset = 1024
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        assert_eq!(model.tensors.len(), 1);
+        let tensor = &model.tensors[0];
+        assert_eq!(tensor.name, "weight");
+        assert_eq!(tensor.n_dims, 2);
+        assert_eq!(tensor.dims, vec![128, 256]);
+        assert_eq!(tensor.qtype, 0);
+        assert_eq!(tensor.offset, 1024);
+    }
+
+    #[test]
+    fn test_parse_tensor_3d() {
+        // GGUF header with 1 tensor (3D)
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
+
+        // Tensor: name = "conv.weight", n_dims = 3, dims = [64, 64, 3]
+        let name = "conv.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes()); // n_dims = 3
+        data.extend_from_slice(&64u64.to_le_bytes());
+        data.extend_from_slice(&64u64.to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes()); // qtype = 2 (quantized)
+        data.extend_from_slice(&2048u64.to_le_bytes()); // offset = 2048
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        assert_eq!(model.tensors.len(), 1);
+        let tensor = &model.tensors[0];
+        assert_eq!(tensor.name, "conv.weight");
+        assert_eq!(tensor.n_dims, 3);
+        assert_eq!(tensor.dims, vec![64, 64, 3]);
+        assert_eq!(tensor.qtype, 2);
+        assert_eq!(tensor.offset, 2048);
+    }
+
+    #[test]
+    fn test_parse_metadata_and_tensors() {
+        // GGUF with both metadata and tensors
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
+        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
+
+        // Metadata: model.type = String("llama")
+        data.extend_from_slice(&10u64.to_le_bytes());
+        data.extend_from_slice(b"model.type");
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&5u64.to_le_bytes());
+        data.extend_from_slice(b"llama");
+
+        // Tensor: embedding
+        data.extend_from_slice(&9u64.to_le_bytes());
+        data.extend_from_slice(b"embedding");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&32000u64.to_le_bytes());
+        data.extend_from_slice(&4096u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        assert_eq!(model.metadata.len(), 1);
+        assert_eq!(model.tensors.len(), 1);
+        assert_eq!(
+            model.metadata.get("model.type"),
+            Some(&GGUFValue::String("llama".to_string()))
+        );
+        assert_eq!(model.tensors[0].name, "embedding");
     }
 }
