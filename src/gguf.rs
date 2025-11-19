@@ -280,10 +280,8 @@ impl GGUFModel {
                 let array_len = Self::read_u64(cursor)?;
 
                 // Safely convert array_len to usize
-                let len = usize::try_from(array_len).map_err(|_| {
-                    RealizarError::InvalidShape {
-                        reason: format!("Array length too large: {array_len}"),
-                    }
+                let len = usize::try_from(array_len).map_err(|_| RealizarError::InvalidShape {
+                    reason: format!("Array length too large: {array_len}"),
                 })?;
 
                 let mut elements = Vec::with_capacity(len);
@@ -291,7 +289,7 @@ impl GGUFModel {
                     elements.push(Self::read_value(cursor, element_type)?);
                 }
                 Ok(GGUFValue::Array(elements))
-            }
+            },
             10 => Ok(GGUFValue::UInt64(Self::read_u64(cursor)?)),
             11 => Ok(GGUFValue::Int64(Self::read_i64(cursor)?)),
             12 => Ok(GGUFValue::Float64(Self::read_f64(cursor)?)),
