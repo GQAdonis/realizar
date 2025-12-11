@@ -1459,14 +1459,30 @@ impl GGUFTransformer {
         let seq_len = input.len() / in_dim;
         let mut output = Vec::with_capacity(seq_len * out_dim);
 
+        // Get actual weight size for bounds checking
+        let actual_weight_size = weight.len();
+        let expected_weight_size = in_dim * out_dim;
+
+        // Determine if weights are transposed (common in some GGUF models)
+        let is_transposed = actual_weight_size == expected_weight_size;
+
         for s in 0..seq_len {
             let x_start = s * in_dim;
             for o in 0..out_dim {
                 let mut sum = 0.0f32;
                 for i in 0..in_dim {
-                    // Weight layout: [in_dim, out_dim] row-major
-                    // w[i][o] = weight[i * out_dim + o]
-                    sum += input[x_start + i] * weight[i * out_dim + o];
+                    let weight_idx = if is_transposed {
+                        // Standard layout: [in_dim, out_dim] row-major
+                        i * out_dim + o
+                    } else {
+                        // Alternate layout: [out_dim, in_dim] (transposed)
+                        o * in_dim + i
+                    };
+
+                    // Bounds check for safety
+                    if weight_idx < actual_weight_size {
+                        sum += input[x_start + i] * weight[weight_idx];
+                    }
                 }
                 output.push(sum);
             }
@@ -1617,12 +1633,36 @@ impl GGUFTransformer {
         let last_hidden_start = (seq_len - 1) * hidden_dim;
         let last_hidden = &normed[last_hidden_start..last_hidden_start + hidden_dim];
 
+        // Detect lm_head weight layout: could be [hidden_dim, vocab_size] or [vocab_size, hidden_dim]
+        let lm_head_size = self.lm_head_weight.len();
+        let expected_size = hidden_dim * self.config.vocab_size;
+
+        // Determine if weights are in standard layout [hidden_dim, vocab_size] (row-major)
+        // or transposed layout [vocab_size, hidden_dim]
+        // Standard: index = i * vocab_size + o
+        // Transposed: index = o * hidden_dim + i
+        let use_transposed = lm_head_size == expected_size;
+
         let mut logits = Vec::with_capacity(self.config.vocab_size);
         for o in 0..self.config.vocab_size {
             let sum: f32 = last_hidden
                 .iter()
                 .enumerate()
-                .map(|(i, &h)| h * self.lm_head_weight[i * self.config.vocab_size + o])
+                .map(|(i, &h)| {
+                    let idx = if use_transposed {
+                        // Transposed layout: [vocab_size, hidden_dim]
+                        o * hidden_dim + i
+                    } else {
+                        // Standard layout: [hidden_dim, vocab_size]
+                        i * self.config.vocab_size + o
+                    };
+                    // Bounds check for safety
+                    if idx < lm_head_size {
+                        h * self.lm_head_weight[idx]
+                    } else {
+                        0.0
+                    }
+                })
                 .sum();
             let final_val = if let Some(ref bias) = self.lm_head_bias {
                 sum + bias[o]
