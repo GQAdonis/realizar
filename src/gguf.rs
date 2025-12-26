@@ -1878,6 +1878,10 @@ pub struct QuantizedGGUFTransformerLayer {
     pub ffn_down_weight: QuantizedTensorRef,
     /// FFN down bias (optional, f32)
     pub ffn_down_bias: Option<Vec<f32>>,
+    /// FFN gate projection (quantized, SwiGLU models like LLaMA)
+    pub ffn_gate_weight: Option<QuantizedTensorRef>,
+    /// FFN gate bias (optional, f32)
+    pub ffn_gate_bias: Option<Vec<f32>>,
 }
 
 /// Quantized GGUF Transformer for fused inference
@@ -2115,6 +2119,13 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             .get_tensor_f32(&format!("{}.ffn_down.bias", prefix), data)
             .ok();
 
+        // FFN gate - SwiGLU models like LLaMA have this
+        let ffn_gate_weight =
+            Self::get_tensor_ref(model, data, &format!("{}.ffn_gate.weight", prefix)).ok();
+        let ffn_gate_bias = model
+            .get_tensor_f32(&format!("{}.ffn_gate.bias", prefix), data)
+            .ok();
+
         Ok(QuantizedGGUFTransformerLayer {
             attn_norm_weight,
             attn_norm_bias,
@@ -2126,6 +2137,8 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             ffn_up_bias,
             ffn_down_weight,
             ffn_down_bias,
+            ffn_gate_weight,
+            ffn_gate_bias,
         })
     }
 
@@ -2708,6 +2721,10 @@ pub struct OwnedQuantizedLayer {
     pub ffn_down_weight: OwnedQuantizedTensor,
     /// FFN down bias (optional)
     pub ffn_down_bias: Option<Vec<f32>>,
+    /// FFN gate projection weights (SwiGLU models like LLaMA)
+    pub ffn_gate_weight: Option<OwnedQuantizedTensor>,
+    /// FFN gate bias (optional)
+    pub ffn_gate_bias: Option<Vec<f32>>,
 }
 
 impl OwnedQuantizedLayer {
@@ -2751,6 +2768,16 @@ impl OwnedQuantizedLayer {
                 hidden_dim,
             ),
             ffn_down_bias: layer.ffn_down_bias.clone(),
+            // FFN gate: [hidden_dim] -> [intermediate_dim] (SwiGLU models)
+            ffn_gate_weight: layer.ffn_gate_weight.as_ref().map(|gate_ref| {
+                OwnedQuantizedTensor::from_ref_with_dims(
+                    gate_ref,
+                    data,
+                    hidden_dim,
+                    intermediate_dim,
+                )
+            }),
+            ffn_gate_bias: layer.ffn_gate_bias.clone(),
         }
     }
 }
@@ -8355,6 +8382,14 @@ impl OwnedQuantizedModel {
         }
     }
 
+    /// Apply SiLU (Sigmoid Linear Unit) activation for SwiGLU FFN
+    /// SiLU(x) = x * sigmoid(x)
+    fn silu(&self, input: &mut [f32]) {
+        for x in input.iter_mut() {
+            *x = *x * (1.0 / (1.0 + (-*x).exp()));
+        }
+    }
+
     /// Apply RoPE (Rotary Position Embeddings) to Q or K vectors (IMP-101a)
     ///
     /// RoPE encodes position by rotating pairs of dimensions.
@@ -8568,17 +8603,41 @@ impl OwnedQuantizedModel {
                 hidden[i] += attn_output[i];
             }
 
-            // 2f. FFN up projection with FUSED ops
-            let mut ffn_hidden = self.fused_matmul(&hidden, &layer.ffn_up_weight)?;
-            if let Some(ref bias) = layer.ffn_up_bias {
-                self.add_bias(&mut ffn_hidden, bias);
-            }
+            // 2f. FFN with SwiGLU or GELU activation
+            let ffn_activated = if let Some(ref gate_weight) = layer.ffn_gate_weight {
+                // SwiGLU path (LLaMA, TinyLlama, Mistral, etc.)
+                // output = down(gate(x) * silu(up(x)))
+                let mut ffn_up = self.fused_matmul(&hidden, &layer.ffn_up_weight)?;
+                if let Some(ref bias) = layer.ffn_up_bias {
+                    self.add_bias(&mut ffn_up, bias);
+                }
 
-            // GELU activation
-            self.gelu(&mut ffn_hidden);
+                let mut ffn_gate = self.fused_matmul(&hidden, gate_weight)?;
+                if let Some(ref bias) = layer.ffn_gate_bias {
+                    self.add_bias(&mut ffn_gate, bias);
+                }
+
+                // SiLU activation on up projection
+                self.silu(&mut ffn_up);
+
+                // Element-wise multiply: gate * silu(up)
+                for i in 0..ffn_up.len() {
+                    ffn_up[i] *= ffn_gate[i];
+                }
+
+                ffn_up
+            } else {
+                // GELU path (phi-2, GPT-2, etc.)
+                let mut ffn_hidden = self.fused_matmul(&hidden, &layer.ffn_up_weight)?;
+                if let Some(ref bias) = layer.ffn_up_bias {
+                    self.add_bias(&mut ffn_hidden, bias);
+                }
+                self.gelu(&mut ffn_hidden);
+                ffn_hidden
+            };
 
             // 2g. FFN down projection with FUSED ops
-            let mut ffn_output = self.fused_matmul(&ffn_hidden, &layer.ffn_down_weight)?;
+            let mut ffn_output = self.fused_matmul(&ffn_activated, &layer.ffn_down_weight)?;
             if let Some(ref bias) = layer.ffn_down_bias {
                 self.add_bias(&mut ffn_output, bias);
             }
