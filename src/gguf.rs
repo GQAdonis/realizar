@@ -814,8 +814,9 @@ impl GGUFModel {
                 // Q4_0 quantized data
                 use crate::quantize::dequantize_q4_0;
 
-                // Q4_0 block size: 20 bytes (4 for scale + 16 for quants)
-                const BLOCK_BYTES: usize = 20;
+                // Q4_0 block: 32 elements
+                // Layout: 1×f16 scale (2 bytes) + 16 bytes (32×4-bit values) = 18 bytes
+                const BLOCK_BYTES: usize = 18;
                 const BLOCK_SIZE: usize = 32;
 
                 let num_blocks = size.div_ceil(BLOCK_SIZE);
@@ -1810,6 +1811,48 @@ pub struct QuantizedTensorRef {
     pub qtype: u32,
 }
 
+/// QKV weight storage - supports both fused (phi-2) and separate (llama) formats
+///
+/// Five Whys Root Cause Fix: TinyLlama and other LLaMA-style models use separate
+/// Q, K, V tensors while phi-2 style models use fused QKV. This enum supports both.
+#[derive(Clone)]
+pub enum QKVWeights {
+    /// Fused QKV tensor (phi-2 style): single [hidden_dim, 3*hidden_dim] tensor
+    Fused(QuantizedTensorRef),
+    /// Separate Q, K, V tensors (llama style): three separate tensors
+    Separate {
+        /// Query projection [hidden_dim, hidden_dim]
+        q: QuantizedTensorRef,
+        /// Key projection [hidden_dim, kv_dim] (may differ for GQA)
+        k: QuantizedTensorRef,
+        /// Value projection [hidden_dim, kv_dim]
+        v: QuantizedTensorRef,
+    },
+}
+
+impl QKVWeights {
+    /// Calculate the output dimension per position (q_dim + k_dim + v_dim)
+    pub fn out_dim(&self, hidden_dim: usize) -> usize {
+        match self {
+            Self::Fused(ref weight) => weight.num_elements / hidden_dim,
+            Self::Separate { ref q, ref k, ref v } => {
+                let q_dim = q.num_elements / hidden_dim;
+                let k_dim = k.num_elements / hidden_dim;
+                let v_dim = v.num_elements / hidden_dim;
+                q_dim + k_dim + v_dim
+            }
+        }
+    }
+
+    /// Get the Q dimension (query projection output dimension)
+    pub fn q_dim(&self, hidden_dim: usize) -> usize {
+        match self {
+            Self::Fused(ref weight) => weight.num_elements / hidden_dim / 3,
+            Self::Separate { ref q, .. } => q.num_elements / hidden_dim,
+        }
+    }
+}
+
 /// Quantized transformer layer weights (stored as byte references)
 ///
 /// Unlike `GGUFTransformerLayer` which stores dequantized Vec<f32>,
@@ -1819,8 +1862,8 @@ pub struct QuantizedGGUFTransformerLayer {
     pub attn_norm_weight: Vec<f32>,
     /// Attention norm bias (optional)
     pub attn_norm_bias: Option<Vec<f32>>,
-    /// QKV projection weights (quantized)
-    pub qkv_weight: QuantizedTensorRef,
+    /// QKV projection weights (quantized) - supports fused or separate
+    pub qkv_weight: QKVWeights,
     /// QKV bias (optional, f32)
     pub qkv_bias: Option<Vec<f32>>,
     /// Attention output projection (quantized)
@@ -1937,8 +1980,10 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         let byte_size = match tensor.qtype {
             GGUF_TYPE_F32 => num_elements * 4,
             GGUF_TYPE_Q4_0 => {
+                // Q4_0: 32 elements per block
+                // Layout: 1×f16 scale (2 bytes) + 16 bytes (32×4-bit values) = 18 bytes
                 const BLOCK_SIZE: usize = 32;
-                const BLOCK_BYTES: usize = 20;
+                const BLOCK_BYTES: usize = 18;
                 let num_blocks = num_elements.div_ceil(BLOCK_SIZE);
                 num_blocks * BLOCK_BYTES
             },
@@ -2011,10 +2056,45 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             .ok();
 
         // QKV - large, keep quantized
-        let qkv_weight = Self::get_tensor_ref(model, data, &format!("{}.attn_qkv.weight", prefix))?;
-        let qkv_bias = model
-            .get_tensor_f32(&format!("{}.attn_qkv.bias", prefix), data)
-            .ok();
+        // Try fused first (phi-2 style), fall back to separate (llama style)
+        let (qkv_weight, qkv_bias) = if let Ok(fused) =
+            Self::get_tensor_ref(model, data, &format!("{}.attn_qkv.weight", prefix))
+        {
+            // phi-2 style: fused QKV tensor
+            let bias = model
+                .get_tensor_f32(&format!("{}.attn_qkv.bias", prefix), data)
+                .ok();
+            (QKVWeights::Fused(fused), bias)
+        } else {
+            // llama style: separate Q, K, V tensors
+            let q = Self::get_tensor_ref(model, data, &format!("{}.attn_q.weight", prefix))?;
+            let k = Self::get_tensor_ref(model, data, &format!("{}.attn_k.weight", prefix))?;
+            let v = Self::get_tensor_ref(model, data, &format!("{}.attn_v.weight", prefix))?;
+
+            // Try to get biases (llama usually doesn't have them)
+            let q_bias = model
+                .get_tensor_f32(&format!("{}.attn_q.bias", prefix), data)
+                .ok();
+            let k_bias = model
+                .get_tensor_f32(&format!("{}.attn_k.bias", prefix), data)
+                .ok();
+            let v_bias = model
+                .get_tensor_f32(&format!("{}.attn_v.bias", prefix), data)
+                .ok();
+
+            let bias = match (q_bias, k_bias, v_bias) {
+                (Some(qb), Some(kb), Some(vb)) => {
+                    let mut combined = Vec::with_capacity(qb.len() + kb.len() + vb.len());
+                    combined.extend_from_slice(&qb);
+                    combined.extend_from_slice(&kb);
+                    combined.extend_from_slice(&vb);
+                    Some(combined)
+                }
+                _ => None,
+            };
+
+            (QKVWeights::Separate { q, k, v }, bias)
+        };
 
         // Attention output - large, keep quantized
         let attn_output_weight =
@@ -2060,7 +2140,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
     /// Performs dequantization inline with dot product - NO intermediate buffer.
     /// Uses rayon parallel iterators per Blumofe & Leiserson [6] for multi-core acceleration.
     ///
-    /// Supports Q4_K, Q5_K, and Q6_K with fused operations.
+    /// Supports Q4_K, Q5_K, Q6_K with fused operations, and Q4_0/Q8_0 via dequantization.
     fn fused_matmul(
         &self,
         input: &[f32],
@@ -2069,11 +2149,38 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         out_dim: usize,
     ) -> Result<Vec<f32>> {
         use crate::quantize::{
+            dequantize_q4_0, dequantize_q8_0,
             fused_q4k_parallel_matvec, fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
         let seq_len = input.len() / in_dim;
         let weight_data = self.tensor_data(weight_ref);
+
+        // For Q4_0 and Q8_0, use dequantize + matmul fallback
+        // These don't have fused implementations yet
+        if weight_ref.qtype == GGUF_TYPE_Q4_0 || weight_ref.qtype == GGUF_TYPE_Q8_0 {
+            let weights_f32 = if weight_ref.qtype == GGUF_TYPE_Q4_0 {
+                dequantize_q4_0(weight_data)?
+            } else {
+                dequantize_q8_0(weight_data)?
+            };
+
+            // Standard matmul: output[s, o] = sum_i(input[s, i] * weights[o, i])
+            // Weight layout: [out_dim, in_dim] row-major
+            let mut output = vec![0.0f32; seq_len * out_dim];
+            for s in 0..seq_len {
+                for o in 0..out_dim {
+                    let mut sum = 0.0f32;
+                    let x = &input[s * in_dim..(s + 1) * in_dim];
+                    let w_row = &weights_f32[o * in_dim..(o + 1) * in_dim];
+                    for i in 0..in_dim {
+                        sum += x[i] * w_row[i];
+                    }
+                    output[s * out_dim + o] = sum;
+                }
+            }
+            return Ok(output);
+        }
 
         // For sequence length > 1, process each position
         if seq_len > 1 {
@@ -2088,7 +2195,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                         return Err(RealizarError::UnsupportedOperation {
                             operation: "fused_matmul".to_string(),
                             reason: format!(
-                                "Fused matmul only supports Q4_K/Q5_K/Q6_K, got type {}",
+                                "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
                                 weight_ref.qtype
                             ),
                         });
@@ -2106,10 +2213,54 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 _ => Err(RealizarError::UnsupportedOperation {
                     operation: "fused_matmul".to_string(),
                     reason: format!(
-                        "Fused matmul only supports Q4_K/Q5_K/Q6_K, got type {}",
+                        "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
                         weight_ref.qtype
                     ),
                 }),
+            }
+        }
+    }
+
+    /// QKV projection supporting both fused (phi-2) and separate (llama) formats
+    ///
+    /// Five Whys Root Cause Fix: This method handles both tensor layouts
+    /// transparently, allowing TinyLlama and other LLaMA-style models to work.
+    fn qkv_matmul(
+        &self,
+        input: &[f32],
+        qkv: &QKVWeights,
+        hidden_dim: usize,
+    ) -> Result<Vec<f32>> {
+        match qkv {
+            QKVWeights::Fused(ref weight) => {
+                let qkv_dim = 3 * hidden_dim;
+                self.fused_matmul(input, weight, hidden_dim, qkv_dim)
+            }
+            QKVWeights::Separate { ref q, ref k, ref v } => {
+                // Compute Q, K, V separately then concatenate
+                let seq_len = input.len() / hidden_dim;
+
+                // Q projection: [seq_len, hidden_dim] @ [hidden_dim, q_dim]
+                let q_dim = q.num_elements / hidden_dim;
+                let q_out = self.fused_matmul(input, q, hidden_dim, q_dim)?;
+
+                // K projection: [seq_len, hidden_dim] @ [hidden_dim, k_dim]
+                let k_dim = k.num_elements / hidden_dim;
+                let k_out = self.fused_matmul(input, k, hidden_dim, k_dim)?;
+
+                // V projection: [seq_len, hidden_dim] @ [hidden_dim, v_dim]
+                let v_dim = v.num_elements / hidden_dim;
+                let v_out = self.fused_matmul(input, v, hidden_dim, v_dim)?;
+
+                // Interleave Q, K, V for each position: [q0, k0, v0, q1, k1, v1, ...]
+                let qkv_dim = q_dim + k_dim + v_dim;
+                let mut output = Vec::with_capacity(seq_len * qkv_dim);
+                for s in 0..seq_len {
+                    output.extend_from_slice(&q_out[s * q_dim..(s + 1) * q_dim]);
+                    output.extend_from_slice(&k_out[s * k_dim..(s + 1) * k_dim]);
+                    output.extend_from_slice(&v_out[s * v_dim..(s + 1) * v_dim]);
+                }
+                Ok(output)
             }
         }
     }
@@ -2224,25 +2375,31 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             );
 
             // 2b. QKV projection with FUSED dequant+dot
-            let qkv_dim = 3 * hidden_dim;
-            let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight, hidden_dim, qkv_dim)?;
+            // Note: qkv_dim may differ from 3*hidden_dim for GQA models
+            let qkv_dim = layer.qkv_weight.out_dim(hidden_dim);
+            let q_dim = layer.qkv_weight.q_dim(hidden_dim);
+            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight, hidden_dim)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.add_bias(&mut qkv, bias);
             }
 
             // 2c. Simplified attention (real impl would have RoPE, causal mask, etc.)
+            // For now, extract just Q as attention output (simplified placeholder)
+            // In full implementation, this would compute attention scores and weighted V
             let seq_len = token_ids.len();
-            let mut attn_out = Vec::with_capacity(seq_len * hidden_dim);
+            let mut attn_out = Vec::with_capacity(seq_len * q_dim);
             for s in 0..seq_len {
                 let qkv_start = s * qkv_dim;
-                for h in 0..hidden_dim {
+                // Extract Q portion (first q_dim elements of each position's QKV)
+                for h in 0..q_dim {
                     attn_out.push(qkv[qkv_start + h]);
                 }
             }
 
             // 2d. Attention output projection with FUSED dequant+dot
+            // Input is q_dim (attention output), projects back to hidden_dim
             let mut attn_output =
-                self.fused_matmul(&attn_out, &layer.attn_output_weight, hidden_dim, hidden_dim)?;
+                self.fused_matmul(&attn_out, &layer.attn_output_weight, q_dim, hidden_dim)?;
             if let Some(ref bias) = layer.attn_output_bias {
                 self.add_bias(&mut attn_output, bias);
             }
@@ -2441,6 +2598,65 @@ pub struct OwnedQuantizedTensor {
     pub qtype: u32,
 }
 
+/// Owned QKV weight storage - supports both fused (phi-2) and separate (llama) formats
+#[derive(Debug, Clone)]
+pub enum OwnedQKVWeights {
+    /// Fused QKV tensor (phi-2 style)
+    Fused(OwnedQuantizedTensor),
+    /// Separate Q, K, V tensors (llama style)
+    Separate {
+        /// Query projection weights
+        q: OwnedQuantizedTensor,
+        /// Key projection weights
+        k: OwnedQuantizedTensor,
+        /// Value projection weights
+        v: OwnedQuantizedTensor,
+    },
+}
+
+impl OwnedQKVWeights {
+    /// Create from borrowed QKVWeights
+    #[must_use]
+    pub fn from_borrowed(qkv: &QKVWeights, data: &[u8], hidden_dim: usize) -> Self {
+        match qkv {
+            QKVWeights::Fused(ref tensor) => {
+                let qkv_dim = 3 * hidden_dim;
+                OwnedQKVWeights::Fused(OwnedQuantizedTensor::from_ref_with_dims(
+                    tensor, data, hidden_dim, qkv_dim,
+                ))
+            }
+            QKVWeights::Separate { ref q, ref k, ref v } => {
+                let q_dim = q.num_elements / hidden_dim;
+                let k_dim = k.num_elements / hidden_dim;
+                let v_dim = v.num_elements / hidden_dim;
+                OwnedQKVWeights::Separate {
+                    q: OwnedQuantizedTensor::from_ref_with_dims(q, data, hidden_dim, q_dim),
+                    k: OwnedQuantizedTensor::from_ref_with_dims(k, data, hidden_dim, k_dim),
+                    v: OwnedQuantizedTensor::from_ref_with_dims(v, data, hidden_dim, v_dim),
+                }
+            }
+        }
+    }
+
+    /// Get the output dimension (total Q+K+V dim)
+    #[must_use]
+    pub fn out_dim(&self) -> usize {
+        match self {
+            OwnedQKVWeights::Fused(t) => t.out_dim,
+            OwnedQKVWeights::Separate { q, k, v } => q.out_dim + k.out_dim + v.out_dim,
+        }
+    }
+
+    /// Get the Q dimension (query projection output dimension)
+    #[must_use]
+    pub fn q_dim(&self) -> usize {
+        match self {
+            OwnedQKVWeights::Fused(t) => t.out_dim / 3,
+            OwnedQKVWeights::Separate { q, .. } => q.out_dim,
+        }
+    }
+}
+
 impl OwnedQuantizedTensor {
     /// Create owned tensor from a tensor reference and data slice with explicit dimensions
     #[must_use]
@@ -2476,8 +2692,8 @@ pub struct OwnedQuantizedLayer {
     pub attn_norm_weight: Vec<f32>,
     /// Attention norm bias (optional)
     pub attn_norm_bias: Option<Vec<f32>>,
-    /// QKV projection weights (owned quantized data)
-    pub qkv_weight: OwnedQuantizedTensor,
+    /// QKV projection weights (owned quantized data) - supports fused or separate
+    pub qkv_weight: OwnedQKVWeights,
     /// QKV bias (optional, f32)
     pub qkv_bias: Option<Vec<f32>>,
     /// Attention output projection weights
@@ -2504,18 +2720,12 @@ impl OwnedQuantizedLayer {
     ) -> Self {
         let hidden_dim = config.hidden_dim;
         let intermediate_dim = config.intermediate_dim;
-        let qkv_dim = 3 * hidden_dim; // Q, K, V concatenated
 
         Self {
             attn_norm_weight: layer.attn_norm_weight.clone(),
             attn_norm_bias: layer.attn_norm_bias.clone(),
-            // QKV: [hidden_dim] -> [3 * hidden_dim]
-            qkv_weight: OwnedQuantizedTensor::from_ref_with_dims(
-                &layer.qkv_weight,
-                data,
-                hidden_dim,
-                qkv_dim,
-            ),
+            // QKV: supports both fused and separate formats
+            qkv_weight: OwnedQKVWeights::from_borrowed(&layer.qkv_weight, data, hidden_dim),
             qkv_bias: layer.qkv_bias.clone(),
             // Attn output: [hidden_dim] -> [hidden_dim]
             attn_output_weight: OwnedQuantizedTensor::from_ref_with_dims(
@@ -2773,13 +2983,11 @@ impl OwnedQuantizedModelCached {
             );
 
             // PARITY-103: QKV projection preferring CUDA
-            let qkv_out_dim = layer.qkv_weight.out_dim;
-            let qkv = self.batch_matmul_gpu_prefer_cuda(
+            let qkv = self.batch_qkv_matmul_gpu(
                 &normed,
                 &layer.qkv_weight,
                 batch_size,
                 hidden_dim,
-                qkv_out_dim,
             )?;
 
             // Split Q, K, V
@@ -2977,6 +3185,40 @@ impl OwnedQuantizedModelCached {
             out_dim,
             &mut scheduler,
         )
+    }
+
+    /// Batch QKV matmul for GPU paths - handles both fused and separate Q/K/V
+    ///
+    /// Five Whys Root Cause Fix: This method handles both tensor layouts for GPU batch ops
+    #[cfg(feature = "gpu")]
+    fn batch_qkv_matmul_gpu(
+        &self,
+        input: &[f32],
+        qkv: &OwnedQKVWeights,
+        batch_size: usize,
+        hidden_dim: usize,
+    ) -> Result<Vec<f32>> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => {
+                self.batch_matmul_gpu_prefer_cuda(input, weight, batch_size, hidden_dim, weight.out_dim)
+            }
+            OwnedQKVWeights::Separate { ref q, ref k, ref v } => {
+                // Compute Q, K, V separately then concatenate
+                let q_out = self.batch_matmul_gpu_prefer_cuda(input, q, batch_size, hidden_dim, q.out_dim)?;
+                let k_out = self.batch_matmul_gpu_prefer_cuda(input, k, batch_size, hidden_dim, k.out_dim)?;
+                let v_out = self.batch_matmul_gpu_prefer_cuda(input, v, batch_size, hidden_dim, v.out_dim)?;
+
+                // Interleave Q, K, V for each position in batch
+                let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
+                let mut output = Vec::with_capacity(batch_size * qkv_dim);
+                for b in 0..batch_size {
+                    output.extend_from_slice(&q_out[b * q.out_dim..(b + 1) * q.out_dim]);
+                    output.extend_from_slice(&k_out[b * k.out_dim..(b + 1) * k.out_dim]);
+                    output.extend_from_slice(&v_out[b * v.out_dim..(b + 1) * v.out_dim]);
+                }
+                Ok(output)
+            }
+        }
     }
 
     /// Batched causal attention with provided scheduler
@@ -5010,7 +5252,7 @@ impl OwnedQuantizedModelCachedSync {
         let layer = &self.model.layers[layer_idx];
 
         // Dequantize QKV weight for GPU GEMM
-        let qkv_weight = self.model.dequantize_weight(&layer.qkv_weight)?;
+        let qkv_weight = self.model.dequantize_qkv(&layer.qkv_weight)?;
 
         // PARITY-103: QKV projection preferring CUDA
         let mut qkv = self.batch_matmul_gpu_prefer_cuda(
@@ -5391,8 +5633,9 @@ impl OwnedQuantizedModelCachedSync {
                         let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
                         // Apply RoPE (position-dependent, must be per-prompt)
-                        self.model.apply_rope(&mut q, positions[prompt_idx]);
-                        self.model.apply_rope(&mut k, positions[prompt_idx]);
+                        // Note: Uses num_heads for both (non-GQA code path)
+                        self.model.apply_rope(&mut q, positions[prompt_idx], self.model.config.num_heads);
+                        self.model.apply_rope(&mut k, positions[prompt_idx], self.model.config.num_heads);
 
                         // Attention with KV cache (must be per-prompt, different caches)
                         // PARITY-027: Use FlashAttention for long sequences (O(N) memory)
@@ -5455,18 +5698,19 @@ impl OwnedQuantizedModelCachedSync {
                     );
 
                     // QKV projection
-                    let mut qkv = self.model.fused_matmul(&normed, &layer.qkv_weight)?;
+                    let mut qkv = self.model.qkv_matmul(&normed, &layer.qkv_weight)?;
                     if let Some(ref bias) = layer.qkv_bias {
                         self.model.add_bias(&mut qkv, bias);
                     }
 
                     // Extract Q, K, V and apply RoPE
+                    // Note: Uses num_heads for both (non-GQA code path)
                     let mut q = qkv[0..hidden_dim].to_vec();
                     let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
                     let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-                    self.model.apply_rope(&mut q, positions[prompt_idx]);
-                    self.model.apply_rope(&mut k, positions[prompt_idx]);
+                    self.model.apply_rope(&mut q, positions[prompt_idx], self.model.config.num_heads);
+                    self.model.apply_rope(&mut k, positions[prompt_idx], self.model.config.num_heads);
 
                     // Get cached K/V and compute attention
                     let k_cache = caches[prompt_idx].get_k(layer_idx);
@@ -7626,12 +7870,13 @@ impl OwnedQuantizedModel {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Fused matrix-vector multiply using Q4_K/Q5_K/Q6_K
+    /// Fused matrix-vector multiply using Q4_0/Q8_0/Q4_K/Q5_K/Q6_K
     ///
     /// PARITY-113: When CUDA is enabled, routes to CUDA GEMM kernel.
     /// Otherwise, uses CPU SIMD (AVX2/SSE).
     fn fused_matmul(&self, input: &[f32], weight: &OwnedQuantizedTensor) -> Result<Vec<f32>> {
         use crate::quantize::{
+            dequantize_q4_0, dequantize_q8_0,
             fused_q4k_parallel_matvec, fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
@@ -7820,6 +8065,31 @@ impl OwnedQuantizedModel {
             return Ok(output);
         }
 
+        // CPU path: For Q4_0 and Q8_0, use dequantize + matmul fallback
+        if weight.qtype == GGUF_TYPE_Q4_0 || weight.qtype == GGUF_TYPE_Q8_0 {
+            let weights_f32 = if weight.qtype == GGUF_TYPE_Q4_0 {
+                dequantize_q4_0(&weight.data)?
+            } else {
+                dequantize_q8_0(&weight.data)?
+            };
+
+            // Standard matmul: output[s, o] = sum_i(input[s, i] * weights[o, i])
+            // Weight layout: [out_dim, in_dim] row-major
+            let mut output = vec![0.0f32; seq_len * out_dim];
+            for s in 0..seq_len {
+                for o in 0..out_dim {
+                    let mut sum = 0.0f32;
+                    let x = &input[s * in_dim..(s + 1) * in_dim];
+                    let w_row = &weights_f32[o * in_dim..(o + 1) * in_dim];
+                    for i in 0..in_dim {
+                        sum += x[i] * w_row[i];
+                    }
+                    output[s * out_dim + o] = sum;
+                }
+            }
+            return Ok(output);
+        }
+
         // CPU path: Process each position in sequence
         if seq_len > 1 {
             let mut output = Vec::with_capacity(seq_len * out_dim);
@@ -7833,7 +8103,7 @@ impl OwnedQuantizedModel {
                         return Err(RealizarError::UnsupportedOperation {
                             operation: "owned_fused_matmul".to_string(),
                             reason: format!(
-                                "Fused matmul only supports Q4_K/Q5_K/Q6_K, got type {}",
+                                "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
                                 weight.qtype
                             ),
                         });
@@ -7851,10 +8121,39 @@ impl OwnedQuantizedModel {
                 _ => Err(RealizarError::UnsupportedOperation {
                     operation: "owned_fused_matmul".to_string(),
                     reason: format!(
-                        "Fused matmul only supports Q4_K/Q5_K/Q6_K, got type {}",
+                        "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
                         weight.qtype
                     ),
                 }),
+            }
+        }
+    }
+
+    /// QKV projection supporting both fused (phi-2) and separate (llama) formats
+    ///
+    /// Five Whys Root Cause Fix: This method handles both tensor layouts
+    /// transparently, allowing TinyLlama and other LLaMA-style models to work.
+    pub fn qkv_matmul(&self, input: &[f32], qkv: &OwnedQKVWeights) -> Result<Vec<f32>> {
+        let hidden_dim = self.config.hidden_dim;
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => self.fused_matmul(input, weight),
+            OwnedQKVWeights::Separate { ref q, ref k, ref v } => {
+                // Compute Q, K, V separately then concatenate
+                let seq_len = input.len() / hidden_dim;
+
+                let q_out = self.fused_matmul(input, q)?;
+                let k_out = self.fused_matmul(input, k)?;
+                let v_out = self.fused_matmul(input, v)?;
+
+                // Interleave Q, K, V for each position
+                let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
+                let mut output = Vec::with_capacity(seq_len * qkv_dim);
+                for s in 0..seq_len {
+                    output.extend_from_slice(&q_out[s * q.out_dim..(s + 1) * q.out_dim]);
+                    output.extend_from_slice(&k_out[s * k.out_dim..(s + 1) * k.out_dim]);
+                    output.extend_from_slice(&v_out[s * v.out_dim..(s + 1) * v.out_dim]);
+                }
+                Ok(output)
             }
         }
     }
@@ -8060,13 +8359,20 @@ impl OwnedQuantizedModel {
     ///
     /// RoPE encodes position by rotating pairs of dimensions.
     /// Reference: Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding"
-    fn apply_rope(&self, x: &mut [f32], position: usize) {
-        let num_heads = self.config.num_heads;
-        let head_dim = self.config.hidden_dim / num_heads;
+    ///
+    /// # Arguments
+    /// * `x` - Vector to apply RoPE to [num_heads_in_x * head_dim]
+    /// * `position` - Position index for frequency calculation
+    /// * `num_heads_in_x` - Number of heads in x (num_heads for Q, num_kv_heads for K)
+    ///
+    /// # GQA Support
+    /// For GQA models, pass num_heads for Q vectors and num_kv_heads for K vectors.
+    fn apply_rope(&self, x: &mut [f32], position: usize, num_heads_in_x: usize) {
+        let head_dim = self.config.hidden_dim / self.config.num_heads;
         let half_dim = head_dim / 2;
         let theta = self.config.rope_theta;
 
-        for h in 0..num_heads {
+        for h in 0..num_heads_in_x {
             let head_start = h * head_dim;
 
             for i in 0..half_dim {
@@ -8093,33 +8399,49 @@ impl OwnedQuantizedModel {
     /// Computes: softmax(QK^T / sqrt(d_k)) * V with causal masking
     ///
     /// # Arguments
-    /// * `q` - Query vectors [seq_len, hidden_dim]
-    /// * `k` - Key vectors [seq_len, hidden_dim]
-    /// * `v` - Value vectors [seq_len, hidden_dim]
+    /// * `q` - Query vectors [seq_len, q_dim] where q_dim = num_heads * head_dim
+    /// * `k` - Key vectors [seq_len, kv_dim] where kv_dim = num_kv_heads * head_dim
+    /// * `v` - Value vectors [seq_len, kv_dim] where kv_dim = num_kv_heads * head_dim
     ///
     /// # Returns
-    /// Attention output [seq_len, hidden_dim]
+    /// Attention output [seq_len, q_dim] where q_dim = num_heads * head_dim
+    ///
+    /// # GQA (Grouped Query Attention) Support
+    /// For models where num_kv_heads < num_heads (e.g., TinyLlama: 4 vs 32),
+    /// multiple Q heads share the same K/V head. The group size is num_heads / num_kv_heads.
     fn causal_attention(&self, q: &[f32], k: &[f32], v: &[f32], seq_len: usize) -> Vec<f32> {
-        let hidden_dim = self.config.hidden_dim;
         let num_heads = self.config.num_heads;
-        let head_dim = hidden_dim / num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.hidden_dim / num_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let mut output = vec![0.0f32; seq_len * hidden_dim];
+        // GQA: multiple Q heads share each KV head
+        // group_size = num_heads / num_kv_heads (e.g., 32/4 = 8 for TinyLlama)
+        let group_size = num_heads / num_kv_heads;
 
-        // Process each head independently
+        // Q has num_heads heads, K/V have num_kv_heads heads
+        let q_dim = num_heads * head_dim; // e.g., 32 * 64 = 2048
+        let kv_dim = num_kv_heads * head_dim; // e.g., 4 * 64 = 256
+
+        let mut output = vec![0.0f32; seq_len * q_dim];
+
+        // Process each Q head independently
         for head in 0..num_heads {
-            let head_offset = head * head_dim;
+            // Map Q head to corresponding KV head (GQA grouping)
+            let kv_head = head / group_size;
+
+            let q_head_offset = head * head_dim;
+            let kv_head_offset = kv_head * head_dim;
 
             // Process each query position
             for i in 0..seq_len {
                 // Compute attention scores for this query against all keys up to position i (causal)
                 let mut scores = Vec::with_capacity(i + 1);
-                let q_start = i * hidden_dim + head_offset;
+                let q_start = i * q_dim + q_head_offset;
 
                 for j in 0..=i {
                     // Only attend to positions 0..=i (causal mask)
-                    let k_start = j * hidden_dim + head_offset;
+                    let k_start = j * kv_dim + kv_head_offset;
 
                     // Dot product Q[i] · K[j]
                     let mut score = 0.0f32;
@@ -8141,9 +8463,9 @@ impl OwnedQuantizedModel {
                 }
 
                 // Weighted sum of values
-                let out_start = i * hidden_dim + head_offset;
+                let out_start = i * q_dim + q_head_offset;
                 for (j, &weight) in scores.iter().enumerate() {
-                    let v_start = j * hidden_dim + head_offset;
+                    let v_start = j * kv_dim + kv_head_offset;
                     for d in 0..head_dim {
                         output[out_start + d] += weight * v[v_start + d];
                     }
@@ -8188,8 +8510,19 @@ impl OwnedQuantizedModel {
             );
 
             // 2b. QKV projection with FUSED dequant+dot (1.37x faster)
-            let qkv_dim = 3 * hidden_dim;
-            let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+            // Note: qkv_dim may differ from 3*hidden_dim for GQA models
+            let qkv_dim = layer.qkv_weight.out_dim();
+            let q_dim = layer.qkv_weight.q_dim();
+            // For GQA, k_dim and v_dim may be smaller than q_dim
+            let k_dim = match &layer.qkv_weight {
+                OwnedQKVWeights::Fused(_) => q_dim,
+                OwnedQKVWeights::Separate { k, .. } => k.out_dim,
+            };
+            let v_dim = match &layer.qkv_weight {
+                OwnedQKVWeights::Fused(_) => q_dim,
+                OwnedQKVWeights::Separate { v, .. } => v.out_dim,
+            };
+            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.add_bias(&mut qkv, bias);
             }
@@ -8198,21 +8531,22 @@ impl OwnedQuantizedModel {
             let seq_len = token_ids.len();
 
             // Extract Q, K, V and apply RoPE to Q and K
-            let mut q_all = Vec::with_capacity(seq_len * hidden_dim);
-            let mut k_all = Vec::with_capacity(seq_len * hidden_dim);
-            let mut v_all = Vec::with_capacity(seq_len * hidden_dim);
+            let mut q_all = Vec::with_capacity(seq_len * q_dim);
+            let mut k_all = Vec::with_capacity(seq_len * k_dim);
+            let mut v_all = Vec::with_capacity(seq_len * v_dim);
 
             for s in 0..seq_len {
                 let qkv_start = s * qkv_dim;
 
-                // Extract Q, K, V for this position
-                let mut q = qkv[qkv_start..qkv_start + hidden_dim].to_vec();
-                let mut k = qkv[qkv_start + hidden_dim..qkv_start + 2 * hidden_dim].to_vec();
-                let v = &qkv[qkv_start + 2 * hidden_dim..qkv_start + 3 * hidden_dim];
+                // Extract Q, K, V for this position (QKV layout: [Q..., K..., V...])
+                let mut q = qkv[qkv_start..qkv_start + q_dim].to_vec();
+                let mut k = qkv[qkv_start + q_dim..qkv_start + q_dim + k_dim].to_vec();
+                let v = &qkv[qkv_start + q_dim + k_dim..qkv_start + q_dim + k_dim + v_dim];
 
                 // Apply RoPE to Q and K (position-dependent rotation)
-                self.apply_rope(&mut q, s);
-                self.apply_rope(&mut k, s);
+                // GQA: Q has num_heads, K has num_kv_heads
+                self.apply_rope(&mut q, s, self.config.num_heads);
+                self.apply_rope(&mut k, s, self.config.num_kv_heads);
 
                 q_all.extend_from_slice(&q);
                 k_all.extend_from_slice(&k);
@@ -8223,6 +8557,7 @@ impl OwnedQuantizedModel {
             let attn_out = self.causal_attention(&q_all, &k_all, &v_all, seq_len);
 
             // 2d. Attention output projection with FUSED ops
+            // Input is q_dim (attention output), projects back to hidden_dim
             let mut attn_output = self.fused_matmul(&attn_out, &layer.attn_output_weight)?;
             if let Some(ref bias) = layer.attn_output_bias {
                 self.add_bias(&mut attn_output, bias);
@@ -9139,18 +9474,19 @@ impl OwnedQuantizedModel {
             );
 
             // 2b. QKV projection
-            let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.add_bias(&mut qkv, bias);
             }
 
             // 2c. Extract Q, K, V and apply RoPE
+            // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
             let mut q = qkv[0..hidden_dim].to_vec();
             let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
             let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-            self.apply_rope(&mut q, position);
-            self.apply_rope(&mut k, position);
+            self.apply_rope(&mut q, position, self.config.num_heads);
+            self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
 
             // 2d. Get cached K/V and compute attention
             let k_cache = cache.get_k(layer_idx);
@@ -9266,7 +9602,7 @@ impl OwnedQuantizedModel {
             #[cfg(feature = "cuda")]
             if cuda_enabled {
                 let start = std::time::Instant::now();
-                let qkv_result = self.fused_matmul(&normed, &layer.qkv_weight)?;
+                let qkv_result = self.qkv_matmul(&normed, &layer.qkv_weight)?;
                 metrics.record_gpu_dispatch();
                 metrics.record_gpu_latency(start.elapsed());
                 let mut qkv = qkv_result;
@@ -9275,12 +9611,13 @@ impl OwnedQuantizedModel {
                 }
 
                 // 2c. Extract Q, K, V and apply RoPE
+                // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
                 let mut q = qkv[0..hidden_dim].to_vec();
                 let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
                 let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-                self.apply_rope(&mut q, position);
-                self.apply_rope(&mut k, position);
+                self.apply_rope(&mut q, position, self.config.num_heads);
+                self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
 
                 // 2d. Get cached K/V and compute attention
                 let k_cache = cache.get_k(layer_idx);
@@ -9342,18 +9679,19 @@ impl OwnedQuantizedModel {
             }
 
             // CPU path (non-CUDA)
-            let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.add_bias(&mut qkv, bias);
             }
 
             // 2c. Extract Q, K, V and apply RoPE
+            // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
             let mut q = qkv[0..hidden_dim].to_vec();
             let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
             let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-            self.apply_rope(&mut q, position);
-            self.apply_rope(&mut k, position);
+            self.apply_rope(&mut q, position, self.config.num_heads);
+            self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
 
             // 2d. Get cached K/V and compute attention with adaptive dispatch
             let k_cache = cache.get_k(layer_idx);
@@ -9548,18 +9886,19 @@ impl OwnedQuantizedModel {
             );
 
             // 2b. QKV projection
-            let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.add_bias(&mut qkv, bias);
             }
 
             // 2c. Extract Q, K, V and apply RoPE
+            // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
             let mut q = qkv[0..hidden_dim].to_vec();
             let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
             let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-            self.apply_rope(&mut q, position);
-            self.apply_rope(&mut k, position);
+            self.apply_rope(&mut q, position, self.config.num_heads);
+            self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
 
             // 2d. Get cached K/V and compute attention (PARITY-005: contiguous access)
             let k_cache = cache.get_k(layer_idx);
@@ -9815,18 +10154,19 @@ impl OwnedQuantizedModel {
                 );
 
                 // 2b. QKV projection
-                let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+                let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
                 if let Some(ref bias) = layer.qkv_bias {
                     self.add_bias(&mut qkv, bias);
                 }
 
                 // 2c. Extract Q, K, V and apply RoPE
+                // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
                 let mut q = qkv[0..hidden_dim].to_vec();
                 let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
                 let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-                self.apply_rope(&mut q, pos);
-                self.apply_rope(&mut k, pos);
+                self.apply_rope(&mut q, pos, self.config.num_heads);
+                self.apply_rope(&mut k, pos, self.config.num_heads); // Same as Q for non-GQA
 
                 all_q.push(q);
                 all_k.push(k);
@@ -10481,18 +10821,19 @@ impl OwnedQuantizedModel {
                 );
 
                 // 2b. QKV projection
-                let mut qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+                let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
                 if let Some(ref bias) = layer.qkv_bias {
                     self.add_bias(&mut qkv, bias);
                 }
 
                 // 2c. Extract Q, K, V and apply RoPE
+                // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
                 let mut q = qkv[0..hidden_dim].to_vec();
                 let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
                 let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-                self.apply_rope(&mut q, position);
-                self.apply_rope(&mut k, position);
+                self.apply_rope(&mut q, position, self.config.num_heads);
+                self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
 
                 // 2d. Get cached K/V and compute attention
                 let k_cache = caches[req_idx].get_k(layer_idx);
@@ -10616,7 +10957,7 @@ impl OwnedQuantizedModel {
             );
 
             // QKV projection (batched)
-            let qkv = self.fused_matmul(&normed, &layer.qkv_weight)?;
+            let qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
 
             // Split Q, K, V for batch - simplified attention (no causal mask for batch)
             let qkv_dim = qkv.len() / batch_size;
@@ -10778,14 +11119,11 @@ impl OwnedQuantizedModel {
             );
 
             // QKV projection - use GPU for batch ops
-            // A: [batch_size, hidden_dim], B: [hidden_dim, 3*hidden_dim]
-            let qkv_out_dim = layer.qkv_weight.out_dim;
-            let qkv = self.batch_matmul_gpu(
+            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
                 &normed,
                 &layer.qkv_weight,
                 batch_size,
                 hidden_dim,
-                qkv_out_dim,
                 &mut scheduler,
             )?;
 
@@ -10931,13 +11269,11 @@ impl OwnedQuantizedModel {
             );
 
             // QKV projection - use GPU (this is required for Q, K, V split)
-            let qkv_out_dim = layer.qkv_weight.out_dim;
-            let qkv = self.batch_matmul_gpu(
+            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
                 &normed,
                 &layer.qkv_weight,
                 batch_size,
                 hidden_dim,
-                qkv_out_dim,
                 &mut scheduler,
             )?;
 
@@ -11063,6 +11399,41 @@ impl OwnedQuantizedModel {
         })
     }
 
+    /// Batch QKV matmul with GPU acceleration via HybridScheduler
+    ///
+    /// Five Whys Root Cause Fix: Handles both fused and separate Q/K/V formats
+    #[cfg(feature = "gpu")]
+    fn batch_qkv_matmul_gpu_with_scheduler(
+        &self,
+        input: &[f32],
+        qkv: &OwnedQKVWeights,
+        batch_size: usize,
+        hidden_dim: usize,
+        scheduler: &mut crate::gpu::HybridScheduler,
+    ) -> Result<Vec<f32>> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => {
+                self.batch_matmul_gpu(input, weight, batch_size, hidden_dim, weight.out_dim, scheduler)
+            }
+            OwnedQKVWeights::Separate { ref q, ref k, ref v } => {
+                // Compute Q, K, V separately then concatenate
+                let q_out = self.batch_matmul_gpu(input, q, batch_size, hidden_dim, q.out_dim, scheduler)?;
+                let k_out = self.batch_matmul_gpu(input, k, batch_size, hidden_dim, k.out_dim, scheduler)?;
+                let v_out = self.batch_matmul_gpu(input, v, batch_size, hidden_dim, v.out_dim, scheduler)?;
+
+                // Interleave Q, K, V for each position in batch
+                let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
+                let mut output = Vec::with_capacity(batch_size * qkv_dim);
+                for b in 0..batch_size {
+                    output.extend_from_slice(&q_out[b * q.out_dim..(b + 1) * q.out_dim]);
+                    output.extend_from_slice(&k_out[b * k.out_dim..(b + 1) * k.out_dim]);
+                    output.extend_from_slice(&v_out[b * v.out_dim..(b + 1) * v.out_dim]);
+                }
+                Ok(output)
+            }
+        }
+    }
+
     /// Dequantize a weight tensor to f32
     #[cfg(feature = "gpu")]
     fn dequantize_weight(&self, weight: &OwnedQuantizedTensor) -> Result<Vec<f32>> {
@@ -11119,6 +11490,28 @@ impl OwnedQuantizedModel {
                 }
                 Ok(output)
             },
+        }
+    }
+
+    /// Dequantize QKV weights - handles both fused and separate formats
+    ///
+    /// Five Whys Root Cause Fix: This method handles both tensor layouts for dequantization
+    #[cfg(feature = "gpu")]
+    pub fn dequantize_qkv(&self, qkv: &OwnedQKVWeights) -> Result<Vec<f32>> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => self.dequantize_weight(weight),
+            OwnedQKVWeights::Separate { ref q, ref k, ref v } => {
+                // Dequantize each separately and concatenate
+                let q_out = self.dequantize_weight(q)?;
+                let k_out = self.dequantize_weight(k)?;
+                let v_out = self.dequantize_weight(v)?;
+
+                let mut output = Vec::with_capacity(q_out.len() + k_out.len() + v_out.len());
+                output.extend_from_slice(&q_out);
+                output.extend_from_slice(&k_out);
+                output.extend_from_slice(&v_out);
+                Ok(output)
+            }
         }
     }
 
@@ -11614,13 +12007,11 @@ impl OwnedQuantizedModel {
             );
 
             // QKV projection - use GPU for batch ops
-            let qkv_out_dim = layer.qkv_weight.out_dim;
-            let qkv = self.batch_matmul_gpu(
+            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
                 &normed,
                 &layer.qkv_weight,
                 batch_size,
                 hidden_dim,
-                qkv_out_dim,
                 &mut scheduler,
             )?;
 
@@ -11763,13 +12154,11 @@ impl OwnedQuantizedModel {
             );
 
             // QKV projection - use GPU for batch ops
-            let qkv_out_dim = layer.qkv_weight.out_dim;
-            let qkv = self.batch_matmul_gpu(
+            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
                 &normed,
                 &layer.qkv_weight,
                 batch_size,
                 hidden_dim,
-                qkv_out_dim,
                 &mut scheduler,
             )?;
 
@@ -12309,7 +12698,7 @@ impl OwnedQuantizedModelCuda {
 
             // 2b. QKV projection (CPU - fused Q4_K for now)
             let qkv_dim = 3 * hidden_dim;
-            let mut qkv = self.model.fused_matmul(&normed, &layer.qkv_weight)?;
+            let mut qkv = self.model.qkv_matmul(&normed, &layer.qkv_weight)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.model.add_bias(&mut qkv, bias);
             }
@@ -12326,8 +12715,9 @@ impl OwnedQuantizedModelCuda {
                 let mut k = qkv[qkv_start + hidden_dim..qkv_start + 2 * hidden_dim].to_vec();
                 let v = &qkv[qkv_start + 2 * hidden_dim..qkv_start + 3 * hidden_dim];
 
-                self.model.apply_rope(&mut q, s);
-                self.model.apply_rope(&mut k, s);
+                // Note: Uses num_heads for both (non-GQA code path)
+                self.model.apply_rope(&mut q, s, self.model.config.num_heads);
+                self.model.apply_rope(&mut k, s, self.model.config.num_heads);
 
                 q_all.extend_from_slice(&q);
                 k_all.extend_from_slice(&k);
@@ -12512,18 +12902,19 @@ impl OwnedQuantizedModelCuda {
             // 2b. QKV projection (CPU - fused Q4_K)
             let mut qkv = self
                 .model
-                .fused_matmul(&normed, &self.model.layers[layer_idx].qkv_weight)?;
+                .qkv_matmul(&normed, &self.model.layers[layer_idx].qkv_weight)?;
             if let Some(ref bias) = self.model.layers[layer_idx].qkv_bias {
                 self.model.add_bias(&mut qkv, bias);
             }
 
             // 2c. Extract Q, K, V and apply RoPE
+            // Note: Uses num_heads for both (non-GQA code path)
             let mut q = qkv[0..hidden_dim].to_vec();
             let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
             let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-            self.model.apply_rope(&mut q, position);
-            self.model.apply_rope(&mut k, position);
+            self.model.apply_rope(&mut q, position, self.model.config.num_heads);
+            self.model.apply_rope(&mut k, position, self.model.config.num_heads);
 
             // 2d. Get cached K/V and compute attention
             let k_cache = cache.get_k(layer_idx);
@@ -12678,6 +13069,32 @@ impl OwnedQuantizedModelCuda {
         Ok(output)
     }
 
+    /// QKV matmul with CUDA - handles both fused and separate Q/K/V
+    ///
+    /// Five Whys Root Cause Fix: Supports TinyLlama and other LLaMA-style models
+    fn qkv_matmul_cuda(
+        &mut self,
+        input: &[f32],
+        qkv: &OwnedQKVWeights,
+    ) -> Result<Vec<f32>> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => self.fused_matmul_cuda(input, weight),
+            OwnedQKVWeights::Separate { ref q, ref k, ref v } => {
+                // Compute Q, K, V separately then concatenate
+                let q_out = self.fused_matmul_cuda(input, q)?;
+                let k_out = self.fused_matmul_cuda(input, k)?;
+                let v_out = self.fused_matmul_cuda(input, v)?;
+
+                // Concatenate Q, K, V
+                let mut output = Vec::with_capacity(q_out.len() + k_out.len() + v_out.len());
+                output.extend_from_slice(&q_out);
+                output.extend_from_slice(&k_out);
+                output.extend_from_slice(&v_out);
+                Ok(output)
+            }
+        }
+    }
+
     /// IMP-1010: Full GPU forward pass for single token with KV cache
     ///
     /// This method uses GPU acceleration for ALL matmul operations:
@@ -12710,10 +13127,7 @@ impl OwnedQuantizedModelCuda {
         for layer_idx in 0..num_layers {
             // Clone weights to avoid borrow conflicts with &mut self
             // IMP-1010: This is necessary because fused_matmul_cuda needs &mut self
-            let qkv_weight_data = self.model.layers[layer_idx].qkv_weight.data.clone();
-            let qkv_weight_in_dim = self.model.layers[layer_idx].qkv_weight.in_dim;
-            let qkv_weight_out_dim = self.model.layers[layer_idx].qkv_weight.out_dim;
-            let qkv_weight_qtype = self.model.layers[layer_idx].qkv_weight.qtype;
+            let qkv_weight = self.model.layers[layer_idx].qkv_weight.clone();
             let qkv_bias = self.model.layers[layer_idx].qkv_bias.clone();
             let attn_norm_weight = self.model.layers[layer_idx].attn_norm_weight.clone();
             let attn_norm_bias = self.model.layers[layer_idx].attn_norm_bias.clone();
@@ -12736,12 +13150,6 @@ impl OwnedQuantizedModelCuda {
             let ffn_down_bias = self.model.layers[layer_idx].ffn_down_bias.clone();
 
             // Reconstruct weight tensors
-            let qkv_weight = OwnedQuantizedTensor {
-                data: qkv_weight_data,
-                in_dim: qkv_weight_in_dim,
-                out_dim: qkv_weight_out_dim,
-                qtype: qkv_weight_qtype,
-            };
             let attn_output_weight = OwnedQuantizedTensor {
                 data: attn_output_weight_data,
                 in_dim: attn_output_weight_in_dim,
@@ -12767,18 +13175,19 @@ impl OwnedQuantizedModelCuda {
                     .layer_norm(&hidden, &attn_norm_weight, attn_norm_bias.as_deref(), eps);
 
             // 2b. QKV projection (GPU - IMP-1010)
-            let mut qkv = self.fused_matmul_cuda(&normed, &qkv_weight)?;
+            let mut qkv = self.qkv_matmul_cuda(&normed, &qkv_weight)?;
             if let Some(ref bias) = qkv_bias {
                 self.model.add_bias(&mut qkv, bias);
             }
 
             // 2c. Extract Q, K, V and apply RoPE
+            // Note: Uses num_heads for both (non-GQA code path)
             let mut q = qkv[0..hidden_dim].to_vec();
             let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
             let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
 
-            self.model.apply_rope(&mut q, position);
-            self.model.apply_rope(&mut k, position);
+            self.model.apply_rope(&mut q, position, self.model.config.num_heads);
+            self.model.apply_rope(&mut k, position, self.model.config.num_heads);
 
             // 2d. Get cached K/V and compute attention
             let k_cache = cache.get_k(layer_idx);
@@ -15264,13 +15673,14 @@ mod tests {
             data.push(0);
         }
 
-        // Add Q4_0 data: 2 blocks (20 bytes each)
-        // Block 1: scale = 1.0, quants = 16 bytes
-        data.extend_from_slice(&1.0f32.to_le_bytes());
+        // Add Q4_0 data: 2 blocks (18 bytes each)
+        // Q4_0 layout: 1×f16 scale (2 bytes) + 16 bytes (32×4-bit quants) = 18 bytes/block
+        // Block 1: scale = 1.0 as f16, quants = 16 bytes
+        data.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
         data.extend_from_slice(&[0x10; 16]); // 4-bit values
 
-        // Block 2: scale = 2.0, quants = 16 bytes
-        data.extend_from_slice(&2.0f32.to_le_bytes());
+        // Block 2: scale = 2.0 as f16, quants = 16 bytes
+        data.extend_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
         data.extend_from_slice(&[0x21; 16]);
 
         let model = GGUFModel::from_bytes(&data).unwrap();
