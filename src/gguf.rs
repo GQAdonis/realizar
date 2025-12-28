@@ -1200,12 +1200,7 @@ impl GGUFModel {
         if let Some(vocab) = self.vocabulary() {
             token_ids
                 .iter()
-                .map(|&id| {
-                    vocab
-                        .get(id as usize)
-                        .map(|s| s.as_str())
-                        .unwrap_or("�")
-                })
+                .map(|&id| vocab.get(id as usize).map_or("�", std::string::String::as_str))
                 .collect::<Vec<_>>()
                 .join("")
         } else {
@@ -1245,7 +1240,7 @@ impl GGUFModel {
                 if ch == ' ' {
                     result.push('▁');
                 } else {
-                    if !first && result.chars().last() != Some('▁') {
+                    if !first && !result.ends_with('▁') {
                         // This handles non-space chars normally
                     }
                     result.push(ch);
@@ -9066,6 +9061,202 @@ impl OwnedQuantizedModel {
         }
 
         probs.last().map_or(0, |(idx, _)| *idx as u32)
+    }
+
+    /// Forward pass with KV cache for efficient autoregressive decoding
+    ///
+    /// This method properly handles both architectures:
+    /// - LLaMA-style: RMSNorm, SwiGLU FFN, GQA attention
+    /// - phi-2 style: LayerNorm, GELU FFN, MHA attention
+    ///
+    /// Uses O(n) per-token cost instead of O(n²) by caching K/V.
+    ///
+    /// # Arguments
+    /// * `token_id` - Token to process
+    /// * `cache` - KV cache for all layers
+    /// * `position` - Position in sequence for RoPE
+    ///
+    /// # Returns
+    /// Logits for next token prediction [vocab_size]
+    pub fn forward_cached(
+        &self,
+        token_id: u32,
+        cache: &mut OwnedQuantizedKVCache,
+        position: usize,
+    ) -> Result<Vec<f32>> {
+        let hidden_dim = self.config.hidden_dim;
+
+        // Detect architecture: LLaMA uses RMSNorm (no bias) and SwiGLU (has gate weight)
+        let use_rmsnorm = self
+            .layers
+            .first()
+            .is_some_and(|l| l.ffn_gate_weight.is_some() && l.attn_norm_bias.is_none());
+
+        // 1. Token embedding lookup
+        let mut hidden = self.embed(&[token_id]);
+
+        // 2. Process through transformer layers
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // 2a. Attention layer norm (RMSNorm for LLaMA, LayerNorm for phi-2)
+            let normed = if use_rmsnorm {
+                self.rms_norm(&hidden, &layer.attn_norm_weight, self.config.eps)
+            } else {
+                self.layer_norm(
+                    &hidden,
+                    &layer.attn_norm_weight,
+                    layer.attn_norm_bias.as_deref(),
+                    self.config.eps,
+                )
+            };
+
+            // 2b. QKV projection
+            let _qkv_dim = layer.qkv_weight.out_dim();
+            let q_dim = layer.qkv_weight.q_dim();
+            let k_dim = match &layer.qkv_weight {
+                OwnedQKVWeights::Fused(_) => q_dim,
+                OwnedQKVWeights::Separate { k, .. } => k.out_dim,
+            };
+            let v_dim = match &layer.qkv_weight {
+                OwnedQKVWeights::Fused(_) => q_dim,
+                OwnedQKVWeights::Separate { v, .. } => v.out_dim,
+            };
+
+            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
+            if let Some(ref bias) = layer.qkv_bias {
+                self.add_bias(&mut qkv, bias);
+            }
+
+            // 2c. Extract Q, K, V and apply RoPE
+            let mut q = qkv[0..q_dim].to_vec();
+            let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
+            let v = qkv[q_dim + k_dim..q_dim + k_dim + v_dim].to_vec();
+
+            // Apply RoPE with correct head counts for GQA
+            self.apply_rope(&mut q, position, self.config.num_heads);
+            self.apply_rope(&mut k, position, self.config.num_kv_heads);
+
+            // 2d. Compute attention using cached K/V
+            let k_cache = cache.get_k(layer_idx);
+            let v_cache = cache.get_v(layer_idx);
+
+            let attn_out = if k_cache.is_empty() {
+                // First token - just use V directly (self-attention with single token)
+                // Expand V if GQA (num_kv_heads < num_heads)
+                if self.config.num_kv_heads < self.config.num_heads {
+                    let head_dim = hidden_dim / self.config.num_heads;
+                    let group_size = self.config.num_heads / self.config.num_kv_heads;
+                    (0..self.config.num_heads)
+                        .flat_map(|h| {
+                            let kv_head = h / group_size;
+                            let start = kv_head * head_dim;
+                            v[start..start + head_dim].iter().copied()
+                        })
+                        .collect()
+                } else {
+                    v.clone()
+                }
+            } else {
+                // Use cached K/V for attention with GQA support
+                self.attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v)
+            };
+
+            // 2e. Store K and V in cache (store original size, not expanded)
+            cache.append(layer_idx, &k, &v);
+
+            // 2f. Attention output projection
+            let mut attn_output = self.fused_matmul(&attn_out, &layer.attn_output_weight)?;
+            if let Some(ref bias) = layer.attn_output_bias {
+                self.add_bias(&mut attn_output, bias);
+            }
+
+            // 2g. Residual connection
+            for i in 0..hidden_dim {
+                hidden[i] += attn_output[i];
+            }
+
+            // 2h. Pre-FFN layer norm (LLaMA has separate ffn_norm)
+            let ffn_input = if let Some(ref ffn_norm) = layer.ffn_norm_weight {
+                if use_rmsnorm {
+                    self.rms_norm(&hidden, ffn_norm, self.config.eps)
+                } else {
+                    self.layer_norm(
+                        &hidden,
+                        ffn_norm,
+                        layer.ffn_norm_bias.as_deref(),
+                        self.config.eps,
+                    )
+                }
+            } else {
+                hidden.clone()
+            };
+
+            // 2i. FFN with SwiGLU or GELU
+            let ffn_output = if let Some(ref gate_weight) = layer.ffn_gate_weight {
+                // SwiGLU path (LLaMA)
+                let mut ffn_up = self.fused_matmul(&ffn_input, &layer.ffn_up_weight)?;
+                if let Some(ref bias) = layer.ffn_up_bias {
+                    self.add_bias(&mut ffn_up, bias);
+                }
+
+                let mut ffn_gate = self.fused_matmul(&ffn_input, gate_weight)?;
+                if let Some(ref bias) = layer.ffn_gate_bias {
+                    self.add_bias(&mut ffn_gate, bias);
+                }
+
+                // SiLU on gate, then multiply with up
+                self.silu(&mut ffn_gate);
+                for i in 0..ffn_gate.len() {
+                    ffn_gate[i] *= ffn_up[i];
+                }
+
+                let mut output = self.fused_matmul(&ffn_gate, &layer.ffn_down_weight)?;
+                if let Some(ref bias) = layer.ffn_down_bias {
+                    self.add_bias(&mut output, bias);
+                }
+                output
+            } else {
+                // GELU path (phi-2)
+                let mut ffn_hidden = self.fused_matmul(&ffn_input, &layer.ffn_up_weight)?;
+                if let Some(ref bias) = layer.ffn_up_bias {
+                    self.add_bias(&mut ffn_hidden, bias);
+                }
+                self.gelu(&mut ffn_hidden);
+
+                let mut output = self.fused_matmul(&ffn_hidden, &layer.ffn_down_weight)?;
+                if let Some(ref bias) = layer.ffn_down_bias {
+                    self.add_bias(&mut output, bias);
+                }
+                output
+            };
+
+            // 2j. Residual connection
+            for i in 0..hidden_dim {
+                hidden[i] += ffn_output[i];
+            }
+        }
+
+        // Advance cache position
+        cache.advance();
+
+        // 3. Final layer norm
+        let normed = if use_rmsnorm {
+            self.rms_norm(&hidden, &self.output_norm_weight, self.config.eps)
+        } else {
+            self.layer_norm(
+                &hidden,
+                &self.output_norm_weight,
+                self.output_norm_bias.as_deref(),
+                self.config.eps,
+            )
+        };
+
+        // 4. LM head projection
+        let mut logits = self.fused_matmul(&normed, &self.lm_head_weight)?;
+        if let Some(ref bias) = self.lm_head_bias {
+            self.add_bias(&mut logits, bias);
+        }
+
+        Ok(logits)
     }
 
     /// Get model configuration
