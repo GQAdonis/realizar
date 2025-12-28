@@ -29,6 +29,8 @@ use std::{
     path::Path,
 };
 
+use rand::Rng;
+
 use memmap2::Mmap;
 use trueno::{Matrix as TruenoMatrix, Vector as TruenoVector};
 
@@ -708,10 +710,13 @@ impl GGUFModel {
             let n_dims = Self::read_u32(cursor)?;
 
             // Read dimensions array
+            // GGUF stores dimensions in GGML order (reversed from standard row-major)
+            // We need to reverse them to get the correct shape [out_dim, in_dim]
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
                 dims.push(Self::read_u64(cursor)?);
             }
+            dims.reverse();
 
             // Read quantization type (u32)
             let qtype = Self::read_u32(cursor)?;
@@ -1139,6 +1144,166 @@ impl GGUFModel {
             None
         }
     }
+
+    /// Get BOS (beginning of sentence) token ID
+    #[must_use]
+    pub fn bos_token_id(&self) -> Option<u32> {
+        if let Some(GGUFValue::UInt32(id)) = self.metadata.get("tokenizer.ggml.bos_token_id") {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+
+    /// Get EOS (end of sentence) token ID
+    #[must_use]
+    pub fn eos_token_id(&self) -> Option<u32> {
+        if let Some(GGUFValue::UInt32(id)) = self.metadata.get("tokenizer.ggml.eos_token_id") {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+
+    /// Get vocabulary tokens from metadata
+    ///
+    /// Returns the token strings indexed by token ID.
+    /// Uses "tokenizer.ggml.tokens" key from GGUF metadata.
+    #[must_use]
+    pub fn vocabulary(&self) -> Option<Vec<String>> {
+        if let Some(GGUFValue::Array(arr)) = self.metadata.get("tokenizer.ggml.tokens") {
+            let tokens: Vec<String> = arr
+                .iter()
+                .filter_map(|v| {
+                    if let GGUFValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if tokens.is_empty() {
+                None
+            } else {
+                Some(tokens)
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Decode token IDs to text using vocabulary
+    ///
+    /// Returns decoded string. Unknown tokens are replaced with "�".
+    #[must_use]
+    pub fn decode(&self, token_ids: &[u32]) -> String {
+        if let Some(vocab) = self.vocabulary() {
+            token_ids
+                .iter()
+                .map(|&id| {
+                    vocab
+                        .get(id as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("�")
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        } else {
+            // Fallback to ASCII if no vocabulary
+            token_ids
+                .iter()
+                .map(|&t| char::from_u32(t.min(127)).unwrap_or('?'))
+                .collect()
+        }
+    }
+
+    /// Encode text to token IDs using vocabulary
+    ///
+    /// Uses greedy longest-match tokenization.
+    /// Returns None if no vocabulary is available.
+    #[must_use]
+    pub fn encode(&self, text: &str) -> Option<Vec<u32>> {
+        let vocab = self.vocabulary()?;
+
+        // Build reverse lookup: token string -> token ID
+        let token_to_id: std::collections::HashMap<&str, u32> = vocab
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.as_str(), id as u32))
+            .collect();
+
+        // SentencePiece preprocessing: replace spaces with ▁ (U+2581)
+        // The first character doesn't get ▁ if the text doesn't start with space
+        // Otherwise, leading space gets converted too
+        let processed = if text.starts_with(' ') {
+            text.replace(' ', "▁")
+        } else {
+            // Add ▁ before spaces but keep first char as-is
+            let mut result = String::new();
+            let mut first = true;
+            for ch in text.chars() {
+                if ch == ' ' {
+                    result.push('▁');
+                } else {
+                    if !first && result.chars().last() != Some('▁') {
+                        // This handles non-space chars normally
+                    }
+                    result.push(ch);
+                }
+                first = false;
+            }
+            result
+        };
+
+        let mut tokens = Vec::new();
+        let mut remaining = processed.as_str();
+
+        while !remaining.is_empty() {
+            // Greedy longest match using character boundaries (not byte indices)
+            let mut best_byte_len = 0;
+            let mut best_id = None;
+
+            // Collect character byte offsets for proper slicing
+            let char_indices: Vec<usize> = remaining
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(remaining.len()))
+                .collect();
+
+            // Try all prefixes up to 32 chars (reasonable max token length)
+            for char_count in 1..=char_indices.len().saturating_sub(1).min(32) {
+                let byte_end = char_indices[char_count];
+                let prefix = &remaining[..byte_end];
+                if let Some(&id) = token_to_id.get(prefix) {
+                    best_byte_len = byte_end;
+                    best_id = Some(id);
+                }
+            }
+
+            if let Some(id) = best_id {
+                tokens.push(id);
+                remaining = &remaining[best_byte_len..];
+            } else {
+                // No match found - try single UTF-8 char as byte tokens
+                let ch = remaining.chars().next().unwrap();
+                let ch_len = ch.len_utf8();
+
+                // Look for byte tokens like <0x48> for 'H'
+                for byte in remaining[..ch_len].bytes() {
+                    let byte_token = format!("<0x{:02X}>", byte);
+                    if let Some(&id) = token_to_id.get(byte_token.as_str()) {
+                        tokens.push(id);
+                    } else {
+                        // Unknown byte - use a common unknown token ID (usually 0 or 1)
+                        tokens.push(0);
+                    }
+                }
+                remaining = &remaining[ch_len..];
+            }
+        }
+
+        Some(tokens)
+    }
 }
 
 /// Configuration for GGUF transformer inference
@@ -1196,19 +1361,21 @@ impl GGUFConfig {
         let num_heads = model.num_heads().unwrap_or(hidden_dim / 64);
 
         // Get vocab_size from token_embd tensor
+        // After dims.reverse(), shape is [vocab_size, hidden_dim] - vocab is at index 0
         let vocab_size = model
             .tensors
             .iter()
             .find(|t| t.name == "token_embd.weight")
-            .map_or(32000, |t| t.dims.get(1).copied().unwrap_or(32000) as usize);
+            .map_or(32000, |t| t.dims.first().copied().unwrap_or(32000) as usize);
 
         // Infer intermediate_dim from ffn_up tensor
+        // After dims.reverse(), shape is [intermediate_dim, hidden_dim] - intermediate is at index 0
         let intermediate_dim = model
             .tensors
             .iter()
             .find(|t| t.name == "blk.0.ffn_up.weight")
             .map_or(hidden_dim * 4, |t| {
-                t.dims.get(1).copied().unwrap_or(hidden_dim as u64 * 4) as usize
+                t.dims.first().copied().unwrap_or(hidden_dim as u64 * 4) as usize
             });
 
         let context_length = model.context_length().unwrap_or(2048);
@@ -1314,7 +1481,7 @@ impl GGUFTransformer {
             layers.push(layer);
         }
 
-        // Load output norm
+        // Load output norm (raw gamma values - no delta transformation needed)
         let output_norm_weight = model.get_tensor_f32("output_norm.weight", file_data)?;
         let output_norm_bias = model.get_tensor_f32("output_norm.bias", file_data).ok();
 
@@ -1345,7 +1512,7 @@ impl GGUFTransformer {
     ) -> Result<GGUFTransformerLayer> {
         let prefix = format!("blk.{}", layer_idx);
 
-        // Attention norm
+        // Attention norm weights
         let attn_norm_weight =
             model.get_tensor_f32(&format!("{}.attn_norm.weight", prefix), file_data)?;
         let attn_norm_bias = model
@@ -2594,10 +2761,9 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             .map(|(i, v)| (*i, (v - max_val).exp() / exp_sum))
             .collect();
 
-        // Sample from distribution (deterministic for now via cumulative)
-        // Use a simple hash-based pseudo-random for reproducibility
-        let hash = logits.len() as u32 ^ (top_k as u32) ^ ((temperature * 1000.0) as u32);
-        let r = (hash % 1000) as f32 / 1000.0;
+        // Sample from probability distribution with proper randomness
+        let mut rng = rand::thread_rng();
+        let r: f32 = rng.gen();
         let mut cumsum = 0.0;
         for (idx, prob) in &probs {
             cumsum += prob;
@@ -2764,9 +2930,8 @@ impl OwnedQuantizedLayer {
         let intermediate_dim = config.intermediate_dim;
 
         Self {
-            // GGUF stores layer norm weights as delta from 1.0 (gamma = 1 + stored_weight)
-            // Without this transformation, attention scores are ~0 giving 50/50 uniform attention
-            attn_norm_weight: layer.attn_norm_weight.iter().map(|w| 1.0 + w).collect(),
+            // Layer norm weights are used as-is (gamma values)
+            attn_norm_weight: layer.attn_norm_weight.clone(),
             attn_norm_bias: layer.attn_norm_bias.clone(),
             // QKV: supports both fused and separate formats
             qkv_weight: OwnedQKVWeights::from_borrowed(&layer.qkv_weight, data, hidden_dim),
@@ -2806,11 +2971,7 @@ impl OwnedQuantizedLayer {
             }),
             ffn_gate_bias: layer.ffn_gate_bias.clone(),
             // FFN norm: pre-FFN layer norm (LLaMA-style)
-            // Also uses delta parameterization (gamma = 1 + stored_weight)
-            ffn_norm_weight: layer
-                .ffn_norm_weight
-                .as_ref()
-                .map(|w| w.iter().map(|v| 1.0 + v).collect()),
+            ffn_norm_weight: layer.ffn_norm_weight.clone(),
             ffn_norm_bias: layer.ffn_norm_bias.clone(),
         }
     }
@@ -8892,9 +9053,9 @@ impl OwnedQuantizedModel {
             .map(|(i, v)| (*i, (v - max_val).exp() / exp_sum))
             .collect();
 
-        // Sample (deterministic via hash for reproducibility)
-        let hash = logits.len() as u32 ^ (top_k as u32) ^ ((temperature * 1000.0) as u32);
-        let r = (hash % 1000) as f32 / 1000.0;
+        // Sample from probability distribution with proper randomness
+        let mut rng = rand::thread_rng();
+        let r: f32 = rng.gen();
 
         let mut cumulative = 0.0;
         for &(idx, prob) in &probs {
@@ -15082,6 +15243,240 @@ impl CudaBackend {
     #[must_use]
     pub const fn ptx_version(&self) -> (u32, u32) {
         (8, 0)
+    }
+}
+
+/// Small, always-compiled vocabulary tests (no OOM risk)
+#[cfg(test)]
+mod vocab_tests {
+    use super::*;
+
+    #[test]
+    fn test_vocabulary_from_metadata() {
+        // Build GGUF with tokenizer.ggml.tokens array
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
+        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
+
+        // Key: "tokenizer.ggml.tokens"
+        let key = "tokenizer.ggml.tokens";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes()); // value_type = Array
+        data.extend_from_slice(&8u32.to_le_bytes()); // element_type = String
+        data.extend_from_slice(&3u64.to_le_bytes()); // array_len = 3
+
+        // Token 0: "<pad>"
+        data.extend_from_slice(&5u64.to_le_bytes());
+        data.extend_from_slice(b"<pad>");
+        // Token 1: "hello"
+        data.extend_from_slice(&5u64.to_le_bytes());
+        data.extend_from_slice(b"hello");
+        // Token 2: "world"
+        data.extend_from_slice(&5u64.to_le_bytes());
+        data.extend_from_slice(b"world");
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        let vocab = model.vocabulary().expect("Should have vocabulary");
+
+        assert_eq!(vocab.len(), 3);
+        assert_eq!(vocab[0], "<pad>");
+        assert_eq!(vocab[1], "hello");
+        assert_eq!(vocab[2], "world");
+    }
+
+    #[test]
+    fn test_decode_with_vocabulary() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let key = "tokenizer.ggml.tokens";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&4u64.to_le_bytes());
+
+        // Tokens: "The ", "capital ", "of ", "France"
+        for token in ["The ", "capital ", "of ", "France"] {
+            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
+            data.extend_from_slice(token.as_bytes());
+        }
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        let decoded = model.decode(&[0, 1, 2, 3]);
+
+        assert_eq!(decoded, "The capital of France");
+    }
+
+    #[test]
+    fn test_decode_unknown_token() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let key = "tokenizer.ggml.tokens";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(b"a");
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(b"b");
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        // Token ID 5 is out of range (vocab only has 0, 1)
+        let decoded = model.decode(&[0, 5, 1]);
+
+        assert_eq!(decoded, "a�b");
+    }
+
+    #[test]
+    fn test_vocabulary_none_when_missing() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        assert!(model.vocabulary().is_none());
+    }
+
+    #[test]
+    fn test_decode_fallback_ascii() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        // Falls back to ASCII: 72=H, 105=i
+        let decoded = model.decode(&[72, 105]);
+
+        assert_eq!(decoded, "Hi");
+    }
+
+    #[test]
+    fn test_encode_simple() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let key = "tokenizer.ggml.tokens";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
+
+        // Tokens: "Hello", " ", "world"
+        for token in ["Hello", " ", "world"] {
+            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
+            data.extend_from_slice(token.as_bytes());
+        }
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        let tokens = model.encode("Hello world").unwrap();
+
+        assert_eq!(tokens, vec![0, 1, 2]); // "Hello" + " " + "world"
+    }
+
+    #[test]
+    fn test_encode_longest_match() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let key = "tokenizer.ggml.tokens";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
+
+        // Tokens: "a", "ab", "abc" - should pick longest match
+        for token in ["a", "ab", "abc"] {
+            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
+            data.extend_from_slice(token.as_bytes());
+        }
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        let tokens = model.encode("abc").unwrap();
+
+        assert_eq!(tokens, vec![2]); // Should pick "abc" (longest match)
+    }
+
+    #[test]
+    fn test_encode_roundtrip() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let key = "tokenizer.ggml.tokens";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&4u64.to_le_bytes());
+
+        for token in ["The ", "capital ", "of ", "France"] {
+            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
+            data.extend_from_slice(token.as_bytes());
+        }
+
+        let model = GGUFModel::from_bytes(&data).unwrap();
+        let text = "The capital of France";
+        let tokens = model.encode(text).unwrap();
+        let decoded = model.decode(&tokens);
+
+        assert_eq!(decoded, text);
+    }
+
+    /// Test that sample_topk produces varied outputs (non-deterministic)
+    #[test]
+    fn test_sample_topk_produces_varied_outputs() {
+        // Create logits with multiple high-probability tokens
+        let mut logits = vec![0.0f32; 100];
+        logits[0] = 5.0;
+        logits[1] = 4.8;
+        logits[2] = 4.6;
+        logits[3] = 4.4;
+        logits[4] = 4.2;
+
+        // Sample multiple times and collect results
+        let mut samples = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let token = OwnedQuantizedModel::sample_topk(&logits, 1.0, 5);
+            samples.insert(token);
+        }
+
+        // With true randomness, we should get multiple different tokens
+        // (with high probability, more than 1 unique token in 50 samples)
+        assert!(
+            samples.len() > 1,
+            "Expected varied sampling, got only {} unique tokens: {:?}. \
+            This indicates deterministic sampling instead of random.",
+            samples.len(),
+            samples
+        );
     }
 }
 
