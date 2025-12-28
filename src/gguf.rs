@@ -9036,7 +9036,7 @@ impl OwnedQuantizedModel {
     }
 
     /// Top-k sampling with temperature
-    fn sample_topk(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
+    pub fn sample_topk(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
         // Apply temperature
         let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
 
