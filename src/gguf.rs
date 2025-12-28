@@ -8611,26 +8611,56 @@ impl OwnedQuantizedModel {
         }
     }
 
-    /// Apply RMSNorm (Root Mean Square Layer Normalization)
+    /// Apply RMSNorm (Root Mean Square Layer Normalization) using trueno SIMD
     /// LLaMA, TinyLlama, Mistral, etc. use RMSNorm instead of LayerNorm
     /// Formula: x / sqrt(mean(x^2) + eps) * weight
+    ///
+    /// Uses trueno SIMD operations for performance:
+    /// - sum_of_squares(): SIMD-accelerated sum of x^2
+    /// - scale(): SIMD-accelerated scalar multiplication
+    /// - mul(): SIMD-accelerated element-wise multiplication
     fn rms_norm(&self, input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         let hidden_dim = weight.len();
         let seq_len = input.len() / hidden_dim;
         let mut output = Vec::with_capacity(input.len());
+
+        // Pre-create weight vector for SIMD multiply (reused across sequence)
+        let weight_vec = TruenoVector::from_slice(weight);
 
         for i in 0..seq_len {
             let start = i * hidden_dim;
             let end = start + hidden_dim;
             let x = &input[start..end];
 
+            // Create SIMD vector from input slice
+            let x_vec = TruenoVector::from_slice(x);
+
+            // SIMD: sum of squares (replaces scalar x.iter().map(|v| v*v).sum())
+            let sum_sq = x_vec.sum_of_squares().unwrap_or_else(|_| {
+                // Fallback to scalar if SIMD fails
+                x.iter().map(|v| v * v).sum::<f32>()
+            });
+
             // RMSNorm: x * weight / sqrt(mean(x^2) + eps)
             // eps is added INSIDE the sqrt (crucial for numerical stability)
-            let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / hidden_dim as f32;
+            let mean_sq = sum_sq / hidden_dim as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
 
-            for j in 0..hidden_dim {
-                output.push(x[j] * inv_rms * weight[j]);
+            // SIMD: scale by inv_rms, then multiply by weight
+            // x * inv_rms * weight
+            match x_vec
+                .scale(inv_rms)
+                .and_then(|scaled| scaled.mul(&weight_vec))
+            {
+                Ok(result) => {
+                    output.extend_from_slice(result.as_slice());
+                },
+                Err(_) => {
+                    // Fallback to scalar if SIMD fails
+                    for j in 0..hidden_dim {
+                        output.push(x[j] * inv_rms * weight[j]);
+                    }
+                },
             }
         }
 
