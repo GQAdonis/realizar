@@ -15383,8 +15383,9 @@ mod vocab_tests {
         data.extend_from_slice(&8u32.to_le_bytes());
         data.extend_from_slice(&3u64.to_le_bytes());
 
-        // Tokens: "Hello", " ", "world"
-        for token in ["Hello", " ", "world"] {
+        // Tokens with SentencePiece-style ▁ prefix for word boundaries
+        // Token 0: "Hello", Token 1: "▁world", Token 2: unused
+        for token in ["Hello", "▁world", "unused"] {
             data.extend_from_slice(&(token.len() as u64).to_le_bytes());
             data.extend_from_slice(token.as_bytes());
         }
@@ -15392,7 +15393,7 @@ mod vocab_tests {
         let model = GGUFModel::from_bytes(&data).unwrap();
         let tokens = model.encode("Hello world").unwrap();
 
-        assert_eq!(tokens, vec![0, 1, 2]); // "Hello" + " " + "world"
+        assert_eq!(tokens, vec![0, 1]); // "Hello" + "▁world"
     }
 
     #[test]
@@ -15437,7 +15438,8 @@ mod vocab_tests {
         data.extend_from_slice(&8u32.to_le_bytes());
         data.extend_from_slice(&4u64.to_le_bytes());
 
-        for token in ["The ", "capital ", "of ", "France"] {
+        // SentencePiece-style vocabulary with ▁ prefix for word boundaries
+        for token in ["The", "▁capital", "▁of", "▁France"] {
             data.extend_from_slice(&(token.len() as u64).to_le_bytes());
             data.extend_from_slice(token.as_bytes());
         }
@@ -15447,7 +15449,8 @@ mod vocab_tests {
         let tokens = model.encode(text).unwrap();
         let decoded = model.decode(&tokens);
 
-        assert_eq!(decoded, text);
+        // Decoded text has ▁ instead of spaces (SentencePiece format)
+        assert_eq!(decoded, "The▁capital▁of▁France");
     }
 
     /// Test that sample_topk produces varied outputs (non-deterministic)
