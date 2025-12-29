@@ -2357,15 +2357,14 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         if weight_ref.qtype == GGUF_TYPE_Q4_0 {
             if seq_len == 1 {
                 return fused_q4_0_parallel_matvec(weight_data, input, in_dim, out_dim);
-            } else {
-                let mut output = Vec::with_capacity(seq_len * out_dim);
-                for s in 0..seq_len {
-                    let x = &input[s * in_dim..(s + 1) * in_dim];
-                    let row_output = fused_q4_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
-                    output.extend_from_slice(&row_output);
-                }
-                return Ok(output);
             }
+            let mut output = Vec::with_capacity(seq_len * out_dim);
+            for s in 0..seq_len {
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let row_output = fused_q4_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
+                output.extend_from_slice(&row_output);
+            }
+            return Ok(output);
         }
 
         // For Q8_0, use dequantize + SIMD matmul fallback
@@ -8332,15 +8331,14 @@ impl OwnedQuantizedModel {
         if weight.qtype == GGUF_TYPE_Q4_0 {
             if seq_len == 1 {
                 return fused_q4_0_parallel_matvec(&weight.data, input, in_dim, out_dim);
-            } else {
-                let mut output = Vec::with_capacity(seq_len * out_dim);
-                for s in 0..seq_len {
-                    let x = &input[s * in_dim..(s + 1) * in_dim];
-                    let row_output = fused_q4_0_parallel_matvec(&weight.data, x, in_dim, out_dim)?;
-                    output.extend_from_slice(&row_output);
-                }
-                return Ok(output);
             }
+            let mut output = Vec::with_capacity(seq_len * out_dim);
+            for s in 0..seq_len {
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let row_output = fused_q4_0_parallel_matvec(&weight.data, x, in_dim, out_dim)?;
+                output.extend_from_slice(&row_output);
+            }
+            return Ok(output);
         }
 
         // CPU path: For Q8_0, use dequantize + SIMD matmul
@@ -9432,26 +9430,20 @@ impl OwnedQuantizedModel {
             let head_offset = head * head_dim;
             let q_head = &q[head_offset..head_offset + head_dim];
 
-            // Create trueno vector for query head (reused across all positions)
-            let q_vec = TruenoVector::from_slice(q_head);
-
             // Compute attention scores against all positions (cached + current)
             let mut scores = Vec::with_capacity(total_len);
 
-            // Scores against cached positions - using trueno SIMD dot product
+            // Scores against cached positions (SIMD-optimized)
             for pos in 0..cache_len {
                 let k_start = pos * hidden_dim + head_offset;
                 let cached_key = &k_cache[k_start..k_start + head_dim];
-                let k_vec = TruenoVector::from_slice(cached_key);
-                // trueno dot uses 4-accumulator SIMD (4-6x faster than scalar)
-                let score = q_vec.dot(&k_vec).unwrap_or(0.0) * scale;
+                let score = Self::simd_dot_f32(q_head, cached_key) * scale;
                 scores.push(score);
             }
 
-            // Score against current position
+            // Score against current position (SIMD-optimized)
             let curr_key = &current_k[head_offset..head_offset + head_dim];
-            let k_vec = TruenoVector::from_slice(curr_key);
-            let current_score = q_vec.dot(&k_vec).unwrap_or(0.0) * scale;
+            let current_score = Self::simd_dot_f32(q_head, curr_key) * scale;
             scores.push(current_score);
 
             // Numerically stable softmax: exp(x - max) / sum(exp(x - max))
@@ -9468,22 +9460,17 @@ impl OwnedQuantizedModel {
             // Weighted sum of values
             let out_head = &mut output[head_offset..head_offset + head_dim];
 
-            // Sum over cached values - using trueno SIMD scale and accumulate
+            // Sum over cached values (SIMD-optimized)
             for (pos, &weight) in scores.iter().enumerate().take(cache_len) {
                 let v_start = pos * hidden_dim + head_offset;
                 let cached_val = &v_cache[v_start..v_start + head_dim];
-                // Scale and accumulate with SIMD
-                for d in 0..head_dim {
-                    out_head[d] += weight * cached_val[d];
-                }
+                Self::simd_axpy_f32(out_head, weight, cached_val);
             }
 
-            // Add current value
+            // Add current value (SIMD-optimized)
             let curr_val = &current_v[head_offset..head_offset + head_dim];
             let current_weight = scores[cache_len];
-            for d in 0..head_dim {
-                out_head[d] += current_weight * curr_val[d];
-            }
+            Self::simd_axpy_f32(out_head, current_weight, curr_val);
         }
 
         output
@@ -9839,6 +9826,125 @@ impl OwnedQuantizedModel {
         Ok(output)
     }
 
+    /// SIMD-optimized dot product for f32 slices
+    #[inline]
+    fn simd_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: We've verified AVX2+FMA support
+                unsafe { Self::simd_dot_f32_avx2(a, b) }
+            } else {
+                Self::simd_dot_f32_scalar(a, b)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self::simd_dot_f32_scalar(a, b)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[inline]
+    unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::{
+            _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehl_ps,
+            _mm_movehdup_ps,
+        };
+
+        let len = a.len().min(b.len());
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+
+        // Process 8 floats at a time
+        while i + 8 <= len {
+            // SAFETY: bounds checked above, pointers valid
+            let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+            let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+            acc = _mm256_fmadd_ps(va, vb, acc);
+            i += 8;
+        }
+
+        // Horizontal sum
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let lo = _mm256_castps256_ps128(acc);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result = _mm_add_ss(sums, shuf2);
+        let mut sum = _mm_cvtss_f32(result);
+
+        // Handle remaining elements
+        while i < len {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+
+        sum
+    }
+
+    #[inline]
+    fn simd_dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
+
+    /// SIMD-optimized scaled accumulation: out[i] += weight * val[i]
+    #[inline]
+    fn simd_axpy_f32(out: &mut [f32], weight: f32, val: &[f32]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                // SAFETY: We've verified AVX2 support
+                unsafe { Self::simd_axpy_f32_avx2(out, weight, val) }
+            } else {
+                Self::simd_axpy_f32_scalar(out, weight, val);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self::simd_axpy_f32_scalar(out, weight, val);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[inline]
+    unsafe fn simd_axpy_f32_avx2(out: &mut [f32], weight: f32, val: &[f32]) {
+        use std::arch::x86_64::{
+            _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps,
+        };
+
+        let len = out.len().min(val.len());
+        let w = _mm256_set1_ps(weight);
+        let mut i = 0;
+
+        // Process 8 floats at a time
+        while i + 8 <= len {
+            // SAFETY: bounds checked above, pointers valid
+            let v_out = unsafe { _mm256_loadu_ps(out.as_ptr().add(i)) };
+            let v_val = unsafe { _mm256_loadu_ps(val.as_ptr().add(i)) };
+            let result = _mm256_fmadd_ps(w, v_val, v_out);
+            unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), result) };
+            i += 8;
+        }
+
+        // Handle remaining elements
+        while i < len {
+            out[i] += weight * val[i];
+            i += 1;
+        }
+    }
+
+    #[inline]
+    fn simd_axpy_f32_scalar(out: &mut [f32], weight: f32, val: &[f32]) {
+        for (o, v) in out.iter_mut().zip(val.iter()) {
+            *o += weight * *v;
+        }
+    }
+
     /// Compute attention with Grouped Query Attention (GQA) support (IMP-105)
     ///
     /// GQA uses fewer KV heads than Q heads, with multiple Q heads sharing each KV head.
@@ -9897,23 +10003,17 @@ impl OwnedQuantizedModel {
             // Compute attention scores against all positions (cached + current)
             let mut scores = Vec::with_capacity(total_len);
 
-            // Scores against cached positions
+            // Scores against cached positions (SIMD-optimized)
             for pos in 0..cache_len {
                 let k_start = pos * kv_dim + kv_head_offset;
                 let cached_key = &k_cache[k_start..k_start + head_dim];
-                let mut score = 0.0f32;
-                for d in 0..head_dim {
-                    score += q_head_data[d] * cached_key[d];
-                }
+                let score = Self::simd_dot_f32(q_head_data, cached_key);
                 scores.push(score * scale);
             }
 
-            // Score against current position
+            // Score against current position (SIMD-optimized)
             let curr_key = &current_k[kv_head_offset..kv_head_offset + head_dim];
-            let mut current_score = 0.0f32;
-            for d in 0..head_dim {
-                current_score += q_head_data[d] * curr_key[d];
-            }
+            let current_score = Self::simd_dot_f32(q_head_data, curr_key);
             scores.push(current_score * scale);
 
             // Softmax
@@ -9930,21 +10030,17 @@ impl OwnedQuantizedModel {
             // Weighted sum of values
             let out_head = &mut output[q_head_offset..q_head_offset + head_dim];
 
-            // Sum over cached values
+            // Sum over cached values (SIMD-optimized)
             for (pos, &weight) in scores.iter().enumerate().take(cache_len) {
                 let v_start = pos * kv_dim + kv_head_offset;
                 let cached_val = &v_cache[v_start..v_start + head_dim];
-                for d in 0..head_dim {
-                    out_head[d] += weight * cached_val[d];
-                }
+                Self::simd_axpy_f32(out_head, weight, cached_val);
             }
 
-            // Add current value
+            // Add current value (SIMD-optimized)
             let curr_val = &current_v[kv_head_offset..kv_head_offset + head_dim];
             let current_weight = scores[cache_len];
-            for d in 0..head_dim {
-                out_head[d] += current_weight * curr_val[d];
-            }
+            Self::simd_axpy_f32(out_head, current_weight, curr_val);
         }
 
         output
