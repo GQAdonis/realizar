@@ -2346,34 +2346,53 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         out_dim: usize,
     ) -> Result<Vec<f32>> {
         use crate::quantize::{
-            dequantize_q4_0, dequantize_q8_0, fused_q4k_parallel_matvec, fused_q5k_parallel_matvec,
-            fused_q6k_parallel_matvec,
+            dequantize_q8_0, fused_q4_0_parallel_matvec, fused_q4k_parallel_matvec,
+            fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
         let seq_len = input.len() / in_dim;
         let weight_data = self.tensor_data(weight_ref);
 
-        // For Q4_0 and Q8_0, use dequantize + matmul fallback
-        // These don't have fused implementations yet
-        if weight_ref.qtype == GGUF_TYPE_Q4_0 || weight_ref.qtype == GGUF_TYPE_Q8_0 {
-            let weights_f32 = if weight_ref.qtype == GGUF_TYPE_Q4_0 {
-                dequantize_q4_0(weight_data)?
+        // For Q4_0, use fused SIMD matmul (no full dequantization)
+        if weight_ref.qtype == GGUF_TYPE_Q4_0 {
+            if seq_len == 1 {
+                return fused_q4_0_parallel_matvec(weight_data, input, in_dim, out_dim);
             } else {
-                dequantize_q8_0(weight_data)?
+                let mut output = Vec::with_capacity(seq_len * out_dim);
+                for s in 0..seq_len {
+                    let x = &input[s * in_dim..(s + 1) * in_dim];
+                    let row_output = fused_q4_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
+                    output.extend_from_slice(&row_output);
+                }
+                return Ok(output);
+            }
+        }
+
+        // For Q8_0, use dequantize + SIMD matmul fallback
+        if weight_ref.qtype == GGUF_TYPE_Q8_0 {
+            let weights_f32 = dequantize_q8_0(weight_data)?;
+
+            // Use trueno SIMD for matmul
+            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(RealizarError::InvalidShape {
+                        reason: "Failed to create weight matrix for Q8_0".to_string(),
+                    });
+                },
             };
 
-            // Standard matmul: output[s, o] = sum_i(input[s, i] * weights[o, i])
-            // Weight layout: [out_dim, in_dim] row-major (same physical layout as PyTorch)
-            let mut output = vec![0.0f32; seq_len * out_dim];
+            let mut output = Vec::with_capacity(seq_len * out_dim);
             for s in 0..seq_len {
-                for o in 0..out_dim {
-                    let mut sum = 0.0f32;
-                    let x = &input[s * in_dim..(s + 1) * in_dim];
-                    let w_row = &weights_f32[o * in_dim..(o + 1) * in_dim];
-                    for i in 0..in_dim {
-                        sum += x[i] * w_row[i];
-                    }
-                    output[s * out_dim + o] = sum;
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let x_vec = TruenoVector::from_slice(x);
+                match weight_matrix.matvec(&x_vec) {
+                    Ok(r) => output.extend_from_slice(r.as_slice()),
+                    Err(_) => {
+                        return Err(RealizarError::InvalidShape {
+                            reason: "SIMD matvec failed for Q8_0".to_string(),
+                        });
+                    },
                 }
             }
             return Ok(output);
@@ -8120,8 +8139,8 @@ impl OwnedQuantizedModel {
     /// Otherwise, uses CPU SIMD (AVX2/SSE).
     fn fused_matmul(&self, input: &[f32], weight: &OwnedQuantizedTensor) -> Result<Vec<f32>> {
         use crate::quantize::{
-            dequantize_q4_0, dequantize_q8_0, fused_q4k_parallel_matvec, fused_q5k_parallel_matvec,
-            fused_q6k_parallel_matvec,
+            dequantize_q8_0, fused_q4_0_parallel_matvec, fused_q4k_parallel_matvec,
+            fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
         let in_dim = weight.in_dim;
@@ -8309,26 +8328,46 @@ impl OwnedQuantizedModel {
             return Ok(output);
         }
 
-        // CPU path: For Q4_0 and Q8_0, use dequantize + matmul fallback
-        if weight.qtype == GGUF_TYPE_Q4_0 || weight.qtype == GGUF_TYPE_Q8_0 {
-            let weights_f32 = if weight.qtype == GGUF_TYPE_Q4_0 {
-                dequantize_q4_0(&weight.data)?
+        // CPU path: For Q4_0, use fused SIMD matmul (no full dequantization)
+        if weight.qtype == GGUF_TYPE_Q4_0 {
+            if seq_len == 1 {
+                return fused_q4_0_parallel_matvec(&weight.data, input, in_dim, out_dim);
             } else {
-                dequantize_q8_0(&weight.data)?
+                let mut output = Vec::with_capacity(seq_len * out_dim);
+                for s in 0..seq_len {
+                    let x = &input[s * in_dim..(s + 1) * in_dim];
+                    let row_output = fused_q4_0_parallel_matvec(&weight.data, x, in_dim, out_dim)?;
+                    output.extend_from_slice(&row_output);
+                }
+                return Ok(output);
+            }
+        }
+
+        // CPU path: For Q8_0, use dequantize + SIMD matmul
+        if weight.qtype == GGUF_TYPE_Q8_0 {
+            let weights_f32 = dequantize_q8_0(&weight.data)?;
+
+            // Use trueno SIMD for matmul
+            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(RealizarError::InvalidShape {
+                        reason: "Failed to create weight matrix for Q8_0".to_string(),
+                    });
+                },
             };
 
-            // Standard matmul: output[s, o] = sum_i(input[s, i] * weights[o, i])
-            // Weight layout: [out_dim, in_dim] row-major (same physical layout as PyTorch)
-            let mut output = vec![0.0f32; seq_len * out_dim];
+            let mut output = Vec::with_capacity(seq_len * out_dim);
             for s in 0..seq_len {
-                for o in 0..out_dim {
-                    let mut sum = 0.0f32;
-                    let x = &input[s * in_dim..(s + 1) * in_dim];
-                    let w_row = &weights_f32[o * in_dim..(o + 1) * in_dim];
-                    for i in 0..in_dim {
-                        sum += x[i] * w_row[i];
-                    }
-                    output[s * out_dim + o] = sum;
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let x_vec = TruenoVector::from_slice(x);
+                match weight_matrix.matvec(&x_vec) {
+                    Ok(r) => output.extend_from_slice(r.as_slice()),
+                    Err(_) => {
+                        return Err(RealizarError::InvalidShape {
+                            reason: "SIMD matvec failed for Q8_0".to_string(),
+                        });
+                    },
                 }
             }
             return Ok(output);
