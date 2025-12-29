@@ -2346,22 +2346,22 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         out_dim: usize,
     ) -> Result<Vec<f32>> {
         use crate::quantize::{
-            dequantize_q8_0, fused_q4_0_parallel_matvec, fused_q4k_parallel_matvec,
+            dequantize_q8_0, fused_q4_0_q8_0_parallel_matvec, fused_q4k_parallel_matvec,
             fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
         let seq_len = input.len() / in_dim;
         let weight_data = self.tensor_data(weight_ref);
 
-        // For Q4_0, use fused SIMD matmul (no full dequantization)
+        // For Q4_0, use fused Q8_0 integer SIMD matmul (llama.cpp parity)
         if weight_ref.qtype == GGUF_TYPE_Q4_0 {
             if seq_len == 1 {
-                return fused_q4_0_parallel_matvec(weight_data, input, in_dim, out_dim);
+                return fused_q4_0_q8_0_parallel_matvec(weight_data, input, in_dim, out_dim);
             }
             let mut output = Vec::with_capacity(seq_len * out_dim);
             for s in 0..seq_len {
                 let x = &input[s * in_dim..(s + 1) * in_dim];
-                let row_output = fused_q4_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
+                let row_output = fused_q4_0_q8_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
                 output.extend_from_slice(&row_output);
             }
             return Ok(output);
@@ -9084,7 +9084,7 @@ impl OwnedQuantizedModel {
     /// Otherwise, uses CPU SIMD (AVX2/SSE).
     fn fused_matmul(&self, input: &[f32], weight: &OwnedQuantizedTensor) -> Result<Vec<f32>> {
         use crate::quantize::{
-            dequantize_q8_0, fused_q4_0_parallel_matvec, fused_q4k_parallel_matvec,
+            dequantize_q8_0, fused_q4_0_q8_0_parallel_matvec, fused_q4k_parallel_matvec,
             fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
@@ -9273,15 +9273,15 @@ impl OwnedQuantizedModel {
             return Ok(output);
         }
 
-        // CPU path: For Q4_0, use fused SIMD matmul (no full dequantization)
+        // CPU path: For Q4_0, use fused Q8_0 integer SIMD matmul (llama.cpp parity)
         if weight.qtype == GGUF_TYPE_Q4_0 {
             if seq_len == 1 {
-                return fused_q4_0_parallel_matvec(&weight.data, input, in_dim, out_dim);
+                return fused_q4_0_q8_0_parallel_matvec(&weight.data, input, in_dim, out_dim);
             }
             let mut output = Vec::with_capacity(seq_len * out_dim);
             for s in 0..seq_len {
                 let x = &input[s * in_dim..(s + 1) * in_dim];
-                let row_output = fused_q4_0_parallel_matvec(&weight.data, x, in_dim, out_dim)?;
+                let row_output = fused_q4_0_q8_0_parallel_matvec(&weight.data, x, in_dim, out_dim)?;
                 output.extend_from_slice(&row_output);
             }
             return Ok(output);
