@@ -2819,8 +2819,8 @@ impl<'a> QuantizedGGUFTransformer<'a> {
     unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         use std::arch::x86_64::{
             _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehl_ps,
-            _mm_movehdup_ps,
+            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
+            _mm_movehl_ps,
         };
 
         let len = a.len().min(b.len());
@@ -2942,9 +2942,9 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             let x_vec = TruenoVector::from_slice(x);
 
             // SIMD: sum of squares
-            let sum_sq = x_vec.sum_of_squares().unwrap_or_else(|_| {
-                x.iter().map(|v| v * v).sum::<f32>()
-            });
+            let sum_sq = x_vec
+                .sum_of_squares()
+                .unwrap_or_else(|_| x.iter().map(|v| v * v).sum::<f32>());
 
             // RMSNorm: x * weight / sqrt(mean(x^2) + eps)
             let mean_sq = sum_sq / hidden_dim as f32;
@@ -3066,7 +3066,11 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let q_per_kv = num_heads / num_kv_heads;
-        let cache_len = if kv_dim > 0 { k_cache.len() / kv_dim } else { 0 };
+        let cache_len = if kv_dim > 0 {
+            k_cache.len() / kv_dim
+        } else {
+            0
+        };
         let total_len = cache_len + 1;
 
         let mut output = vec![0.0f32; hidden_dim];
@@ -3373,7 +3377,12 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // 2a. Attention layer norm (reuse normed buffer)
             if use_rmsnorm {
-                self.rms_norm_into(&scratch.hidden, &layer.attn_norm_weight, self.config.eps, &mut scratch.normed);
+                self.rms_norm_into(
+                    &scratch.hidden,
+                    &layer.attn_norm_weight,
+                    self.config.eps,
+                    &mut scratch.normed,
+                );
             } else {
                 self.layer_norm_into(
                     &scratch.hidden,
@@ -3407,7 +3416,9 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             scratch.k.clear();
             scratch.k.extend_from_slice(&qkv[q_dim..q_dim + k_dim]);
             scratch.v.clear();
-            scratch.v.extend_from_slice(&qkv[q_dim + k_dim..q_dim + k_dim + v_dim]);
+            scratch
+                .v
+                .extend_from_slice(&qkv[q_dim + k_dim..q_dim + k_dim + v_dim]);
 
             self.apply_rope(&mut scratch.q, position, self.config.num_heads);
             self.apply_rope(&mut scratch.k, position, self.config.num_kv_heads);
@@ -3425,20 +3436,34 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                     for h in 0..self.config.num_heads {
                         let kv_head = h / group_size;
                         let start = kv_head * head_dim;
-                        scratch.attn_out.extend_from_slice(&scratch.v[start..start + head_dim]);
+                        scratch
+                            .attn_out
+                            .extend_from_slice(&scratch.v[start..start + head_dim]);
                     }
                 } else {
                     scratch.attn_out.extend_from_slice(&scratch.v);
                 }
             } else {
-                self.attention_with_cache_gqa_into(&scratch.q, k_cache, v_cache, &scratch.k, &scratch.v, &mut scratch.attn_out);
+                self.attention_with_cache_gqa_into(
+                    &scratch.q,
+                    k_cache,
+                    v_cache,
+                    &scratch.k,
+                    &scratch.v,
+                    &mut scratch.attn_out,
+                );
             }
 
             // 2e. Store K and V in cache
             cache.append(layer_idx, &scratch.k, &scratch.v);
 
             // 2f. Attention output projection (reuse ffn_input as temp)
-            let attn_output = self.fused_matmul(&scratch.attn_out, &layer.attn_output_weight, hidden_dim, hidden_dim)?;
+            let attn_output = self.fused_matmul(
+                &scratch.attn_out,
+                &layer.attn_output_weight,
+                hidden_dim,
+                hidden_dim,
+            )?;
             let mut attn_output = attn_output;
             if let Some(ref bias) = layer.attn_output_bias {
                 self.add_bias(&mut attn_output, bias);
@@ -3452,7 +3477,12 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             // 2h. Pre-FFN layer norm
             if let Some(ref ffn_norm) = layer.ffn_norm_weight {
                 if use_rmsnorm {
-                    self.rms_norm_into(&scratch.hidden, ffn_norm, self.config.eps, &mut scratch.normed);
+                    self.rms_norm_into(
+                        &scratch.hidden,
+                        ffn_norm,
+                        self.config.eps,
+                        &mut scratch.normed,
+                    );
                 } else {
                     self.layer_norm_into(
                         &scratch.hidden,
@@ -3541,7 +3571,12 @@ impl<'a> QuantizedGGUFTransformer<'a> {
 
         // 3. Final layer norm
         if use_rmsnorm {
-            self.rms_norm_into(&scratch.hidden, &self.output_norm_weight, self.config.eps, &mut scratch.normed);
+            self.rms_norm_into(
+                &scratch.hidden,
+                &self.output_norm_weight,
+                self.config.eps,
+                &mut scratch.normed,
+            );
         } else {
             self.layer_norm_into(
                 &scratch.hidden,
@@ -3589,14 +3624,17 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         let x_vec = TruenoVector::from_slice(input);
         let weight_vec = TruenoVector::from_slice(weight);
 
-        let sum_sq = x_vec.sum_of_squares().unwrap_or_else(|_| {
-            input.iter().map(|v| v * v).sum::<f32>()
-        });
+        let sum_sq = x_vec
+            .sum_of_squares()
+            .unwrap_or_else(|_| input.iter().map(|v| v * v).sum::<f32>());
 
         let mean_sq = sum_sq / hidden_dim as f32;
         let inv_rms = 1.0 / (mean_sq + eps).sqrt();
 
-        match x_vec.scale(inv_rms).and_then(|scaled| scaled.mul(&weight_vec)) {
+        match x_vec
+            .scale(inv_rms)
+            .and_then(|scaled| scaled.mul(&weight_vec))
+        {
             Ok(result) => output.extend_from_slice(result.as_slice()),
             Err(_) => {
                 for j in 0..hidden_dim {
@@ -3649,7 +3687,11 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let q_per_kv = num_heads / num_kv_heads;
-        let cache_len = if kv_dim > 0 { k_cache.len() / kv_dim } else { 0 };
+        let cache_len = if kv_dim > 0 {
+            k_cache.len() / kv_dim
+        } else {
+            0
+        };
         let total_len = cache_len + 1;
 
         output.clear();
@@ -10796,8 +10838,8 @@ impl OwnedQuantizedModel {
     unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         use std::arch::x86_64::{
             _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehl_ps,
-            _mm_movehdup_ps,
+            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
+            _mm_movehl_ps,
         };
 
         let len = a.len().min(b.len());
