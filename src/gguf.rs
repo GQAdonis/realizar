@@ -1145,6 +1145,18 @@ impl GGUFModel {
         }
     }
 
+    /// Get RoPE frequency base from metadata
+    /// Different models use different bases (LLaMA: 10000, Qwen2: 1000000)
+    pub fn rope_freq_base(&self) -> Option<f32> {
+        let arch = self.architecture()?;
+        let key = format!("{}.rope.freq_base", arch);
+        if let Some(GGUFValue::Float32(base)) = self.metadata.get(&key) {
+            Some(*base)
+        } else {
+            None
+        }
+    }
+
     /// Get BOS (beginning of sentence) token ID
     #[must_use]
     pub fn bos_token_id(&self) -> Option<u32> {
@@ -1379,8 +1391,9 @@ impl GGUFConfig {
 
         let context_length = model.context_length().unwrap_or(2048);
 
-        // Default rope_theta for most models
-        let rope_theta = 10000.0;
+        // Read rope_theta from metadata, or use default (10000.0 for LLaMA-style)
+        // Qwen2 uses 1000000.0, which is read from qwen2.rope.freq_base
+        let rope_theta = model.rope_freq_base().unwrap_or(10000.0);
         let eps = 1e-5;
 
         // num_kv_heads (for GQA - e.g., Qwen uses fewer KV heads than Q heads)
@@ -1485,7 +1498,10 @@ impl GGUFTransformer {
         let output_norm_bias = model.get_tensor_f32("output_norm.bias", file_data).ok();
 
         // Load LM head (output projection)
-        let lm_head_weight = model.get_tensor_f32("output.weight", file_data)?;
+        // Fall back to token_embd.weight for tied embeddings (Qwen2, some LLaMA variants)
+        let lm_head_weight = model
+            .get_tensor_f32("output.weight", file_data)
+            .or_else(|_| model.get_tensor_f32("token_embd.weight", file_data))?;
         let lm_head_bias = model.get_tensor_f32("output.bias", file_data).ok();
 
         Ok(Self {
@@ -2126,7 +2142,9 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         let output_norm_bias = model.get_tensor_f32("output_norm.bias", data).ok();
 
         // LM head - large, keep quantized
-        let lm_head_weight = Self::get_tensor_ref(model, data, "output.weight")?;
+        // Fall back to token_embd.weight for tied embeddings (Qwen2, some LLaMA variants)
+        let lm_head_weight = Self::get_tensor_ref(model, data, "output.weight")
+            .or_else(|_| Self::get_tensor_ref(model, data, "token_embd.weight"))?;
         let lm_head_bias = model.get_tensor_f32("output.bias", data).ok();
 
         Ok(Self {
@@ -2168,6 +2186,22 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             GGUF_TYPE_Q8_0 => {
                 const BLOCK_SIZE: usize = 32;
                 const BLOCK_BYTES: usize = 36;
+                let num_blocks = num_elements.div_ceil(BLOCK_SIZE);
+                num_blocks * BLOCK_BYTES
+            },
+            GGUF_TYPE_Q4_1 => {
+                // Q4_1: 32 elements per block
+                // Layout: 1×f16 scale (2 bytes) + 1×f16 min (2 bytes) + 16 bytes (32×4-bit values) = 20 bytes
+                const BLOCK_SIZE: usize = 32;
+                const BLOCK_BYTES: usize = 20;
+                let num_blocks = num_elements.div_ceil(BLOCK_SIZE);
+                num_blocks * BLOCK_BYTES
+            },
+            GGUF_TYPE_Q5_0 => {
+                // Q5_0: 32 elements per block
+                // Layout: 1×f16 scale (2 bytes) + 4 bytes high bits + 16 bytes quants = 22 bytes
+                const BLOCK_SIZE: usize = 32;
+                const BLOCK_BYTES: usize = 22;
                 let num_blocks = num_elements.div_ceil(BLOCK_SIZE);
                 num_blocks * BLOCK_BYTES
             },
@@ -2337,7 +2371,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
     /// Performs dequantization inline with dot product - NO intermediate buffer.
     /// Uses rayon parallel iterators per Blumofe & Leiserson [6] for multi-core acceleration.
     ///
-    /// Supports Q4_K, Q5_K, Q6_K with fused operations, and Q4_0/Q8_0 via dequantization.
+    /// Supports Q4_K, Q5_K, Q6_K with fused operations, and Q4_0/Q4_1/Q5_0/Q8_0 via dequantization.
     fn fused_matmul(
         &self,
         input: &[f32],
@@ -2346,8 +2380,8 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         out_dim: usize,
     ) -> Result<Vec<f32>> {
         use crate::quantize::{
-            dequantize_q8_0, fused_q4_0_q8_0_parallel_matvec, fused_q4k_parallel_matvec,
-            fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
+            dequantize_q4_1, dequantize_q5_0, dequantize_q8_0, fused_q4_0_q8_0_parallel_matvec,
+            fused_q4k_parallel_matvec, fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
         let seq_len = input.len() / in_dim;
@@ -2390,6 +2424,66 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                     Err(_) => {
                         return Err(RealizarError::InvalidShape {
                             reason: "SIMD matvec failed for Q8_0".to_string(),
+                        });
+                    },
+                }
+            }
+            return Ok(output);
+        }
+
+        // For Q4_1, use dequantize + SIMD matmul fallback
+        if weight_ref.qtype == GGUF_TYPE_Q4_1 {
+            let weights_f32 = dequantize_q4_1(weight_data)?;
+
+            // Use trueno SIMD for matmul
+            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(RealizarError::InvalidShape {
+                        reason: "Failed to create weight matrix for Q4_1".to_string(),
+                    });
+                },
+            };
+
+            let mut output = Vec::with_capacity(seq_len * out_dim);
+            for s in 0..seq_len {
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let x_vec = TruenoVector::from_slice(x);
+                match weight_matrix.matvec(&x_vec) {
+                    Ok(r) => output.extend_from_slice(r.as_slice()),
+                    Err(_) => {
+                        return Err(RealizarError::InvalidShape {
+                            reason: "SIMD matvec failed for Q4_1".to_string(),
+                        });
+                    },
+                }
+            }
+            return Ok(output);
+        }
+
+        // For Q5_0, use dequantize + SIMD matmul fallback
+        if weight_ref.qtype == GGUF_TYPE_Q5_0 {
+            let weights_f32 = dequantize_q5_0(weight_data)?;
+
+            // Use trueno SIMD for matmul
+            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(RealizarError::InvalidShape {
+                        reason: "Failed to create weight matrix for Q5_0".to_string(),
+                    });
+                },
+            };
+
+            let mut output = Vec::with_capacity(seq_len * out_dim);
+            for s in 0..seq_len {
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let x_vec = TruenoVector::from_slice(x);
+                match weight_matrix.matvec(&x_vec) {
+                    Ok(r) => output.extend_from_slice(r.as_slice()),
+                    Err(_) => {
+                        return Err(RealizarError::InvalidShape {
+                            reason: "SIMD matvec failed for Q5_0".to_string(),
                         });
                     },
                 }
@@ -9120,14 +9214,14 @@ impl OwnedQuantizedModel {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Fused matrix-vector multiply using Q4_0/Q8_0/Q4_K/Q5_K/Q6_K
+    /// Fused matrix-vector multiply using Q4_0/Q4_1/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K
     ///
     /// PARITY-113: When CUDA is enabled, routes to CUDA GEMM kernel.
     /// Otherwise, uses CPU SIMD (AVX2/SSE).
     fn fused_matmul(&self, input: &[f32], weight: &OwnedQuantizedTensor) -> Result<Vec<f32>> {
         use crate::quantize::{
-            dequantize_q8_0, fused_q4_0_q8_0_parallel_matvec, fused_q4k_parallel_matvec,
-            fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
+            dequantize_q4_1, dequantize_q5_0, dequantize_q8_0, fused_q4_0_q8_0_parallel_matvec,
+            fused_q4k_parallel_matvec, fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
         };
 
         let in_dim = weight.in_dim;
@@ -9359,6 +9453,66 @@ impl OwnedQuantizedModel {
             return Ok(output);
         }
 
+        // CPU path: For Q4_1, use dequantize + SIMD matmul
+        if weight.qtype == GGUF_TYPE_Q4_1 {
+            let weights_f32 = dequantize_q4_1(&weight.data)?;
+
+            // Use trueno SIMD for matmul
+            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(RealizarError::InvalidShape {
+                        reason: "Failed to create weight matrix for Q4_1".to_string(),
+                    });
+                },
+            };
+
+            let mut output = Vec::with_capacity(seq_len * out_dim);
+            for s in 0..seq_len {
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let x_vec = TruenoVector::from_slice(x);
+                match weight_matrix.matvec(&x_vec) {
+                    Ok(r) => output.extend_from_slice(r.as_slice()),
+                    Err(_) => {
+                        return Err(RealizarError::InvalidShape {
+                            reason: "SIMD matvec failed for Q4_1".to_string(),
+                        });
+                    },
+                }
+            }
+            return Ok(output);
+        }
+
+        // CPU path: For Q5_0, use dequantize + SIMD matmul
+        if weight.qtype == GGUF_TYPE_Q5_0 {
+            let weights_f32 = dequantize_q5_0(&weight.data)?;
+
+            // Use trueno SIMD for matmul
+            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(RealizarError::InvalidShape {
+                        reason: "Failed to create weight matrix for Q5_0".to_string(),
+                    });
+                },
+            };
+
+            let mut output = Vec::with_capacity(seq_len * out_dim);
+            for s in 0..seq_len {
+                let x = &input[s * in_dim..(s + 1) * in_dim];
+                let x_vec = TruenoVector::from_slice(x);
+                match weight_matrix.matvec(&x_vec) {
+                    Ok(r) => output.extend_from_slice(r.as_slice()),
+                    Err(_) => {
+                        return Err(RealizarError::InvalidShape {
+                            reason: "SIMD matvec failed for Q5_0".to_string(),
+                        });
+                    },
+                }
+            }
+            return Ok(output);
+        }
+
         // CPU path: Process each position in sequence
         if seq_len > 1 {
             let mut output = Vec::with_capacity(seq_len * out_dim);
@@ -9372,7 +9526,7 @@ impl OwnedQuantizedModel {
                         return Err(RealizarError::UnsupportedOperation {
                             operation: "owned_fused_matmul".to_string(),
                             reason: format!(
-                                "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
+                                "Fused matmul only supports Q4_0/Q4_1/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
                                 weight.qtype
                             ),
                         });
