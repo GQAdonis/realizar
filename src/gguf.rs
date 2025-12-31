@@ -9570,6 +9570,78 @@ impl OwnedQuantizedModel {
         }
     }
 
+    /// Fused RMSNorm + matmul for Q4_0 weights
+    ///
+    /// Combines RMSNorm normalization with quantized matmul:
+    /// 1. Computes inv_rms = 1 / sqrt(mean(x^2) + eps)
+    /// 2. Quantizes (x * inv_rms * norm_weight) to Q8_0
+    /// 3. Performs Q4_0 × Q8_0 integer matmul
+    ///
+    /// This eliminates the intermediate normalized vector allocation.
+    fn fused_rmsnorm_matmul(
+        &self,
+        input: &[f32],
+        norm_weight: &[f32],
+        eps: f32,
+        weight: &OwnedQuantizedTensor,
+    ) -> Result<Vec<f32>> {
+        use crate::quantize::fused_rmsnorm_q4_0_matmul;
+
+        // Only use fused path for Q4_0 weights (most common)
+        if weight.qtype == GGUF_TYPE_Q4_0 && input.len() == weight.in_dim {
+            return fused_rmsnorm_q4_0_matmul(
+                input,
+                norm_weight,
+                eps,
+                &weight.data,
+                weight.in_dim,
+                weight.out_dim,
+            );
+        }
+
+        // Fallback to separate RMSNorm + matmul for other types
+        let normed = self.rms_norm(input, norm_weight, eps);
+        self.fused_matmul(&normed, weight)
+    }
+
+    /// Fused RMSNorm + QKV projection
+    ///
+    /// Combines attention layer norm with QKV projection in one operation.
+    /// Avoids allocating intermediate normalized vector.
+    pub fn fused_rmsnorm_qkv_matmul(
+        &self,
+        input: &[f32],
+        norm_weight: &[f32],
+        eps: f32,
+        qkv: &OwnedQKVWeights,
+    ) -> Result<Vec<f32>> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => {
+                self.fused_rmsnorm_matmul(input, norm_weight, eps, weight)
+            }
+            OwnedQKVWeights::Separate {
+                ref q,
+                ref k,
+                ref v,
+            } => {
+                // For separate Q/K/V, we need to normalize once and reuse
+                // (Can't easily fuse since we need same normalized input for all three)
+                let normed = self.rms_norm(input, norm_weight, eps);
+
+                let q_out = self.fused_matmul(&normed, q)?;
+                let k_out = self.fused_matmul(&normed, k)?;
+                let v_out = self.fused_matmul(&normed, v)?;
+
+                let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
+                let mut output = Vec::with_capacity(qkv_dim);
+                output.extend_from_slice(&q_out);
+                output.extend_from_slice(&k_out);
+                output.extend_from_slice(&v_out);
+                Ok(output)
+            }
+        }
+    }
+
     /// PARITY-113: Dequantize weight tensor to FP32 for CUDA GEMM
     ///
     /// This is a fallback path for non-matvec operations (seq_len > 1).
@@ -11353,20 +11425,25 @@ impl OwnedQuantizedModel {
 
         // 2. Process through transformer layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // 2a. Attention layer norm (RMSNorm for LLaMA, LayerNorm for others)
-            let normed = if use_rmsnorm {
-                self.rms_norm(&hidden, &layer.attn_norm_weight, self.config.eps)
+            // 2a+2b. Fused attention layer norm + QKV projection
+            // For RMSNorm models: fuse norm + matmul to eliminate intermediate allocation
+            // For LayerNorm models: use separate operations (has bias)
+            let mut qkv = if use_rmsnorm {
+                self.fused_rmsnorm_qkv_matmul(
+                    &hidden,
+                    &layer.attn_norm_weight,
+                    self.config.eps,
+                    &layer.qkv_weight,
+                )?
             } else {
-                self.layer_norm(
+                let normed = self.layer_norm(
                     &hidden,
                     &layer.attn_norm_weight,
                     layer.attn_norm_bias.as_deref(),
                     self.config.eps,
-                )
+                );
+                self.qkv_matmul(&normed, &layer.qkv_weight)?
             };
-
-            // 2b. QKV projection
-            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
             if let Some(ref bias) = layer.qkv_bias {
                 self.add_bias(&mut qkv, bias);
             }
