@@ -2498,6 +2498,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 let row_output = match weight_ref.qtype {
                     GGUF_TYPE_Q4_K => fused_q4k_parallel_matvec(weight_data, x, in_dim, out_dim)?,
                     GGUF_TYPE_Q5_K => fused_q5k_parallel_matvec(weight_data, x, in_dim, out_dim)?,
+                    // Q6_K: All weights are row-major in TinyLlama
                     GGUF_TYPE_Q6_K => fused_q6k_parallel_matvec(weight_data, x, in_dim, out_dim)?,
                     _ => {
                         return Err(RealizarError::UnsupportedOperation {
@@ -2517,6 +2518,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             match weight_ref.qtype {
                 GGUF_TYPE_Q4_K => fused_q4k_parallel_matvec(weight_data, input, in_dim, out_dim),
                 GGUF_TYPE_Q5_K => fused_q5k_parallel_matvec(weight_data, input, in_dim, out_dim),
+                // Q6_K: All weights are row-major in TinyLlama
                 GGUF_TYPE_Q6_K => fused_q6k_parallel_matvec(weight_data, input, in_dim, out_dim),
                 _ => Err(RealizarError::UnsupportedOperation {
                     operation: "fused_matmul".to_string(),
@@ -9506,6 +9508,7 @@ impl OwnedQuantizedModel {
                 let row_output = match weight.qtype {
                     GGUF_TYPE_Q4_K => fused_q4k_parallel_matvec(&weight.data, x, in_dim, out_dim)?,
                     GGUF_TYPE_Q5_K => fused_q5k_parallel_matvec(&weight.data, x, in_dim, out_dim)?,
+                    // Q6_K: All weights are row-major in TinyLlama
                     GGUF_TYPE_Q6_K => fused_q6k_parallel_matvec(&weight.data, x, in_dim, out_dim)?,
                     _ => {
                         return Err(RealizarError::UnsupportedOperation {
@@ -9525,6 +9528,7 @@ impl OwnedQuantizedModel {
             match weight.qtype {
                 GGUF_TYPE_Q4_K => fused_q4k_parallel_matvec(&weight.data, input, in_dim, out_dim),
                 GGUF_TYPE_Q5_K => fused_q5k_parallel_matvec(&weight.data, input, in_dim, out_dim),
+                // Q6_K: All weights are row-major in TinyLlama
                 GGUF_TYPE_Q6_K => fused_q6k_parallel_matvec(&weight.data, input, in_dim, out_dim),
                 _ => Err(RealizarError::UnsupportedOperation {
                     operation: "owned_fused_matmul".to_string(),
@@ -9618,7 +9622,7 @@ impl OwnedQuantizedModel {
         match qkv {
             OwnedQKVWeights::Fused(ref weight) => {
                 self.fused_rmsnorm_matmul(input, norm_weight, eps, weight)
-            }
+            },
             OwnedQKVWeights::Separate {
                 ref q,
                 ref k,
@@ -9638,7 +9642,7 @@ impl OwnedQuantizedModel {
                 output.extend_from_slice(&k_out);
                 output.extend_from_slice(&v_out);
                 Ok(output)
-            }
+            },
         }
     }
 
@@ -9693,8 +9697,7 @@ impl OwnedQuantizedModel {
         use crate::quantize::fused_rmsnorm_q4_0_matmul;
 
         // Only use fused path for Q4_0 weights
-        if self.lm_head_weight.qtype == GGUF_TYPE_Q4_0
-            && input.len() == self.lm_head_weight.in_dim
+        if self.lm_head_weight.qtype == GGUF_TYPE_Q4_0 && input.len() == self.lm_head_weight.in_dim
         {
             return fused_rmsnorm_q4_0_matmul(
                 input,
@@ -9835,8 +9838,8 @@ impl OwnedQuantizedModel {
         }
     }
 
-    /// Look up token embeddings
-    fn embed(&self, token_ids: &[u32]) -> Vec<f32> {
+    /// Look up token embeddings (public for debugging PAR-001)
+    pub fn embed(&self, token_ids: &[u32]) -> Vec<f32> {
         let hidden_dim = self.config.hidden_dim;
         let mut embeddings = Vec::with_capacity(token_ids.len() * hidden_dim);
 
@@ -11558,11 +11561,11 @@ impl OwnedQuantizedModel {
                 expanded_v
             } else {
                 // Use cached K/V for attention with GQA
-                self.attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v)
+                self.attention_with_cache_gqa(q, k_cache, v_cache, k, v)
             };
 
             // 2e. Store K and V in cache for future tokens
-            cache.append(layer_idx, &k, &v);
+            cache.append(layer_idx, k, v);
 
             // 2f. Attention output projection
             let mut attn_output = self.fused_matmul(&attn_out, &layer.attn_output_weight)?;
@@ -11601,7 +11604,7 @@ impl OwnedQuantizedModel {
                         ffn_gate[i] *= ffn_up[i];
                     }
                     ffn_gate
-                }
+                },
 
                 // Non-fused SwiGLU (LayerNorm models with gate)
                 (ffn_norm_opt, Some(ref gate_weight)) => {
@@ -11632,7 +11635,7 @@ impl OwnedQuantizedModel {
                         ffn_gate[i] *= ffn_up[i];
                     }
                     ffn_gate
-                }
+                },
 
                 // GELU path (phi-2, GPT-2, etc.) - no gate weight
                 (ffn_norm_opt, None) => {
@@ -11657,7 +11660,7 @@ impl OwnedQuantizedModel {
                     }
                     self.gelu(&mut ffn_hidden);
                     ffn_hidden
-                }
+                },
             };
 
             // 2j. FFN down projection
@@ -11933,8 +11936,7 @@ impl OwnedQuantizedModel {
                     result
                 } else {
                     let start = std::time::Instant::now();
-                    let result =
-                        self.attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v);
+                    let result = self.attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v);
                     metrics.record_cpu_dispatch();
                     metrics.record_cpu_latency(start.elapsed());
                     result
