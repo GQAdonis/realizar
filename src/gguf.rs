@@ -3079,7 +3079,9 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         output
     }
 
-    /// Apply RoPE (Rotary Position Embeddings) to Q or K vectors using trueno SIMD
+    /// Apply RoPE (Rotary Position Embeddings) to Q or K vectors
+    ///
+    /// Optimized version using stack-based arrays to avoid heap allocations.
     ///
     /// # Arguments
     /// * `x` - Vector to apply RoPE to [num_heads_in_x * head_dim]
@@ -3090,22 +3092,22 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         let half_dim = head_dim / 2;
         let theta = self.config.rope_theta;
 
-        // Pre-compute cos/sin values for all dimensions
-        let mut cos_vals = Vec::with_capacity(half_dim);
-        let mut sin_vals = Vec::with_capacity(half_dim);
+        // Stack-based buffers (max 128 = 256 head_dim, covers all common models)
+        let mut cos_vals: [f32; 128] = [0.0; 128];
+        let mut sin_vals: [f32; 128] = [0.0; 128];
 
-        for i in 0..half_dim {
-            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-            let angle = position as f32 * freq;
-            cos_vals.push(angle.cos());
-            sin_vals.push(angle.sin());
+        // Pre-compute cos/sin for this position
+        let pos_f32 = position as f32;
+        let head_dim_f32 = head_dim as f32;
+        for i in 0..half_dim.min(128) {
+            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim_f32);
+            let angle = pos_f32 * freq;
+            let (sin_v, cos_v) = angle.sin_cos();
+            cos_vals[i] = cos_v;
+            sin_vals[i] = sin_v;
         }
 
-        // Create SIMD vectors for cos/sin
-        let cos_vec = TruenoVector::from_slice(&cos_vals);
-        let sin_vec = TruenoVector::from_slice(&sin_vals);
-
-        // Apply rotation to each head
+        // Apply rotation to each head using SIMD (AVX-512/AVX2)
         for h in 0..num_heads_in_x {
             let head_start = h * head_dim;
             let idx2_start = head_start + half_dim;
@@ -3114,41 +3116,15 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 continue;
             }
 
-            let x1_slice = &x[head_start..head_start + half_dim];
-            let x2_slice = &x[idx2_start..idx2_start + half_dim];
-
-            let x1_vec = TruenoVector::from_slice(x1_slice);
-            let x2_vec = TruenoVector::from_slice(x2_slice);
-
-            // SIMD rotation
-            let simd_result = x1_vec
-                .mul(&cos_vec)
-                .and_then(|x1_cos| x2_vec.mul(&sin_vec).and_then(|x2_sin| x1_cos.sub(&x2_sin)))
-                .and_then(|new_x1| {
-                    x1_vec.mul(&sin_vec).and_then(|x1_sin| {
-                        x2_vec
-                            .mul(&cos_vec)
-                            .and_then(|x2_cos| x1_sin.add(&x2_cos))
-                            .map(|new_x2| (new_x1, new_x2))
-                    })
-                });
-
-            match simd_result {
-                Ok((new_x1, new_x2)) => {
-                    x[head_start..head_start + half_dim].copy_from_slice(new_x1.as_slice());
-                    x[idx2_start..idx2_start + half_dim].copy_from_slice(new_x2.as_slice());
-                },
-                Err(_) => {
-                    for i in 0..half_dim {
-                        let idx1 = head_start + i;
-                        let idx2 = idx2_start + i;
-                        let x1 = x[idx1];
-                        let x2 = x[idx2];
-                        x[idx1] = x1 * cos_vals[i] - x2 * sin_vals[i];
-                        x[idx2] = x1 * sin_vals[i] + x2 * cos_vals[i];
-                    }
-                },
-            }
+            // Split into first/second halves for SIMD rotation
+            let (first_half, second_half) =
+                x[head_start..head_start + head_dim].split_at_mut(half_dim);
+            crate::quantize::apply_rope_rotation_simd(
+                first_half,
+                second_half,
+                &cos_vals[..half_dim],
+                &sin_vals[..half_dim],
+            );
         }
     }
 
@@ -3207,16 +3183,8 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             let current_score = Self::simd_dot_f32(q_head_data, curr_key);
             scores.push(current_score * scale);
 
-            // Softmax
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_sum = 0.0f32;
-            for s in &mut scores {
-                *s = (*s - max_score).exp();
-                exp_sum += *s;
-            }
-            for s in &mut scores {
-                *s /= exp_sum;
-            }
+            // Softmax (SIMD-optimized)
+            crate::quantize::softmax_simd(&mut scores);
 
             // Weighted sum of values
             let out_head = &mut output[q_head_offset..q_head_offset + head_dim];
@@ -3827,15 +3795,8 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             let current_score = Self::simd_dot_f32(q_head_data, curr_key);
             scores.push(current_score * scale);
 
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_sum = 0.0f32;
-            for s in &mut scores {
-                *s = (*s - max_score).exp();
-                exp_sum += *s;
-            }
-            for s in &mut scores {
-                *s /= exp_sum;
-            }
+            // Softmax (SIMD-optimized)
+            crate::quantize::softmax_simd(&mut scores);
 
             let out_head = &mut output[q_head_offset..q_head_offset + head_dim];
 
@@ -4152,6 +4113,14 @@ impl std::fmt::Debug for OwnedQuantizedModel {
                 &self
                     .cuda_kernel_count
                     .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "cached_weight_count",
+                &self
+                    .cached_weight_names
+                    .lock()
+                    .map(|g| g.len())
+                    .unwrap_or(0),
             );
 
         s.finish()
@@ -10132,72 +10101,40 @@ impl OwnedQuantizedModel {
         let half_dim = head_dim / 2;
         let theta = self.config.rope_theta;
 
-        // Pre-compute cos/sin values for all dimensions (reused across heads)
-        // This is the expensive part - compute once, apply to all heads
-        let mut cos_vals = Vec::with_capacity(half_dim);
-        let mut sin_vals = Vec::with_capacity(half_dim);
+        // Stack-based buffers (max 128 = 256 head_dim, covers all common models)
+        // Avoids heap allocation on every call
+        let mut cos_vals: [f32; 128] = [0.0; 128];
+        let mut sin_vals: [f32; 128] = [0.0; 128];
 
-        for i in 0..half_dim {
-            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-            let angle = position as f32 * freq;
-            cos_vals.push(angle.cos());
-            sin_vals.push(angle.sin());
+        // Pre-compute cos/sin for this position (reused across all heads)
+        let pos_f32 = position as f32;
+        let head_dim_f32 = head_dim as f32;
+        for i in 0..half_dim.min(128) {
+            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim_f32);
+            let angle = pos_f32 * freq;
+            let (sin_v, cos_v) = angle.sin_cos();
+            cos_vals[i] = cos_v;
+            sin_vals[i] = sin_v;
         }
 
-        // Create SIMD vectors for cos/sin (reused across all heads)
-        let cos_vec = TruenoVector::from_slice(&cos_vals);
-        let sin_vec = TruenoVector::from_slice(&sin_vals);
-
-        // Apply rotation to each head using SIMD
+        // Apply rotation to each head using SIMD (AVX-512/AVX2)
         for h in 0..num_heads_in_x {
             let head_start = h * head_dim;
             let idx2_start = head_start + half_dim;
 
-            // Bounds check
             if idx2_start + half_dim > x.len() {
                 continue;
             }
 
-            // Extract first half (x1) and second half (x2) of this head
-            let x1_slice = &x[head_start..head_start + half_dim];
-            let x2_slice = &x[idx2_start..idx2_start + half_dim];
-
-            let x1_vec = TruenoVector::from_slice(x1_slice);
-            let x2_vec = TruenoVector::from_slice(x2_slice);
-
-            // SIMD rotation: [cos -sin; sin cos] * [x1; x2]
-            // new_x1 = x1 * cos - x2 * sin
-            // new_x2 = x1 * sin + x2 * cos
-            let simd_result = x1_vec
-                .mul(&cos_vec)
-                .and_then(|x1_cos| x2_vec.mul(&sin_vec).and_then(|x2_sin| x1_cos.sub(&x2_sin)))
-                .and_then(|new_x1| {
-                    x1_vec.mul(&sin_vec).and_then(|x1_sin| {
-                        x2_vec
-                            .mul(&cos_vec)
-                            .and_then(|x2_cos| x1_sin.add(&x2_cos))
-                            .map(|new_x2| (new_x1, new_x2))
-                    })
-                });
-
-            match simd_result {
-                Ok((new_x1, new_x2)) => {
-                    // Write back results
-                    x[head_start..head_start + half_dim].copy_from_slice(new_x1.as_slice());
-                    x[idx2_start..idx2_start + half_dim].copy_from_slice(new_x2.as_slice());
-                },
-                Err(_) => {
-                    // Fallback to scalar if SIMD fails
-                    for i in 0..half_dim {
-                        let idx1 = head_start + i;
-                        let idx2 = idx2_start + i;
-                        let x1 = x[idx1];
-                        let x2 = x[idx2];
-                        x[idx1] = x1 * cos_vals[i] - x2 * sin_vals[i];
-                        x[idx2] = x1 * sin_vals[i] + x2 * cos_vals[i];
-                    }
-                },
-            }
+            // Split into first/second halves for SIMD rotation
+            let (first_half, second_half) =
+                x[head_start..head_start + head_dim].split_at_mut(half_dim);
+            crate::quantize::apply_rope_rotation_simd(
+                first_half,
+                second_half,
+                &cos_vals[..half_dim],
+                &sin_vals[..half_dim],
+            );
         }
     }
 
@@ -10258,16 +10195,8 @@ impl OwnedQuantizedModel {
                     scores.push(score * scale);
                 }
 
-                // Softmax over causal positions
-                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut exp_sum = 0.0f32;
-                for s in &mut scores {
-                    *s = (*s - max_score).exp();
-                    exp_sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= exp_sum;
-                }
+                // Softmax (SIMD-optimized)
+                crate::quantize::softmax_simd(&mut scores);
 
                 // Weighted sum of values
                 let out_start = i * q_dim + q_head_offset;
@@ -10852,16 +10781,8 @@ impl OwnedQuantizedModel {
             let current_score = Self::simd_dot_f32(q_head, curr_key) * scale;
             scores.push(current_score);
 
-            // Numerically stable softmax: exp(x - max) / sum(exp(x - max))
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_sum = 0.0f32;
-            for s in &mut scores {
-                *s = (*s - max_score).exp();
-                exp_sum += *s;
-            }
-            for s in &mut scores {
-                *s /= exp_sum;
-            }
+            // Softmax (SIMD-optimized)
+            crate::quantize::softmax_simd(&mut scores);
 
             // Weighted sum of values
             let out_head = &mut output[head_offset..head_offset + head_dim];
@@ -11206,20 +11127,12 @@ impl OwnedQuantizedModel {
                         scores.push(score * scale);
                     }
 
-                    // Softmax
-                    let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut exp_scores: Vec<f32> =
-                        scores.iter().map(|&s| (s - max_score).exp()).collect();
-                    let sum: f32 = exp_scores.iter().sum();
-                    if sum > 0.0 {
-                        for s in &mut exp_scores {
-                            *s /= sum;
-                        }
-                    }
+                    // Softmax (SIMD-optimized, in-place)
+                    crate::quantize::softmax_simd(&mut scores);
 
                     // Weighted sum of values
                     let out_start = b * hidden_dim + head_offset;
-                    for (s, &weight) in exp_scores.iter().enumerate() {
+                    for (s, &weight) in scores.iter().enumerate() {
                         let v_start = b * seq_len * hidden_dim + s * hidden_dim + head_offset;
                         for d in 0..head_dim {
                             output[out_start + d] += weight * values[v_start + d];
@@ -11433,16 +11346,8 @@ impl OwnedQuantizedModel {
             let current_score = Self::simd_dot_f32(q_head_data, curr_key);
             scores.push(current_score * scale);
 
-            // Softmax
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_sum = 0.0f32;
-            for s in &mut scores {
-                *s = (*s - max_score).exp();
-                exp_sum += *s;
-            }
-            for s in &mut scores {
-                *s /= exp_sum;
-            }
+            // Softmax (SIMD-optimized)
+            crate::quantize::softmax_simd(&mut scores);
 
             // Weighted sum of values
             let out_head = &mut output[q_head_offset..q_head_offset + head_dim];
@@ -11575,16 +11480,8 @@ impl OwnedQuantizedModel {
             // Scale scores
             let mut scores: Vec<f32> = scores_raw.iter().map(|&s| s * scale).collect();
 
-            // Softmax
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut exp_sum = 0.0f32;
-            for s in &mut scores {
-                *s = (*s - max_score).exp();
-                exp_sum += *s;
-            }
-            for s in &mut scores {
-                *s /= exp_sum;
-            }
+            // Softmax (SIMD-optimized)
+            crate::quantize::softmax_simd(&mut scores);
 
             // Weighted sum of values
             let out_head = &mut output[head_offset..head_offset + head_dim];
@@ -11843,6 +11740,273 @@ impl OwnedQuantizedModel {
         }
 
         Ok(logits)
+    }
+
+    /// Single-token forward pass with pre-allocated scratch buffers
+    ///
+    /// Uses OwnedInferenceScratchBuffer to eliminate per-token allocations.
+    /// For Qwen2.5-0.5B, this saves ~40KB of allocations per token.
+    ///
+    /// # Arguments
+    /// * `token_id` - Token to process
+    /// * `cache` - KV cache for incremental decoding
+    /// * `position` - Position in sequence
+    /// * `scratch` - Pre-allocated scratch buffers
+    ///
+    /// # Returns
+    /// Logits slice from the scratch buffer
+    pub fn forward_single_with_cache_scratch<'a>(
+        &self,
+        token_id: u32,
+        cache: &mut OwnedQuantizedKVCache,
+        position: usize,
+        scratch: &'a mut OwnedInferenceScratchBuffer,
+    ) -> Result<&'a [f32]> {
+        let hidden_dim = self.config.hidden_dim;
+
+        // 1. Token embedding lookup
+        let hidden = self.embed(&[token_id]);
+
+        // Detect if model uses RMSNorm (LLaMA-style) or LayerNorm (phi-2 style)
+        let use_rmsnorm = self
+            .layers
+            .first()
+            .is_some_and(|l| l.ffn_gate_weight.is_some() && l.attn_norm_bias.is_none());
+
+        // Working hidden state (can't avoid this allocation easily)
+        let mut working_hidden = hidden;
+
+        // 2. Process through transformer layers
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // 2a+2b. Fused attention layer norm + QKV projection
+            let mut qkv = if use_rmsnorm {
+                self.fused_rmsnorm_qkv_matmul(
+                    &working_hidden,
+                    &layer.attn_norm_weight,
+                    self.config.eps,
+                    &layer.qkv_weight,
+                )?
+            } else {
+                let normed = self.layer_norm(
+                    &working_hidden,
+                    &layer.attn_norm_weight,
+                    layer.attn_norm_bias.as_deref(),
+                    self.config.eps,
+                );
+                self.qkv_matmul(&normed, &layer.qkv_weight)?
+            };
+            if let Some(ref bias) = layer.qkv_bias {
+                self.add_bias(&mut qkv, bias);
+            }
+
+            // 2c. Extract Q, K, V with GQA-aware sizes and apply RoPE
+            let num_kv_heads = self.config.num_kv_heads;
+            let head_dim = hidden_dim / self.config.num_heads;
+            let kv_dim = num_kv_heads * head_dim;
+
+            // Apply RoPE in-place to Q and K within QKV buffer
+            self.apply_rope(&mut qkv[0..hidden_dim], position, self.config.num_heads);
+            self.apply_rope(
+                &mut qkv[hidden_dim..hidden_dim + kv_dim],
+                position,
+                num_kv_heads,
+            );
+
+            // Use slices to avoid copies
+            let q = &qkv[0..hidden_dim];
+            let k = &qkv[hidden_dim..hidden_dim + kv_dim];
+            let v = &qkv[hidden_dim + kv_dim..hidden_dim + 2 * kv_dim];
+
+            // 2d. Get cached K/V and compute attention
+            let k_cache = cache.get_k(layer_idx);
+            let v_cache = cache.get_v(layer_idx);
+
+            // Reuse scratch.attn_out for attention output
+            scratch.attn_out.clear();
+            scratch.attn_out.resize(hidden_dim, 0.0);
+
+            if k_cache.is_empty() {
+                // First token - expand V if GQA
+                let q_per_kv = self.config.num_heads / num_kv_heads;
+                for q_head in 0..self.config.num_heads {
+                    let kv_head = q_head / q_per_kv;
+                    let v_start = kv_head * head_dim;
+                    let out_start = q_head * head_dim;
+                    scratch.attn_out[out_start..out_start + head_dim]
+                        .copy_from_slice(&v[v_start..v_start + head_dim]);
+                }
+            } else {
+                // Use cached K/V for attention with GQA
+                let attn_result = self.attention_with_cache_gqa(q, k_cache, v_cache, k, v);
+                scratch.attn_out.copy_from_slice(&attn_result);
+            }
+
+            // 2e. Store K and V in cache
+            cache.append(layer_idx, k, v);
+
+            // 2f. Attention output projection
+            let mut attn_output =
+                self.fused_matmul(&scratch.attn_out, &layer.attn_output_weight)?;
+            if let Some(ref bias) = layer.attn_output_bias {
+                self.add_bias(&mut attn_output, bias);
+            }
+
+            // 2g. Residual connection
+            for i in 0..hidden_dim {
+                working_hidden[i] += attn_output[i];
+            }
+
+            // 2h+2i. FFN with SwiGLU/GELU
+            // For RMSNorm+SwiGLU: use zero-allocation path with scratch buffers
+            // For other paths: use allocating path
+            let ffn_output = if use_rmsnorm
+                && layer.ffn_norm_weight.is_some()
+                && layer.ffn_gate_weight.is_some()
+            {
+                let ffn_norm = layer.ffn_norm_weight.as_ref().unwrap();
+                let gate_weight = layer.ffn_gate_weight.as_ref().unwrap();
+
+                // Get FFN dimensions for this layer
+                let ffn_out_dim = layer.ffn_up_weight.out_dim;
+
+                // Resize scratch buffers to match layer dimensions
+                scratch.ffn_up.resize(ffn_out_dim, 0.0);
+                scratch.ffn_gate.resize(ffn_out_dim, 0.0);
+
+                // Zero-allocation FFN using scratch buffers
+                crate::quantize::fused_rmsnorm_ffn_up_gate_into(
+                    &working_hidden,
+                    ffn_norm,
+                    self.config.eps,
+                    &layer.ffn_up_weight.data,
+                    &gate_weight.data,
+                    hidden_dim,
+                    ffn_out_dim,
+                    &mut scratch.ffn_up,
+                    &mut scratch.ffn_gate,
+                    &mut scratch.q8_scales,
+                    &mut scratch.q8_quants,
+                )?;
+
+                if let Some(ref bias) = layer.ffn_up_bias {
+                    self.add_bias(&mut scratch.ffn_up, bias);
+                }
+                if let Some(ref bias) = layer.ffn_gate_bias {
+                    self.add_bias(&mut scratch.ffn_gate, bias);
+                }
+
+                // SwiGLU: silu(gate) * up, result in ffn_gate
+                self.silu(&mut scratch.ffn_gate);
+                for i in 0..scratch.ffn_gate.len() {
+                    scratch.ffn_gate[i] *= scratch.ffn_up[i];
+                }
+
+                // FFN down projection using scratch buffer directly
+                let mut result = self.fused_matmul(&scratch.ffn_gate, &layer.ffn_down_weight)?;
+                if let Some(ref bias) = layer.ffn_down_bias {
+                    self.add_bias(&mut result, bias);
+                }
+                result
+            } else {
+                // Non-optimized paths
+                let ffn_activated = match (&layer.ffn_norm_weight, &layer.ffn_gate_weight) {
+                    // Non-fused SwiGLU
+                    (ffn_norm_opt, Some(ref gate_weight)) => {
+                        let ffn_input = if let Some(ref ffn_norm) = ffn_norm_opt {
+                            self.layer_norm(
+                                &working_hidden,
+                                ffn_norm,
+                                layer.ffn_norm_bias.as_deref(),
+                                self.config.eps,
+                            )
+                        } else {
+                            working_hidden.clone()
+                        };
+
+                        let mut ffn_up = self.fused_matmul(&ffn_input, &layer.ffn_up_weight)?;
+                        if let Some(ref bias) = layer.ffn_up_bias {
+                            self.add_bias(&mut ffn_up, bias);
+                        }
+
+                        let mut ffn_gate = self.fused_matmul(&ffn_input, gate_weight)?;
+                        if let Some(ref bias) = layer.ffn_gate_bias {
+                            self.add_bias(&mut ffn_gate, bias);
+                        }
+
+                        // SwiGLU: silu(gate) * up
+                        self.silu(&mut ffn_gate);
+                        for i in 0..ffn_gate.len() {
+                            ffn_gate[i] *= ffn_up[i];
+                        }
+                        ffn_gate
+                    },
+
+                    // GELU path
+                    (ffn_norm_opt, None) => {
+                        let ffn_input = if let Some(ref ffn_norm) = ffn_norm_opt {
+                            if use_rmsnorm {
+                                self.rms_norm(&working_hidden, ffn_norm, self.config.eps)
+                            } else {
+                                self.layer_norm(
+                                    &working_hidden,
+                                    ffn_norm,
+                                    layer.ffn_norm_bias.as_deref(),
+                                    self.config.eps,
+                                )
+                            }
+                        } else {
+                            working_hidden.clone()
+                        };
+
+                        let mut ffn_hidden = self.fused_matmul(&ffn_input, &layer.ffn_up_weight)?;
+                        if let Some(ref bias) = layer.ffn_up_bias {
+                            self.add_bias(&mut ffn_hidden, bias);
+                        }
+                        self.gelu(&mut ffn_hidden);
+                        ffn_hidden
+                    },
+                };
+
+                // FFN down projection
+                let mut result = self.fused_matmul(&ffn_activated, &layer.ffn_down_weight)?;
+                if let Some(ref bias) = layer.ffn_down_bias {
+                    self.add_bias(&mut result, bias);
+                }
+                result
+            };
+
+            // Residual
+            for i in 0..hidden_dim {
+                working_hidden[i] += ffn_output[i];
+            }
+        }
+
+        // Advance cache position
+        cache.advance();
+
+        // 3+4. Fused final layer norm + LM head projection
+        // Reuse scratch.logits for output
+        let logits_vec = if use_rmsnorm {
+            self.fused_rmsnorm_lm_head(&working_hidden)?
+        } else {
+            let normed = self.layer_norm(
+                &working_hidden,
+                &self.output_norm_weight,
+                self.output_norm_bias.as_deref(),
+                self.config.eps,
+            );
+            self.fused_matmul(&normed, &self.lm_head_weight)?
+        };
+
+        // Copy to scratch buffer (this is the output)
+        scratch.logits.clear();
+        scratch.logits.extend_from_slice(&logits_vec);
+
+        if let Some(ref bias) = self.lm_head_bias {
+            self.add_bias(&mut scratch.logits, bias);
+        }
+
+        Ok(&scratch.logits)
     }
 
     /// Forward pass with adaptive CPU/GPU attention selection (IMP-124)
@@ -12788,16 +12952,13 @@ impl OwnedQuantizedModel {
                     .map_err(|e| RealizarError::GpuError { reason: e })?;
 
                 // Scale scores
-                let scores: Vec<f32> = scores_raw.iter().map(|&s| s * scale).collect();
+                let mut scores: Vec<f32> = scores_raw.iter().map(|&s| s * scale).collect();
 
-                // Softmax
-                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_scores: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
-                let sum_exp: f32 = exp_scores.iter().sum();
-                let attention: Vec<f32> = exp_scores.iter().map(|e| e / sum_exp).collect();
+                // Softmax (SIMD-optimized, in-place)
+                crate::quantize::softmax_simd(&mut scores);
 
                 // Weighted sum of values using GPU matmul
-                // attention[1, attend_len] @ V[attend_len, head_dim] = output[1, head_dim]
+                // scores[1, attend_len] @ V[attend_len, head_dim] = output[1, head_dim]
                 let mut v_head = vec![0.0f32; attend_len * head_dim];
                 for (pos, v_pos) in (0..attend_len).enumerate() {
                     let v_offset = v_pos * hidden_dim + head_start;
@@ -12807,7 +12968,7 @@ impl OwnedQuantizedModel {
                 }
 
                 let head_output = gpu
-                    .matmul(&attention, &v_head, 1, attend_len, head_dim)
+                    .matmul(&scores, &v_head, 1, attend_len, head_dim)
                     .map_err(|e| RealizarError::GpuError { reason: e })?;
 
                 // Copy to output
@@ -12900,14 +13061,11 @@ impl OwnedQuantizedModel {
                 scores.push(score * scale);
             }
 
-            // Softmax
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exp_scores: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
-            let sum_exp: f32 = exp_scores.iter().sum();
-            let attention: Vec<f32> = exp_scores.iter().map(|e| e / sum_exp).collect();
+            // Softmax (SIMD-optimized, in-place)
+            crate::quantize::softmax_simd(&mut scores);
 
             // Weighted sum of values
-            for (attn, v) in attention.iter().zip(v_vecs.iter()) {
+            for (attn, v) in scores.iter().zip(v_vecs.iter()) {
                 let v_head = &v[head_start..head_end];
                 for (i, &v_val) in v_head.iter().enumerate() {
                     output[head_start + i] += attn * v_val;
@@ -15887,6 +16045,9 @@ impl OwnedQuantizedModelCuda {
             }
 
             // 2h/2i. FFN (PAR-014: fused path temporarily disabled for debugging)
+            // NOTE: Fused FFN path is disabled by setting condition to false
+            // This will be re-enabled once CUDA kernel correctness is verified
+            #[allow(clippy::overly_complex_bool_expr)]
             let ffn_output = if false
                 && ffn_up_bias.is_none()
                 && ffn_down_bias.is_none()
@@ -16837,6 +16998,78 @@ impl OwnedQuantizedKVCache {
     #[must_use]
     pub fn max_len(&self) -> usize {
         self.max_seq_len
+    }
+}
+
+// ============================================================================
+// OwnedInferenceScratchBuffer: Pre-allocated buffers for zero-alloc forward
+// ============================================================================
+
+/// Pre-allocated scratch buffers for OwnedQuantizedModel inference
+///
+/// Eliminates per-token allocations by reusing buffers across forward passes.
+/// For Qwen2.5-0.5B with intermediate_dim=4864, this saves ~40KB per token.
+#[derive(Debug)]
+pub struct OwnedInferenceScratchBuffer {
+    /// QKV output buffer [hidden_dim + 2*kv_dim]
+    pub qkv: Vec<f32>,
+    /// Attention output buffer [hidden_dim]
+    pub attn_out: Vec<f32>,
+    /// FFN up projection buffer [intermediate_dim]
+    pub ffn_up: Vec<f32>,
+    /// FFN gate projection buffer [intermediate_dim]
+    pub ffn_gate: Vec<f32>,
+    /// FFN down output buffer [hidden_dim]
+    pub ffn_down: Vec<f32>,
+    /// Expanded V buffer for first token GQA [hidden_dim]
+    pub expanded_v: Vec<f32>,
+    /// Logits buffer [vocab_size]
+    pub logits: Vec<f32>,
+    /// Q8 quantization scales scratch [num_blocks]
+    pub q8_scales: Vec<f32>,
+    /// Q8 quantization values scratch [num_blocks * 32]
+    pub q8_quants: Vec<i8>,
+}
+
+impl OwnedInferenceScratchBuffer {
+    /// Create scratch buffer from model config
+    #[must_use]
+    pub fn from_config(config: &GGUFConfig) -> Self {
+        let hidden_dim = config.hidden_dim;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = hidden_dim / config.num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let qkv_dim = hidden_dim + 2 * kv_dim;
+        // Qwen2.5 uses intermediate = 5.5 * hidden, others use 4 * hidden
+        let intermediate_dim = hidden_dim * 6; // Conservative estimate
+                                               // Q8 quantization uses 32-element blocks
+        let num_blocks = hidden_dim.div_ceil(32);
+
+        Self {
+            qkv: vec![0.0f32; qkv_dim],
+            attn_out: vec![0.0f32; hidden_dim],
+            ffn_up: vec![0.0f32; intermediate_dim],
+            ffn_gate: vec![0.0f32; intermediate_dim],
+            ffn_down: vec![0.0f32; hidden_dim],
+            expanded_v: vec![0.0f32; hidden_dim],
+            logits: vec![0.0f32; config.vocab_size],
+            q8_scales: vec![0.0f32; num_blocks],
+            q8_quants: vec![0i8; num_blocks * 32],
+        }
+    }
+
+    /// Reset all buffers (clear without deallocating)
+    pub fn reset(&mut self) {
+        // Just zero the lengths, keeping capacity
+        self.qkv.clear();
+        self.attn_out.clear();
+        self.ffn_up.clear();
+        self.ffn_gate.clear();
+        self.ffn_down.clear();
+        self.expanded_v.clear();
+        self.logits.clear();
+        self.q8_scales.clear();
+        self.q8_quants.clear();
     }
 }
 
@@ -17994,7 +18227,7 @@ impl CudaBackend {
     #[must_use]
     pub const fn validate_dimensions(&self) -> bool {
         // K must be divisible by Q4_K block size (32)
-        let k_valid = self.k % 32 == 0;
+        let k_valid = self.k.is_multiple_of(32);
         // Head dim should be power of 2 for efficient memory access
         let head_dim_valid = self.head_dim.is_power_of_two();
         // Dimensions must be non-zero
@@ -19206,6 +19439,8 @@ mod tests {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Create test vector
@@ -19259,6 +19494,8 @@ mod tests {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Apply RoPE at different positions
@@ -19327,6 +19564,8 @@ mod tests {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Create test Q, K, V (seq_len=4, hidden_dim=8)
@@ -19393,6 +19632,8 @@ mod tests {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Create identity K (each position is unique)
@@ -19553,6 +19794,8 @@ mod tests {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Test attention with cache
@@ -19809,6 +20052,8 @@ mod tests {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -25833,8 +26078,8 @@ mod tests {
         fn median(values: &mut [f64]) -> f64 {
             values.sort_by(|a, b| a.partial_cmp(b).expect("test"));
             let mid = values.len() / 2;
-            if values.len() % 2 == 0 {
-                (values[mid - 1] + values[mid]) / 2.0
+            if values.len().is_multiple_of(2) {
+                f64::midpoint(values[mid - 1], values[mid])
             } else {
                 values[mid]
             }
@@ -36251,6 +36496,7 @@ mod tests {
             lm_head_bias: None,
             cuda_executor: None,
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         let cuda_model = OwnedQuantizedModelCuda::new(model, 0);
