@@ -1309,7 +1309,11 @@ impl GGUFModel {
                 remaining = &remaining[best_byte_len..];
             } else {
                 // No match found - try single UTF-8 char as byte tokens
-                let ch = remaining.chars().next().unwrap();
+                // SAFETY: remaining is non-empty (loop condition guarantees this)
+                let ch = remaining
+                    .chars()
+                    .next()
+                    .expect("loop invariant: remaining non-empty");
                 let ch_len = ch.len_utf8();
 
                 // Look for byte tokens like <0x48> for 'H'
@@ -1666,7 +1670,7 @@ impl GGUFTransformer {
                 embeddings.extend_from_slice(&self.token_embedding[start..end]);
             } else {
                 // Pad with zeros for out-of-bounds tokens
-                embeddings.extend(std::iter::repeat(0.0).take(hidden_dim));
+                embeddings.extend(std::iter::repeat_n(0.0, hidden_dim));
             }
         }
 
@@ -2585,7 +2589,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             if end <= self.token_embedding.len() {
                 embeddings.extend_from_slice(&self.token_embedding[start..end]);
             } else {
-                embeddings.extend(std::iter::repeat(0.0).take(hidden_dim));
+                embeddings.extend(std::iter::repeat_n(0.0, hidden_dim));
             }
         }
 
@@ -2912,42 +2916,53 @@ impl<'a> QuantizedGGUFTransformer<'a> {
     #[target_feature(enable = "avx2", enable = "fma")]
     #[inline]
     unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-        use std::arch::x86_64::{
-            _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
-            _mm_movehl_ps,
-        };
+        unsafe {
+            use std::arch::x86_64::{
+                _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+                _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
+                _mm_movehl_ps,
+            };
 
-        let len = a.len().min(b.len());
-        let mut acc = _mm256_setzero_ps();
-        let mut i = 0;
+            let len = a.len().min(b.len());
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
 
-        // Process 8 floats at a time
-        while i + 8 <= len {
-            // SAFETY: bounds checked above, pointers valid
-            let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
-            let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
-            acc = _mm256_fmadd_ps(va, vb, acc);
-            i += 8;
+            // Process 16 floats at a time (2x unrolled for better ILP)
+            while i + 16 <= len {
+                let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+                let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+                let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+                acc = _mm256_fmadd_ps(va0, vb0, acc);
+                acc = _mm256_fmadd_ps(va1, vb1, acc);
+                i += 16;
+            }
+            // Handle remaining 8-float chunk
+            if i + 8 <= len {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                acc = _mm256_fmadd_ps(va, vb, acc);
+                i += 8;
+            }
+
+            // Horizontal sum
+            let hi = _mm256_extractf128_ps(acc, 1);
+            let lo = _mm256_castps256_ps128(acc);
+            let sum128 = _mm_add_ps(lo, hi);
+            let shuf = _mm_movehdup_ps(sum128);
+            let sums = _mm_add_ps(sum128, shuf);
+            let shuf2 = _mm_movehl_ps(sums, sums);
+            let result = _mm_add_ss(sums, shuf2);
+            let mut sum = _mm_cvtss_f32(result);
+
+            // Handle remaining elements
+            while i < len {
+                sum += a[i] * b[i];
+                i += 1;
+            }
+
+            sum
         }
-
-        // Horizontal sum
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let lo = _mm256_castps256_ps128(acc);
-        let sum128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let result = _mm_add_ss(sums, shuf2);
-        let mut sum = _mm_cvtss_f32(result);
-
-        // Handle remaining elements
-        while i < len {
-            sum += a[i] * b[i];
-            i += 1;
-        }
-
-        sum
     }
 
     #[inline]
@@ -4112,6 +4127,10 @@ pub struct OwnedQuantizedModel {
     /// Uses AtomicU64 for thread-safe counting
     #[cfg(feature = "cuda")]
     pub(crate) cuda_kernel_count: std::sync::atomic::AtomicU64,
+    /// PARITY-003: Set of weight names that have been cached on GPU
+    /// Used to avoid repeated dequantization for the same weight
+    #[cfg(feature = "cuda")]
+    pub(crate) cached_weight_names: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 // Manual Debug implementation (skip CUDA executor which doesn't impl Debug)
@@ -4155,6 +4174,8 @@ impl Clone for OwnedQuantizedModel {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -6791,7 +6812,11 @@ impl OwnedQuantizedModelCachedSync {
                 // Collect tokens, positions, and cache slices for active prompts
                 let batch_tokens: Vec<u32> = active_indices
                     .iter()
-                    .map(|&idx| *sequences[idx].last().unwrap())
+                    .map(|&idx| {
+                        *sequences[idx]
+                            .last()
+                            .expect("sequence must have at least prompt tokens")
+                    })
                     .collect();
 
                 let batch_positions: Vec<usize> = active_indices
@@ -6840,7 +6865,9 @@ impl OwnedQuantizedModelCachedSync {
                 // Sequential forward for small batches (CPU is faster)
                 for &prompt_idx in &active_indices {
                     let position = prompts[prompt_idx].len() + gen_idx;
-                    let last_token = *sequences[prompt_idx].last().unwrap();
+                    let last_token = *sequences[prompt_idx]
+                        .last()
+                        .expect("sequence must have at least prompt tokens");
 
                     let logits = self.model.forward_single_with_cache(
                         last_token,
@@ -7996,7 +8023,7 @@ impl GpuBufferPool {
     pub fn warmup(&self) {
         // Pre-allocate hidden state buffers
         {
-            let mut buffers = self.hidden_buffers.lock().unwrap();
+            let mut buffers = self.hidden_buffers.lock().expect("mutex poisoned");
             for _ in 0..self.pool_size {
                 buffers.push(vec![0.0f32; self.hidden_dim]);
             }
@@ -8004,7 +8031,7 @@ impl GpuBufferPool {
 
         // Pre-allocate intermediate buffers (FFN)
         {
-            let mut buffers = self.intermediate_buffers.lock().unwrap();
+            let mut buffers = self.intermediate_buffers.lock().expect("mutex poisoned");
             for _ in 0..self.pool_size {
                 buffers.push(vec![0.0f32; self.intermediate_dim]);
             }
@@ -8012,7 +8039,7 @@ impl GpuBufferPool {
 
         // Pre-allocate attention score buffers
         {
-            let mut buffers = self.attention_buffers.lock().unwrap();
+            let mut buffers = self.attention_buffers.lock().expect("mutex poisoned");
             for _ in 0..self.pool_size {
                 buffers.push(vec![0.0f32; self.num_heads * self.max_seq_len]);
             }
@@ -8029,7 +8056,7 @@ impl GpuBufferPool {
         self.borrows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let mut buffers = self.hidden_buffers.lock().unwrap();
+        let mut buffers = self.hidden_buffers.lock().expect("mutex poisoned");
         if let Some(buffer) = buffers.pop() {
             buffer
         } else {
@@ -8050,7 +8077,7 @@ impl GpuBufferPool {
         // Zero out for security and determinism
         buffer.fill(0.0);
 
-        let mut buffers = self.hidden_buffers.lock().unwrap();
+        let mut buffers = self.hidden_buffers.lock().expect("mutex poisoned");
         if buffers.len() < self.pool_size {
             buffers.push(buffer);
         }
@@ -8062,7 +8089,7 @@ impl GpuBufferPool {
         self.borrows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let mut buffers = self.intermediate_buffers.lock().unwrap();
+        let mut buffers = self.intermediate_buffers.lock().expect("mutex poisoned");
         if let Some(buffer) = buffers.pop() {
             buffer
         } else {
@@ -8080,7 +8107,7 @@ impl GpuBufferPool {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         buffer.fill(0.0);
 
-        let mut buffers = self.intermediate_buffers.lock().unwrap();
+        let mut buffers = self.intermediate_buffers.lock().expect("mutex poisoned");
         if buffers.len() < self.pool_size {
             buffers.push(buffer);
         }
@@ -8091,7 +8118,7 @@ impl GpuBufferPool {
         self.borrows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let mut buffers = self.attention_buffers.lock().unwrap();
+        let mut buffers = self.attention_buffers.lock().expect("mutex poisoned");
         if let Some(buffer) = buffers.pop() {
             buffer
         } else {
@@ -8109,7 +8136,7 @@ impl GpuBufferPool {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         buffer.fill(0.0);
 
-        let mut buffers = self.attention_buffers.lock().unwrap();
+        let mut buffers = self.attention_buffers.lock().expect("mutex poisoned");
         if buffers.len() < self.pool_size {
             buffers.push(buffer);
         }
@@ -8133,9 +8160,13 @@ impl GpuBufferPool {
                 .post_warmup_allocs
                 .load(std::sync::atomic::Ordering::Relaxed),
             warmed_up: self.warmed_up.load(std::sync::atomic::Ordering::Acquire),
-            hidden_available: self.hidden_buffers.lock().unwrap().len(),
-            intermediate_available: self.intermediate_buffers.lock().unwrap().len(),
-            attention_available: self.attention_buffers.lock().unwrap().len(),
+            hidden_available: self.hidden_buffers.lock().expect("mutex poisoned").len(),
+            intermediate_available: self
+                .intermediate_buffers
+                .lock()
+                .expect("mutex poisoned")
+                .len(),
+            attention_available: self.attention_buffers.lock().expect("mutex poisoned").len(),
         }
     }
 
@@ -8262,7 +8293,7 @@ impl AsyncCommandQueue {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             % 2;
 
-        let mut slot = self.slots[slot_idx].lock().unwrap();
+        let mut slot = self.slots[slot_idx].lock().expect("mutex poisoned");
 
         // Check if we need to wait for previous command
         if matches!(
@@ -8292,7 +8323,7 @@ impl AsyncCommandQueue {
 
     /// Mark a command as complete with output
     pub fn complete(&self, slot_idx: usize, output: Vec<f32>) {
-        let mut slot = self.slots[slot_idx].lock().unwrap();
+        let mut slot = self.slots[slot_idx].lock().expect("mutex poisoned");
         slot.state = CommandSlotState::Complete;
         slot.output = Some(output);
         self.commands_completed
@@ -8303,7 +8334,7 @@ impl AsyncCommandQueue {
     ///
     /// Returns None if command is not complete yet.
     pub fn get_output(&self, slot_idx: usize) -> Option<Vec<f32>> {
-        let mut slot = self.slots[slot_idx].lock().unwrap();
+        let mut slot = self.slots[slot_idx].lock().expect("mutex poisoned");
         if matches!(slot.state, CommandSlotState::Complete) {
             slot.state = CommandSlotState::Empty;
             slot.output.take()
@@ -8314,7 +8345,7 @@ impl AsyncCommandQueue {
 
     /// Check if a slot is ready for new commands
     pub fn is_slot_ready(&self, slot_idx: usize) -> bool {
-        let slot = self.slots[slot_idx].lock().unwrap();
+        let slot = self.slots[slot_idx].lock().expect("mutex poisoned");
         matches!(
             slot.state,
             CommandSlotState::Empty | CommandSlotState::Complete
@@ -8465,7 +8496,7 @@ impl PrefixCache {
     pub fn lookup(&self, tokens: &[u32]) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
         let hash = Self::hash_tokens(tokens);
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().expect("mutex poisoned");
         if let Some(entry) = entries.get_mut(&hash) {
             // Verify tokens match (hash collision check)
             if entry.tokens == tokens {
@@ -8487,7 +8518,7 @@ impl PrefixCache {
     pub fn insert(&self, tokens: Vec<u32>, k_cache: Vec<Vec<f32>>, v_cache: Vec<Vec<f32>>) {
         let hash = Self::hash_tokens(&tokens);
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().expect("mutex poisoned");
 
         // Evict LRU if at capacity
         if entries.len() >= self.max_entries {
@@ -8514,7 +8545,7 @@ impl PrefixCache {
     /// Check if a prefix is cached
     pub fn contains(&self, tokens: &[u32]) -> bool {
         let hash = Self::hash_tokens(tokens);
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().expect("mutex poisoned");
         entries.contains_key(&hash)
     }
 
@@ -8528,7 +8559,7 @@ impl PrefixCache {
             hits,
             misses,
             evictions: self.evictions.load(std::sync::atomic::Ordering::Relaxed),
-            entries: self.entries.lock().unwrap().len(),
+            entries: self.entries.lock().expect("mutex poisoned").len(),
             hit_rate: if total > 0 {
                 hits as f64 / total as f64
             } else {
@@ -8539,13 +8570,13 @@ impl PrefixCache {
 
     /// Clear all cached entries
     pub fn clear(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().expect("mutex poisoned");
         entries.clear();
     }
 
     /// Estimate memory usage of cached prefixes
     pub fn memory_usage_bytes(&self) -> usize {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().expect("mutex poisoned");
         entries
             .values()
             .map(|e| {
@@ -8729,7 +8760,7 @@ impl MultiRequestScheduler {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = MultiSchedulerRequest::new(id, tokens, max_tokens);
 
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock().expect("mutex poisoned");
         pending.push_back(request);
         self.requests_submitted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8741,8 +8772,8 @@ impl MultiRequestScheduler {
     ///
     /// Returns request IDs and their current positions
     pub fn get_decode_batch(&self) -> Vec<(u64, usize)> {
-        let mut active = self.active.lock().unwrap();
-        let mut pending = self.pending.lock().unwrap();
+        let mut active = self.active.lock().expect("mutex poisoned");
+        let mut pending = self.pending.lock().expect("mutex poisoned");
 
         // Promote pending requests to active (up to max_concurrent)
         while active.len() < self.max_concurrent && !pending.is_empty() {
@@ -8780,7 +8811,7 @@ impl MultiRequestScheduler {
 
     /// Record generated token for a request
     pub fn record_token(&self, request_id: u64, token: u32) {
-        let mut active = self.active.lock().unwrap();
+        let mut active = self.active.lock().expect("mutex poisoned");
 
         if let Some(req) = active.iter_mut().find(|r| r.id == request_id) {
             // Record TTFT for first token
@@ -8802,8 +8833,8 @@ impl MultiRequestScheduler {
 
     /// Move completed requests from active to completed
     pub fn collect_completed(&self) -> Vec<MultiSchedulerRequest> {
-        let mut active = self.active.lock().unwrap();
-        let mut completed = self.completed.lock().unwrap();
+        let mut active = self.active.lock().expect("mutex poisoned");
+        let mut completed = self.completed.lock().expect("mutex poisoned");
 
         let (done, still_active): (Vec<_>, Vec<_>) = active
             .drain(..)
@@ -8841,8 +8872,8 @@ impl MultiRequestScheduler {
             .batch_iterations
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let pending = self.pending.lock().unwrap().len();
-        let active = self.active.lock().unwrap().len();
+        let pending = self.pending.lock().expect("mutex poisoned").len();
+        let active = self.active.lock().expect("mutex poisoned").len();
 
         MultiRequestStats {
             requests_submitted: submitted,
@@ -9133,6 +9164,8 @@ impl OwnedQuantizedModel {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -9161,6 +9194,8 @@ impl OwnedQuantizedModel {
             cuda_executor: None,
             #[cfg(feature = "cuda")]
             cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -9240,9 +9275,13 @@ impl OwnedQuantizedModel {
             let gemm_start = std::time::Instant::now();
             let mut output = vec![0.0f32; seq_len * out_dim];
 
-            // PARITY-115: Use native Q4_K kernel for Q4_K weights
+            // PAR-003/PAR-005: Use native Q4_K GEMV kernel with cached weights
+            // PAR-003: Optimized for M=1 token generation with warp shuffle reduction
+            // PAR-005: Weights cached on GPU to avoid ~50+ CPU→GPU transfers per token
             if weight.qtype == GGUF_TYPE_Q4_K && seq_len == 1 {
-                // Native Q4_K CUDA kernel - no dequantization overhead
+                // Use data pointer as unique cache key (stable since model owns data)
+                let cache_key = format!("q4k_{:016x}", weight.data.as_ptr() as usize);
+
                 {
                     let mut executor =
                         executor_mutex
@@ -9251,27 +9290,39 @@ impl OwnedQuantizedModel {
                                 operation: "cuda_q4k_lock".to_string(),
                                 reason: format!("Failed to acquire CUDA executor lock: {e}"),
                             })?;
+
+                    // PAR-005: Lazy cache - upload weights on first use
+                    if !executor.has_quantized_weights(&cache_key) {
+                        executor
+                            .load_quantized_weights(&cache_key, &weight.data)
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "cuda_q4k_cache".to_string(),
+                                reason: format!("Failed to cache Q4_K weights: {e}"),
+                            })?;
+                    }
+
+                    // Use cached GEMV (no weight transfer)
                     executor
-                        .q4k_matvec(
-                            &weight.data,
+                        .q4k_gemv_cached(
+                            &cache_key,
                             input,
                             &mut output,
                             out_dim as u32,
                             in_dim as u32,
                         )
                         .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "cuda_q4k_matvec".to_string(),
-                            reason: format!("CUDA Q4_K matvec failed: {e}"),
+                            operation: "cuda_q4k_gemv".to_string(),
+                            reason: format!("CUDA Q4_K GEMV failed: {e}"),
                         })?;
                 }
                 let gemm_duration_us = gemm_start.elapsed().as_micros() as u64;
 
-                // Emit tracing span for Q4_K kernel
+                // Emit tracing span for Q4_K GEMV kernel
                 let _span = info_span!(
-                    "gpu_kernel:q4k_matvec",
+                    "gpu_kernel:q4k_gemv",
                     gpu.backend = "cuda",
-                    gpu.kernel = "q4k_matvec",
-                    gpu.dimensions.m = out_dim,
+                    gpu.kernel = "q4k_gemv_cached",
+                    gpu.dimensions.n = out_dim,
                     gpu.dimensions.k = in_dim,
                     duration_us = gemm_duration_us,
                 )
@@ -9283,8 +9334,10 @@ impl OwnedQuantizedModel {
                 return Ok(output);
             }
 
-            // PARITY-118: Use native Q5_K kernel for Q5_K weights
+            // PAR-003/PAR-005: Use native Q5_K GEMV kernel with cached weights
             if weight.qtype == GGUF_TYPE_Q5_K && seq_len == 1 {
+                let cache_key = format!("q5k_{:016x}", weight.data.as_ptr() as usize);
+
                 {
                     let mut executor =
                         executor_mutex
@@ -9293,26 +9346,37 @@ impl OwnedQuantizedModel {
                                 operation: "cuda_q5k_lock".to_string(),
                                 reason: format!("Failed to acquire CUDA executor lock: {e}"),
                             })?;
+
+                    // PAR-005: Lazy cache
+                    if !executor.has_quantized_weights(&cache_key) {
+                        executor
+                            .load_quantized_weights(&cache_key, &weight.data)
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "cuda_q5k_cache".to_string(),
+                                reason: format!("Failed to cache Q5_K weights: {e}"),
+                            })?;
+                    }
+
                     executor
-                        .q5k_matvec(
-                            &weight.data,
+                        .q5k_gemv_cached(
+                            &cache_key,
                             input,
                             &mut output,
                             out_dim as u32,
                             in_dim as u32,
                         )
                         .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "cuda_q5k_matvec".to_string(),
-                            reason: format!("CUDA Q5_K matvec failed: {e}"),
+                            operation: "cuda_q5k_gemv".to_string(),
+                            reason: format!("CUDA Q5_K GEMV failed: {e}"),
                         })?;
                 }
                 let gemm_duration_us = gemm_start.elapsed().as_micros() as u64;
 
                 let _span = info_span!(
-                    "gpu_kernel:q5k_matvec",
+                    "gpu_kernel:q5k_gemv",
                     gpu.backend = "cuda",
-                    gpu.kernel = "q5k_matvec",
-                    gpu.dimensions.m = out_dim,
+                    gpu.kernel = "q5k_gemv_cached",
+                    gpu.dimensions.n = out_dim,
                     gpu.dimensions.k = in_dim,
                     duration_us = gemm_duration_us,
                 )
@@ -9324,8 +9388,10 @@ impl OwnedQuantizedModel {
                 return Ok(output);
             }
 
-            // PARITY-118: Use native Q6_K kernel for Q6_K weights
+            // PAR-003/PAR-005: Use native Q6_K GEMV kernel with cached weights
             if weight.qtype == GGUF_TYPE_Q6_K && seq_len == 1 {
+                let cache_key = format!("q6k_{:016x}", weight.data.as_ptr() as usize);
+
                 {
                     let mut executor =
                         executor_mutex
@@ -9334,26 +9400,37 @@ impl OwnedQuantizedModel {
                                 operation: "cuda_q6k_lock".to_string(),
                                 reason: format!("Failed to acquire CUDA executor lock: {e}"),
                             })?;
+
+                    // PAR-005: Lazy cache
+                    if !executor.has_quantized_weights(&cache_key) {
+                        executor
+                            .load_quantized_weights(&cache_key, &weight.data)
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "cuda_q6k_cache".to_string(),
+                                reason: format!("Failed to cache Q6_K weights: {e}"),
+                            })?;
+                    }
+
                     executor
-                        .q6k_matvec(
-                            &weight.data,
+                        .q6k_gemv_cached(
+                            &cache_key,
                             input,
                             &mut output,
                             out_dim as u32,
                             in_dim as u32,
                         )
                         .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "cuda_q6k_matvec".to_string(),
-                            reason: format!("CUDA Q6_K matvec failed: {e}"),
+                            operation: "cuda_q6k_gemv".to_string(),
+                            reason: format!("CUDA Q6_K GEMV failed: {e}"),
                         })?;
                 }
                 let gemm_duration_us = gemm_start.elapsed().as_micros() as u64;
 
                 let _span = info_span!(
-                    "gpu_kernel:q6k_matvec",
+                    "gpu_kernel:q6k_gemv",
                     gpu.backend = "cuda",
-                    gpu.kernel = "q6k_matvec",
-                    gpu.dimensions.m = out_dim,
+                    gpu.kernel = "q6k_gemv_cached",
+                    gpu.dimensions.n = out_dim,
                     gpu.dimensions.k = in_dim,
                     duration_us = gemm_duration_us,
                 )
@@ -9365,50 +9442,58 @@ impl OwnedQuantizedModel {
                 return Ok(output);
             }
 
-            // Fallback: Dequantize and use FP32 GEMM for batched operations (seq_len > 1)
-            let dequant_weight = self.dequantize_weight_for_cuda(weight)?;
+            // PAR-003: Q4_K/Q5_K/Q6_K with seq_len==1 now handled by native GEMV kernels above
+            // This fallback is only for cases where CUDA is not working
+            let is_q4k_q5k_q6k_matvec = false; // Disabled - native GEMV kernels handle M=1
 
-            {
-                let mut executor =
-                    executor_mutex
-                        .lock()
+            if is_q4k_q5k_q6k_matvec {
+                // Fall through to CPU path - no longer needed with native GEMV kernels
+            } else {
+                // Fallback: Dequantize and use FP32 GEMM for batched operations (seq_len > 1)
+                let dequant_weight = self.dequantize_weight_for_cuda(weight)?;
+
+                {
+                    let mut executor =
+                        executor_mutex
+                            .lock()
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "cuda_gemm_lock".to_string(),
+                                reason: format!("Failed to acquire CUDA executor lock: {e}"),
+                            })?;
+                    executor
+                        .gemm(
+                            input,
+                            &dequant_weight,
+                            &mut output,
+                            seq_len as u32,
+                            out_dim as u32,
+                            in_dim as u32,
+                        )
                         .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "cuda_gemm_lock".to_string(),
-                            reason: format!("Failed to acquire CUDA executor lock: {e}"),
+                            operation: "cuda_gemm".to_string(),
+                            reason: format!("CUDA GEMM failed: {e}"),
                         })?;
-                executor
-                    .gemm(
-                        input,
-                        &dequant_weight,
-                        &mut output,
-                        seq_len as u32,
-                        out_dim as u32,
-                        in_dim as u32,
-                    )
-                    .map_err(|e| RealizarError::UnsupportedOperation {
-                        operation: "cuda_gemm".to_string(),
-                        reason: format!("CUDA GEMM failed: {e}"),
-                    })?;
+                }
+                let gemm_duration_us = gemm_start.elapsed().as_micros() as u64;
+
+                // Emit tracing span for CUDA GEMM kernel execution
+                let _span = info_span!(
+                    "gpu_kernel:gemm_fp32",
+                    gpu.backend = "cuda",
+                    gpu.kernel = "gemm_fp32",
+                    gpu.dimensions.m = seq_len,
+                    gpu.dimensions.n = out_dim,
+                    gpu.dimensions.k = in_dim,
+                    duration_us = gemm_duration_us,
+                )
+                .entered();
+
+                // Increment kernel count
+                self.cuda_kernel_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                return Ok(output);
             }
-            let gemm_duration_us = gemm_start.elapsed().as_micros() as u64;
-
-            // Emit tracing span for CUDA GEMM kernel execution
-            let _span = info_span!(
-                "gpu_kernel:gemm_fp32",
-                gpu.backend = "cuda",
-                gpu.kernel = "gemm_fp32",
-                gpu.dimensions.m = seq_len,
-                gpu.dimensions.n = out_dim,
-                gpu.dimensions.k = in_dim,
-                duration_us = gemm_duration_us,
-            )
-            .entered();
-
-            // Increment kernel count
-            self.cuda_kernel_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            return Ok(output);
         }
 
         // CPU path: For Q4_0, use fused Q8_0 integer SIMD matmul (llama.cpp parity)
@@ -9740,60 +9825,110 @@ impl OwnedQuantizedModel {
         // Dequantize based on quantization type
         match weight.qtype {
             GGUF_TYPE_Q4_K => {
-                // Q4_K: super-block size 256, 144 bytes per super-block
-                // Each super-block contains: 2 scales (f16) + 12 bytes mins + 128 bytes qs
-                let num_blocks = total_weights.div_ceil(Q4K_WEIGHTS_PER_BLOCK);
+                // PAR-002/003 FIX: Use proper dequantization that matches CPU path
+                // CPU path in fused_q4k_parallel_matvec:
+                //   - super_blocks_per_row = in_dim.div_ceil(QK_K)
+                //   - bytes_per_row = super_blocks_per_row * 144
+                //   - For each output o in 0..out_dim: row_data = weight[o*bytes_per_row..]
+                // So weight layout is [out_dim, in_dim] (out_dim rows, in_dim cols)
+                use crate::quantize::{dequantize_q4_k_simd, QK_K};
 
-                for block_idx in 0..num_blocks {
-                    let block_start = block_idx * Q4K_BLOCK_SIZE;
-                    if block_start + Q4K_BLOCK_SIZE > weight.data.len() {
+                // Each row has in_dim elements = super_blocks_per_row super-blocks
+                let super_blocks_per_row = in_dim.div_ceil(QK_K);
+                let bytes_per_row = super_blocks_per_row * Q4K_BLOCK_SIZE;
+
+                for row in 0..out_dim {
+                    let row_start = row * bytes_per_row;
+                    let row_end = row_start + bytes_per_row;
+                    if row_end > weight.data.len() {
                         break;
                     }
+                    let row_data = &weight.data[row_start..row_end];
+                    let row_dequant = dequantize_q4_k_simd(row_data)?;
 
-                    let block_data = &weight.data[block_start..block_start + Q4K_BLOCK_SIZE];
-                    let output_start = block_idx * Q4K_WEIGHTS_PER_BLOCK;
-                    let output_end = (output_start + Q4K_WEIGHTS_PER_BLOCK).min(total_weights);
+                    // Copy to output (may have padding due to super-block alignment)
+                    let copy_len = in_dim.min(row_dequant.len());
+                    let out_start = row * in_dim;
+                    output[out_start..out_start + copy_len]
+                        .copy_from_slice(&row_dequant[..copy_len]);
+                }
 
-                    // Read scale from first 2 bytes (f16)
-                    let scale = Self::f16_bytes_to_f32([block_data[0], block_data[1]]);
-
-                    // Dequantize 4-bit values (simplified)
-                    let qs_start = 16; // Skip scales and mins
-                    for i in 0..(Q4K_WEIGHTS_PER_BLOCK / 2).min(output_end - output_start) {
-                        if qs_start + i >= block_data.len() {
-                            break;
-                        }
-                        let byte = block_data[qs_start + i];
-                        let q_low = (byte & 0x0F) as i8 - 8;
-                        let q_high = ((byte >> 4) & 0x0F) as i8 - 8;
-
-                        if output_start + 2 * i < output_end {
-                            output[output_start + 2 * i] = scale * q_low as f32;
-                        }
-                        if output_start + 2 * i + 1 < output_end {
-                            output[output_start + 2 * i + 1] = scale * q_high as f32;
-                        }
+                // Transpose from [out_dim, in_dim] to [in_dim, out_dim] for GEMV kernel
+                // GEMV expects A[k, n] at offset k*N + n, computing y[n] = sum_k(A[k,n] * x[k])
+                // We have W[o, i] at offset o*in_dim + i (CPU layout)
+                // Need A[i, o] = W[o, i] so that y[o] = sum_i(A[i,o] * x[i]) = sum_i(W[o,i] * x[i])
+                let mut transposed = vec![0.0f32; total_weights];
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        // A[i, o] = W[o, i]
+                        transposed[i * out_dim + o] = output[o * in_dim + i];
                     }
                 }
-                Ok(output)
+                Ok(transposed)
             },
             GGUF_TYPE_Q5_K => {
                 // Q5_K: 176 bytes per 256-element super-block
-                use crate::quantize::dequantize_q5_k;
-                let dequant = dequantize_q5_k(&weight.data)?;
-                // Truncate to exact size needed
-                let needed = total_weights.min(dequant.len());
-                output[..needed].copy_from_slice(&dequant[..needed]);
-                Ok(output)
+                use crate::quantize::{dequantize_q5_k, QK_K};
+
+                // GGUF tensor layout is [out_dim, in_dim] (same as Q4_K)
+                let super_blocks_per_row = in_dim.div_ceil(QK_K);
+                let bytes_per_row = super_blocks_per_row * 176;
+
+                for row in 0..out_dim {
+                    let row_start = row * bytes_per_row;
+                    let row_end = row_start + bytes_per_row;
+                    if row_end > weight.data.len() {
+                        break;
+                    }
+                    let row_data = &weight.data[row_start..row_end];
+                    let row_dequant = dequantize_q5_k(row_data)?;
+
+                    let copy_len = in_dim.min(row_dequant.len());
+                    let out_start = row * in_dim;
+                    output[out_start..out_start + copy_len]
+                        .copy_from_slice(&row_dequant[..copy_len]);
+                }
+
+                // Transpose from [out_dim, in_dim] to [in_dim, out_dim] for GEMV kernel
+                let mut transposed = vec![0.0f32; total_weights];
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        transposed[i * out_dim + o] = output[o * in_dim + i];
+                    }
+                }
+                Ok(transposed)
             },
             GGUF_TYPE_Q6_K => {
                 // Q6_K: 210 bytes per 256-element super-block
-                use crate::quantize::dequantize_q6_k;
-                let dequant = dequantize_q6_k(&weight.data)?;
-                // Truncate to exact size needed
-                let needed = total_weights.min(dequant.len());
-                output[..needed].copy_from_slice(&dequant[..needed]);
-                Ok(output)
+                use crate::quantize::{dequantize_q6_k, QK_K};
+
+                // GGUF tensor layout is [out_dim, in_dim] (same as Q4_K)
+                let super_blocks_per_row = in_dim.div_ceil(QK_K);
+                let bytes_per_row = super_blocks_per_row * 210;
+
+                for row in 0..out_dim {
+                    let row_start = row * bytes_per_row;
+                    let row_end = row_start + bytes_per_row;
+                    if row_end > weight.data.len() {
+                        break;
+                    }
+                    let row_data = &weight.data[row_start..row_end];
+                    let row_dequant = dequantize_q6_k(row_data)?;
+
+                    let copy_len = in_dim.min(row_dequant.len());
+                    let out_start = row * in_dim;
+                    output[out_start..out_start + copy_len]
+                        .copy_from_slice(&row_dequant[..copy_len]);
+                }
+
+                // Transpose from [out_dim, in_dim] to [in_dim, out_dim] for GEMV kernel
+                let mut transposed = vec![0.0f32; total_weights];
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        transposed[i * out_dim + o] = output[o * in_dim + i];
+                    }
+                }
+                Ok(transposed)
             },
             _ => Err(RealizarError::UnsupportedOperation {
                 operation: "dequantize_for_cuda".to_string(),
@@ -9849,7 +9984,7 @@ impl OwnedQuantizedModel {
             if end <= self.token_embedding.len() {
                 embeddings.extend_from_slice(&self.token_embedding[start..end]);
             } else {
-                embeddings.extend(std::iter::repeat(0.0).take(hidden_dim));
+                embeddings.extend(std::iter::repeat_n(0.0, hidden_dim));
             }
         }
 
@@ -11119,42 +11254,53 @@ impl OwnedQuantizedModel {
     #[target_feature(enable = "avx2", enable = "fma")]
     #[inline]
     unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-        use std::arch::x86_64::{
-            _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-            _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
-            _mm_movehl_ps,
-        };
+        unsafe {
+            use std::arch::x86_64::{
+                _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+                _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
+                _mm_movehl_ps,
+            };
 
-        let len = a.len().min(b.len());
-        let mut acc = _mm256_setzero_ps();
-        let mut i = 0;
+            let len = a.len().min(b.len());
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
 
-        // Process 8 floats at a time
-        while i + 8 <= len {
-            // SAFETY: bounds checked above, pointers valid
-            let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
-            let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
-            acc = _mm256_fmadd_ps(va, vb, acc);
-            i += 8;
+            // Process 16 floats at a time (2x unrolled for better ILP)
+            while i + 16 <= len {
+                let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+                let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+                let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+                acc = _mm256_fmadd_ps(va0, vb0, acc);
+                acc = _mm256_fmadd_ps(va1, vb1, acc);
+                i += 16;
+            }
+            // Handle remaining 8-float chunk
+            if i + 8 <= len {
+                let va = _mm256_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+                acc = _mm256_fmadd_ps(va, vb, acc);
+                i += 8;
+            }
+
+            // Horizontal sum
+            let hi = _mm256_extractf128_ps(acc, 1);
+            let lo = _mm256_castps256_ps128(acc);
+            let sum128 = _mm_add_ps(lo, hi);
+            let shuf = _mm_movehdup_ps(sum128);
+            let sums = _mm_add_ps(sum128, shuf);
+            let shuf2 = _mm_movehl_ps(sums, sums);
+            let result = _mm_add_ss(sums, shuf2);
+            let mut sum = _mm_cvtss_f32(result);
+
+            // Handle remaining elements
+            while i < len {
+                sum += a[i] * b[i];
+                i += 1;
+            }
+
+            sum
         }
-
-        // Horizontal sum
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let lo = _mm256_castps256_ps128(acc);
-        let sum128 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        let result = _mm_add_ss(sums, shuf2);
-        let mut sum = _mm_cvtss_f32(result);
-
-        // Handle remaining elements
-        while i < len {
-            sum += a[i] * b[i];
-            i += 1;
-        }
-
-        sum
     }
 
     #[inline]
@@ -12087,7 +12233,7 @@ impl OwnedQuantizedModel {
         // Generate new tokens
         for gen_idx in 0..config.max_tokens {
             let position = prompt.len() + gen_idx;
-            let last_token = *tokens.last().unwrap();
+            let last_token = *tokens.last().expect("tokens must be non-empty");
 
             let logits = self.forward_single_with_cache(last_token, &mut cache, position)?;
 
@@ -12267,7 +12413,7 @@ impl OwnedQuantizedModel {
         // Generate new tokens
         for gen_idx in 0..config.max_tokens {
             let position = prompt.len() + gen_idx;
-            let last_token = *tokens.last().unwrap();
+            let last_token = *tokens.last().expect("tokens must be non-empty");
 
             let logits =
                 self.forward_single_with_contiguous_cache(last_token, &mut cache, position)?;
@@ -12336,7 +12482,7 @@ impl OwnedQuantizedModel {
         // Generate new tokens with adaptive attention
         for gen_idx in 0..config.max_tokens {
             let position = prompt.len() + gen_idx;
-            let last_token = *tokens.last().unwrap();
+            let last_token = *tokens.last().expect("tokens must be non-empty");
 
             let logits =
                 self.forward_single_with_cache_adaptive(last_token, &mut cache, position, metrics)?;
@@ -12992,7 +13138,9 @@ impl OwnedQuantizedModel {
 
             for &req_idx in &active_indices {
                 let position = prompts[req_idx].len() + gen_idx;
-                let last_token = *all_tokens[req_idx].last().unwrap();
+                let last_token = *all_tokens[req_idx]
+                    .last()
+                    .expect("tokens must be non-empty");
 
                 let logits = self.forward_single_with_contiguous_cache(
                     last_token,
@@ -14887,9 +15035,28 @@ impl OwnedQuantizedModelCuda {
     ///
     /// Returns error if CUDA is not available or device doesn't exist.
     pub fn new(model: OwnedQuantizedModel, device_ordinal: i32) -> Result<Self> {
+        Self::with_max_seq_len(model, device_ordinal, 2048)
+    }
+
+    /// Create a new CUDA-accelerated model wrapper with custom max sequence length
+    ///
+    /// # Arguments
+    ///
+    /// * `model` - The quantized model to wrap
+    /// * `device_ordinal` - GPU device index (0 for first GPU)
+    /// * `max_seq_len` - Maximum sequence length for GPU KV cache (PAR-018)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if CUDA is not available or device doesn't exist.
+    pub fn with_max_seq_len(
+        model: OwnedQuantizedModel,
+        device_ordinal: i32,
+        max_seq_len: usize,
+    ) -> Result<Self> {
         use crate::cuda::CudaExecutor;
 
-        let executor =
+        let mut executor =
             CudaExecutor::new(device_ordinal).map_err(|e| RealizarError::UnsupportedOperation {
                 operation: "CudaExecutor::new".to_string(),
                 reason: format!("CUDA initialization failed: {e}"),
@@ -14899,6 +15066,20 @@ impl OwnedQuantizedModelCuda {
             .device_name()
             .unwrap_or_else(|_| "Unknown GPU".to_string());
         let memory_info = executor.memory_info().unwrap_or((0, 0));
+
+        // PAR-018: Initialize GPU-resident KV cache for attention acceleration
+        // This avoids ~66 MB CPU→GPU transfer per token for TinyLlama
+        let num_layers = model.layers.len();
+        let num_heads = model.config.num_heads;
+        let num_kv_heads = model.config.num_kv_heads; // PAR-021 GQA support
+        let head_dim = model.config.hidden_dim / num_heads;
+
+        executor
+            .init_kv_cache_gpu(num_layers, num_heads, num_kv_heads, head_dim, max_seq_len)
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "init_kv_cache_gpu".to_string(),
+                reason: format!("GPU KV cache initialization failed: {e}"),
+            })?;
 
         Ok(Self {
             model,
@@ -15212,8 +15393,9 @@ impl OwnedQuantizedModelCuda {
                 let cache_len = k_cache.len() / hidden_dim;
                 let total_len = cache_len + 1;
 
-                // GPU threshold: use GPU for sequences > 32 tokens
-                const GPU_ATTN_THRESHOLD: usize = 32;
+                // PAR-017: Lower GPU attention threshold for more consistent GPU usage
+                // Previous: 32 tokens caused high variance with short sequences
+                const GPU_ATTN_THRESHOLD: usize = 8;
 
                 if total_len >= GPU_ATTN_THRESHOLD {
                     self.cuda_attention_with_cache(
@@ -15336,18 +15518,87 @@ impl OwnedQuantizedModelCuda {
         // Allocate output buffer
         let mut output = vec![0.0f32; out_dim];
 
-        // Execute Q4_K matmul on GPU
+        // PAR-014: Use cached GEMV for weight reuse (avoids re-transfer each call)
+        // Cache key is based on weight data pointer (stable since model owns data)
+        let cache_key = format!("q4k_{:016x}", weight.data.as_ptr() as usize);
+
+        // Lazy cache - upload weight on first use
+        if !self.executor.has_quantized_weights(&cache_key) {
+            self.executor
+                .load_quantized_weights(&cache_key, &weight.data)
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "cuda_q4k_cache".to_string(),
+                    reason: format!("Failed to cache Q4_K weights: {e}"),
+                })?;
+        }
+
+        // Execute Q4_K matmul on GPU using cached weights
         self.executor
-            .q4k_matvec(
-                &weight.data,
+            .q4k_gemv_cached(
+                &cache_key,
                 input,
                 &mut output,
                 out_dim as u32,
                 in_dim as u32,
             )
             .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "q4k_matvec".to_string(),
-                reason: format!("CUDA Q4_K matvec failed: {e}"),
+                operation: "q4k_gemv_cached".to_string(),
+                reason: format!("CUDA Q4_K GEMV failed: {e}"),
+            })?;
+
+        Ok(output)
+    }
+
+    /// PAR-014: Fused matmul with explicit cache key
+    ///
+    /// Same as `fused_matmul_cuda` but accepts an explicit cache key, allowing
+    /// the caller to use the original weight pointer for caching even when
+    /// working with cloned weight data.
+    fn fused_matmul_cuda_with_key(
+        &mut self,
+        input: &[f32],
+        weight: &OwnedQuantizedTensor,
+        cache_key: &str,
+    ) -> Result<Vec<f32>> {
+        // Only Q4_K is supported for GPU acceleration
+        const GGUF_TYPE_Q4_K: u32 = 12;
+
+        if weight.qtype != GGUF_TYPE_Q4_K {
+            // Fallback to CPU for non-Q4_K weights
+            return self.model.fused_matmul(input, weight);
+        }
+
+        let in_dim = weight.in_dim;
+        let out_dim = weight.out_dim;
+
+        if input.len() != in_dim {
+            return Err(RealizarError::InvalidShape {
+                reason: format!(
+                    "PAR-014: Input length {} doesn't match weight in_dim {}",
+                    input.len(),
+                    in_dim
+                ),
+            });
+        }
+
+        let mut output = vec![0.0f32; out_dim];
+
+        // Lazy cache - upload weight on first use
+        if !self.executor.has_quantized_weights(cache_key) {
+            self.executor
+                .load_quantized_weights(cache_key, &weight.data)
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "cuda_q4k_cache".to_string(),
+                    reason: format!("Failed to cache Q4_K weights: {e}"),
+                })?;
+        }
+
+        // Execute Q4_K matmul on GPU using cached weights
+        self.executor
+            .q4k_gemv_cached(cache_key, input, &mut output, out_dim as u32, in_dim as u32)
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "q4k_gemv_cached".to_string(),
+                reason: format!("CUDA Q4_K GEMV failed: {e}"),
             })?;
 
         Ok(output)
@@ -15379,6 +15630,39 @@ impl OwnedQuantizedModelCuda {
         }
     }
 
+    /// PAR-014: QKV matmul with explicit cache key for fused weights
+    ///
+    /// Same as `qkv_matmul_cuda` but accepts a cache key for the fused case.
+    fn qkv_matmul_cuda_with_key(
+        &mut self,
+        input: &[f32],
+        qkv: &OwnedQKVWeights,
+        cache_key: &str,
+    ) -> Result<Vec<f32>> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => {
+                self.fused_matmul_cuda_with_key(input, weight, cache_key)
+            },
+            OwnedQKVWeights::Separate {
+                ref q,
+                ref k,
+                ref v,
+            } => {
+                // For separate Q/K/V, we still use the cloned pointers
+                // (less critical since these are already separate tensors)
+                let q_out = self.fused_matmul_cuda(input, q)?;
+                let k_out = self.fused_matmul_cuda(input, k)?;
+                let v_out = self.fused_matmul_cuda(input, v)?;
+
+                let mut output = Vec::with_capacity(q_out.len() + k_out.len() + v_out.len());
+                output.extend_from_slice(&q_out);
+                output.extend_from_slice(&k_out);
+                output.extend_from_slice(&v_out);
+                Ok(output)
+            },
+        }
+    }
+
     /// IMP-1010: Full GPU forward pass for single token with KV cache
     ///
     /// This method uses GPU acceleration for ALL matmul operations:
@@ -15400,15 +15684,56 @@ impl OwnedQuantizedModelCuda {
     ) -> Result<Vec<f32>> {
         let hidden_dim = self.model.config.hidden_dim;
         let num_heads = self.model.config.num_heads;
+        let num_kv_heads = self.model.config.num_kv_heads;
         let head_dim = hidden_dim / num_heads;
         let num_layers = self.model.layers.len();
         let eps = self.model.config.eps;
 
+        // PAR-021: GQA support
+        // Q: [hidden_dim] = [num_heads * head_dim]
+        // K: [kv_dim] = [num_kv_heads * head_dim] (smaller for GQA)
+        // V: [kv_dim] = [num_kv_heads * head_dim] (smaller for GQA)
+        let kv_dim = num_kv_heads * head_dim;
+
         // 1. Token embedding lookup (CPU - fast enough, single lookup)
         let mut hidden = self.model.embed(&[token_id]);
 
+        // PAR-016: Pre-capture LM head cache key for stable caching
+        let lm_head_cache_key = format!(
+            "q4k_{:016x}",
+            self.model.lm_head_weight.data.as_ptr() as usize
+        );
+
         // 2. Process through transformer layers
         for layer_idx in 0..num_layers {
+            // PAR-014: Capture original weight pointers BEFORE cloning for stable cache keys
+            // This ensures weight caching works across forward passes
+            let attn_output_cache_key = format!(
+                "q4k_{:016x}",
+                self.model.layers[layer_idx]
+                    .attn_output_weight
+                    .data
+                    .as_ptr() as usize
+            );
+            let ffn_up_cache_key = format!(
+                "q4k_{:016x}",
+                self.model.layers[layer_idx].ffn_up_weight.data.as_ptr() as usize
+            );
+            let ffn_down_cache_key = format!(
+                "q4k_{:016x}",
+                self.model.layers[layer_idx].ffn_down_weight.data.as_ptr() as usize
+            );
+            // Capture QKV weight pointer for cache key (handles both Fused and Separate)
+            let qkv_cache_key = match &self.model.layers[layer_idx].qkv_weight {
+                OwnedQKVWeights::Fused(ref tensor) => {
+                    format!("q4k_{:016x}", tensor.data.as_ptr() as usize)
+                },
+                OwnedQKVWeights::Separate { ref q, .. } => {
+                    // Use Q tensor pointer as representative key for separate case
+                    format!("q4k_{:016x}", q.data.as_ptr() as usize)
+                },
+            };
+
             // Clone weights to avoid borrow conflicts with &mut self
             // IMP-1010: This is necessary because fused_matmul_cuda needs &mut self
             let qkv_weight = self.model.layers[layer_idx].qkv_weight.clone();
@@ -15432,6 +15757,12 @@ impl OwnedQuantizedModelCuda {
             let ffn_down_weight_out_dim = self.model.layers[layer_idx].ffn_down_weight.out_dim;
             let ffn_down_weight_qtype = self.model.layers[layer_idx].ffn_down_weight.qtype;
             let ffn_down_bias = self.model.layers[layer_idx].ffn_down_bias.clone();
+            // PAR-015: Extract FFN gate weight for SwiGLU (LLaMA models)
+            let ffn_gate_weight = self.model.layers[layer_idx].ffn_gate_weight.clone();
+            let ffn_gate_bias = self.model.layers[layer_idx].ffn_gate_bias.clone();
+            let ffn_gate_cache_key = ffn_gate_weight
+                .as_ref()
+                .map(|w| format!("q4k_{:016x}", w.data.as_ptr() as usize));
 
             // Reconstruct weight tensors
             let attn_output_weight = OwnedQuantizedTensor {
@@ -15458,22 +15789,21 @@ impl OwnedQuantizedModelCuda {
                 self.model
                     .layer_norm(&hidden, &attn_norm_weight, attn_norm_bias.as_deref(), eps);
 
-            // 2b. QKV projection (GPU - IMP-1010)
-            let mut qkv = self.qkv_matmul_cuda(&normed, &qkv_weight)?;
+            // 2b. QKV projection (GPU - PAR-014: use pre-captured cache key)
+            let mut qkv = self.qkv_matmul_cuda_with_key(&normed, &qkv_weight, &qkv_cache_key)?;
             if let Some(ref bias) = qkv_bias {
                 self.model.add_bias(&mut qkv, bias);
             }
 
-            // 2c. Extract Q, K, V and apply RoPE
-            // Note: Uses num_heads for both (non-GQA code path)
+            // 2c. Extract Q, K, V with GQA-aware sizes and apply RoPE
+            // PAR-021: For GQA, K and V have smaller kv_dim (num_kv_heads * head_dim)
             let mut q = qkv[0..hidden_dim].to_vec();
-            let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
-            let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
+            let mut k = qkv[hidden_dim..hidden_dim + kv_dim].to_vec();
+            let v = qkv[hidden_dim + kv_dim..hidden_dim + 2 * kv_dim].to_vec();
 
             self.model
                 .apply_rope(&mut q, position, self.model.config.num_heads);
-            self.model
-                .apply_rope(&mut k, position, self.model.config.num_heads);
+            self.model.apply_rope(&mut k, position, num_kv_heads);
 
             // 2d. Get cached K/V and compute attention
             let k_cache = cache.get_k(layer_idx);
@@ -15481,28 +15811,72 @@ impl OwnedQuantizedModelCuda {
 
             let attn_out = if k_cache.is_empty() {
                 // First token - no cache yet
-                v.clone()
+                // PAR-021: Use GPU incremental attention for GQA
+                if self.executor.has_kv_cache_gpu() {
+                    // For first token, attention output = V (weighted by 1.0)
+                    // Still need to populate GPU cache for subsequent tokens
+                    let mut attn_output = vec![0.0f32; hidden_dim];
+                    self.executor
+                        .incremental_attention_gpu(layer_idx, &q, &k, &v, &mut attn_output)
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "incremental_attention_gpu_first".to_string(),
+                            reason: format!("PAR-020: GPU attention (first token) failed: {e}"),
+                        })?;
+                    attn_output
+                } else {
+                    // PAR-021: Expand V for GQA (each KV head serves multiple Q heads)
+                    if num_kv_heads < num_heads {
+                        let q_per_kv = num_heads / num_kv_heads;
+                        let mut expanded_v = vec![0.0f32; hidden_dim];
+                        for q_head in 0..num_heads {
+                            let kv_head = q_head / q_per_kv;
+                            let v_start = kv_head * head_dim;
+                            let out_start = q_head * head_dim;
+                            expanded_v[out_start..out_start + head_dim]
+                                .copy_from_slice(&v[v_start..v_start + head_dim]);
+                        }
+                        expanded_v
+                    } else {
+                        v.clone()
+                    }
+                }
             } else {
                 // GPU attention for longer sequences
-                let cache_len = k_cache.len() / hidden_dim;
-                let total_len = cache_len + 1;
+                // PAR-021: cache_len based on kv_dim (not hidden_dim) for GQA
+                let cache_len = k_cache.len() / kv_dim;
+                let _total_len = cache_len + 1;
 
-                const GPU_ATTN_THRESHOLD: usize = 32;
-                if total_len >= GPU_ATTN_THRESHOLD {
-                    self.cuda_attention_with_cache(
-                        &q, k_cache, v_cache, &k, &v, total_len, num_heads, head_dim,
-                    )?
+                // PAR-020/021: Use GPU-resident KV cache with GQA support
+                if self.executor.has_kv_cache_gpu() {
+                    let mut attn_output = vec![0.0f32; hidden_dim];
+                    self.executor
+                        .incremental_attention_gpu(layer_idx, &q, &k, &v, &mut attn_output)
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "incremental_attention_gpu".to_string(),
+                            reason: format!("PAR-020: GPU attention failed: {e}"),
+                        })?;
+                    attn_output
                 } else {
+                    // PAR-021: Use GQA-aware attention for GQA models
+                    // TODO: cuda_attention_with_cache doesn't handle GQA yet
+                    // For now, always use CPU GQA attention for correctness
                     self.model
-                        .attention_with_cache(&q, k_cache, v_cache, &k, &v)
+                        .attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v)
                 }
             };
 
-            // 2e. Store K and V in cache
-            cache.append(layer_idx, &k, &v);
+            // 2e. Store K and V in cache (only if using CPU attention path)
+            // PAR-022: Skip CPU cache when GPU attention is active (saves ~10% overhead)
+            if !self.executor.has_kv_cache_gpu() {
+                cache.append(layer_idx, &k, &v);
+            }
 
-            // 2f. Attention output projection (GPU - IMP-1010)
-            let mut attn_output = self.fused_matmul_cuda(&attn_out, &attn_output_weight)?;
+            // 2f. Attention output projection (GPU - PAR-014: use pre-captured cache key)
+            let mut attn_output = self.fused_matmul_cuda_with_key(
+                &attn_out,
+                &attn_output_weight,
+                &attn_output_cache_key,
+            )?;
             if let Some(ref bias) = attn_output_bias {
                 self.model.add_bias(&mut attn_output, bias);
             }
@@ -15512,18 +15886,105 @@ impl OwnedQuantizedModelCuda {
                 hidden[i] += attn_output[i];
             }
 
-            // 2h. FFN up projection (GPU - IMP-1010)
-            let mut ffn_hidden = self.fused_matmul_cuda(&hidden, &ffn_up_weight)?;
-            if let Some(ref bias) = ffn_up_bias {
-                self.model.add_bias(&mut ffn_hidden, bias);
-            }
-            self.model.gelu(&mut ffn_hidden);
+            // 2h/2i. FFN (PAR-014: fused path temporarily disabled for debugging)
+            let ffn_output = if false
+                && ffn_up_bias.is_none()
+                && ffn_down_bias.is_none()
+                && ffn_up_weight.qtype == 12
+                && ffn_down_weight.qtype == 12
+            {
+                // Fused FFN path: up + GELU + down in single GPU round-trip
+                let intermediate_dim = ffn_up_weight.out_dim;
+                let mut output = vec![0.0f32; hidden_dim];
 
-            // 2i. FFN down projection (GPU - IMP-1010)
-            let mut ffn_output = self.fused_matmul_cuda(&ffn_hidden, &ffn_down_weight)?;
-            if let Some(ref bias) = ffn_down_bias {
-                self.model.add_bias(&mut ffn_output, bias);
-            }
+                // Ensure weights are cached
+                if !self.executor.has_quantized_weights(&ffn_up_cache_key) {
+                    self.executor
+                        .load_quantized_weights(&ffn_up_cache_key, &ffn_up_weight.data)
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "cuda_ffn_up_cache".to_string(),
+                            reason: format!("Failed to cache FFN up weights: {e}"),
+                        })?;
+                }
+                if !self.executor.has_quantized_weights(&ffn_down_cache_key) {
+                    self.executor
+                        .load_quantized_weights(&ffn_down_cache_key, &ffn_down_weight.data)
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "cuda_ffn_down_cache".to_string(),
+                            reason: format!("Failed to cache FFN down weights: {e}"),
+                        })?;
+                }
+
+                self.executor
+                    .fused_ffn_q4k(
+                        &hidden,
+                        &mut output,
+                        &ffn_up_cache_key,
+                        &ffn_down_cache_key,
+                        hidden_dim as u32,
+                        intermediate_dim as u32,
+                    )
+                    .map_err(|e| RealizarError::UnsupportedOperation {
+                        operation: "cuda_fused_ffn".to_string(),
+                        reason: format!("CUDA fused FFN failed: {e}"),
+                    })?;
+
+                output
+            } else if let (Some(ref gate_weight), Some(ref gate_cache_key)) =
+                (&ffn_gate_weight, &ffn_gate_cache_key)
+            {
+                // PAR-015: SwiGLU path for LLaMA models
+                // Formula: down(silu(gate(x)) * up(x))
+
+                // UP projection
+                let mut ffn_up =
+                    self.fused_matmul_cuda_with_key(&hidden, &ffn_up_weight, &ffn_up_cache_key)?;
+                if let Some(ref bias) = ffn_up_bias {
+                    self.model.add_bias(&mut ffn_up, bias);
+                }
+
+                // GATE projection
+                let mut ffn_gate =
+                    self.fused_matmul_cuda_with_key(&hidden, gate_weight, gate_cache_key)?;
+                if let Some(ref bias) = ffn_gate_bias {
+                    self.model.add_bias(&mut ffn_gate, bias);
+                }
+
+                // SiLU on gate, then multiply with up
+                self.model.silu(&mut ffn_gate);
+                for i in 0..ffn_gate.len() {
+                    ffn_gate[i] *= ffn_up[i];
+                }
+
+                // DOWN projection
+                let mut ffn_output = self.fused_matmul_cuda_with_key(
+                    &ffn_gate,
+                    &ffn_down_weight,
+                    &ffn_down_cache_key,
+                )?;
+                if let Some(ref bias) = ffn_down_bias {
+                    self.model.add_bias(&mut ffn_output, bias);
+                }
+                ffn_output
+            } else {
+                // GELU path for phi-2 style models (no gate projection)
+                let mut ffn_hidden =
+                    self.fused_matmul_cuda_with_key(&hidden, &ffn_up_weight, &ffn_up_cache_key)?;
+                if let Some(ref bias) = ffn_up_bias {
+                    self.model.add_bias(&mut ffn_hidden, bias);
+                }
+                self.model.gelu(&mut ffn_hidden);
+
+                let mut ffn_output = self.fused_matmul_cuda_with_key(
+                    &ffn_hidden,
+                    &ffn_down_weight,
+                    &ffn_down_cache_key,
+                )?;
+                if let Some(ref bias) = ffn_down_bias {
+                    self.model.add_bias(&mut ffn_output, bias);
+                }
+                ffn_output
+            };
 
             // Residual
             for i in 0..hidden_dim {
@@ -15542,8 +16003,8 @@ impl OwnedQuantizedModelCuda {
             self.model.config.eps,
         );
 
-        // 4. LM head projection (GPU - IMP-1010)
-        // Clone LM head weight to avoid borrow conflicts
+        // 4. LM head projection (GPU - IMP-1010, PAR-016: use pre-captured cache key)
+        // Clone LM head weight to avoid borrow conflicts, but use stable cache key
         let lm_head_weight_data = self.model.lm_head_weight.data.clone();
         let lm_head_weight_in_dim = self.model.lm_head_weight.in_dim;
         let lm_head_weight_out_dim = self.model.lm_head_weight.out_dim;
@@ -15555,7 +16016,8 @@ impl OwnedQuantizedModelCuda {
             qtype: lm_head_weight_qtype,
         };
 
-        let mut logits = self.fused_matmul_cuda(&normed, &lm_head_weight)?;
+        let mut logits =
+            self.fused_matmul_cuda_with_key(&normed, &lm_head_weight, &lm_head_cache_key)?;
         if let Some(ref bias) = self.model.lm_head_bias {
             self.model.add_bias(&mut logits, bias);
         }
@@ -15632,7 +16094,7 @@ impl OwnedQuantizedModelCuda {
                 .copy_from_slice(&current_v[head_offset..head_offset + head_dim]);
         }
 
-        // GPU multi-head attention
+        // GPU multi-head attention using FlashAttention kernel
         let mut output_full = vec![0.0f32; tensor_size];
         self.executor
             .flash_attention_multi_head(
@@ -15788,6 +16250,391 @@ impl OwnedQuantizedModelCuda {
         for _ in 0..config.max_tokens {
             let logits =
                 self.forward_single_full_cuda_with_cache(last_token, &mut cache, position)?;
+
+            // Greedy sampling (temperature=0)
+            let next_token = if config.temperature == 0.0 || config.top_k == 1 {
+                logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map_or(0, |(idx, _)| idx as u32)
+            } else {
+                // Top-k sampling
+                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.truncate(config.top_k);
+                indexed[0].0 as u32
+            };
+
+            // Check stop tokens
+            if config.stop_tokens.contains(&next_token) {
+                break;
+            }
+
+            tokens.push(next_token);
+            last_token = next_token;
+            position += 1;
+        }
+
+        Ok(tokens)
+    }
+
+    // =========================================================================
+    // PAR-023: GPU-Resident Transformer Layer Integration
+    // =========================================================================
+
+    /// PAR-023: Pre-upload all layer weights to GPU with naming convention for
+    /// GPU-resident transformer layer.
+    ///
+    /// This method uploads quantized weights using names expected by
+    /// `CudaExecutor::transformer_layer_gpu`:
+    /// - `blk.{i}.attn_q.weight`, `blk.{i}.attn_k.weight`, `blk.{i}.attn_v.weight`
+    /// - `blk.{i}.attn_output.weight`
+    /// - `blk.{i}.ffn_gate.weight`, `blk.{i}.ffn_up.weight`, `blk.{i}.ffn_down.weight`
+    ///
+    /// # Errors
+    ///
+    /// Returns error if weight upload fails or model uses fused QKV (phi-2 style).
+    pub fn preload_weights_gpu(&mut self) -> Result<usize> {
+        let mut total_bytes = 0usize;
+
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            let prefix = format!("blk.{}", layer_idx);
+
+            // Upload Q, K, V weights (requires separate format for GPU-resident path)
+            match &layer.qkv_weight {
+                OwnedQKVWeights::Separate { q, k, v } => {
+                    // Q projection
+                    let q_name = format!("{}.attn_q.weight", prefix);
+                    if !self.executor.has_quantized_weights(&q_name) {
+                        total_bytes += self
+                            .executor
+                            .load_quantized_weights(&q_name, &q.data)
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "preload_weights_gpu".to_string(),
+                                reason: format!(
+                                    "Failed to upload Q weights for layer {}: {}",
+                                    layer_idx, e
+                                ),
+                            })?;
+                    }
+
+                    // K projection
+                    let k_name = format!("{}.attn_k.weight", prefix);
+                    if !self.executor.has_quantized_weights(&k_name) {
+                        total_bytes += self
+                            .executor
+                            .load_quantized_weights(&k_name, &k.data)
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "preload_weights_gpu".to_string(),
+                                reason: format!(
+                                    "Failed to upload K weights for layer {}: {}",
+                                    layer_idx, e
+                                ),
+                            })?;
+                    }
+
+                    // V projection
+                    let v_name = format!("{}.attn_v.weight", prefix);
+                    if !self.executor.has_quantized_weights(&v_name) {
+                        total_bytes += self
+                            .executor
+                            .load_quantized_weights(&v_name, &v.data)
+                            .map_err(|e| RealizarError::UnsupportedOperation {
+                                operation: "preload_weights_gpu".to_string(),
+                                reason: format!(
+                                    "Failed to upload V weights for layer {}: {}",
+                                    layer_idx, e
+                                ),
+                            })?;
+                    }
+                },
+                OwnedQKVWeights::Fused(_) => {
+                    // Fused QKV not yet supported for GPU-resident path
+                    // Fall back to standard forward pass for phi-2 style models
+                    return Err(RealizarError::UnsupportedOperation {
+                        operation: "preload_weights_gpu".to_string(),
+                        reason: format!(
+                            "Layer {} uses fused QKV (phi-2 style), GPU-resident path requires separate Q/K/V",
+                            layer_idx
+                        ),
+                    });
+                },
+            }
+
+            // Output projection
+            let o_name = format!("{}.attn_output.weight", prefix);
+            if !self.executor.has_quantized_weights(&o_name) {
+                total_bytes += self
+                    .executor
+                    .load_quantized_weights(&o_name, &layer.attn_output_weight.data)
+                    .map_err(|e| RealizarError::UnsupportedOperation {
+                        operation: "preload_weights_gpu".to_string(),
+                        reason: format!(
+                            "Failed to upload O weights for layer {}: {}",
+                            layer_idx, e
+                        ),
+                    })?;
+            }
+
+            // FFN gate (SwiGLU models)
+            if let Some(ref gate) = layer.ffn_gate_weight {
+                let gate_name = format!("{}.ffn_gate.weight", prefix);
+                if !self.executor.has_quantized_weights(&gate_name) {
+                    total_bytes += self
+                        .executor
+                        .load_quantized_weights(&gate_name, &gate.data)
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "preload_weights_gpu".to_string(),
+                            reason: format!(
+                                "Failed to upload gate weights for layer {}: {}",
+                                layer_idx, e
+                            ),
+                        })?;
+                }
+            }
+
+            // FFN up
+            let up_name = format!("{}.ffn_up.weight", prefix);
+            if !self.executor.has_quantized_weights(&up_name) {
+                total_bytes += self
+                    .executor
+                    .load_quantized_weights(&up_name, &layer.ffn_up_weight.data)
+                    .map_err(|e| RealizarError::UnsupportedOperation {
+                        operation: "preload_weights_gpu".to_string(),
+                        reason: format!(
+                            "Failed to upload up weights for layer {}: {}",
+                            layer_idx, e
+                        ),
+                    })?;
+            }
+
+            // FFN down
+            let down_name = format!("{}.ffn_down.weight", prefix);
+            if !self.executor.has_quantized_weights(&down_name) {
+                total_bytes += self
+                    .executor
+                    .load_quantized_weights(&down_name, &layer.ffn_down_weight.data)
+                    .map_err(|e| RealizarError::UnsupportedOperation {
+                        operation: "preload_weights_gpu".to_string(),
+                        reason: format!(
+                            "Failed to upload down weights for layer {}: {}",
+                            layer_idx, e
+                        ),
+                    })?;
+            }
+        }
+
+        // Also upload LM head weights
+        let lm_head_name = "output.weight".to_string();
+        if !self.executor.has_quantized_weights(&lm_head_name) {
+            total_bytes += self
+                .executor
+                .load_quantized_weights(&lm_head_name, &self.model.lm_head_weight.data)
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "preload_weights_gpu".to_string(),
+                    reason: format!("Failed to upload LM head weights: {}", e),
+                })?;
+        }
+
+        // PAR-023: Pre-cache RMSNorm weights for all layers
+        let num_layers = self.model.layers.len();
+        let attn_norms: Vec<&[f32]> = self
+            .model
+            .layers
+            .iter()
+            .map(|l| l.attn_norm_weight.as_slice())
+            .collect();
+        let ffn_norms: Vec<&[f32]> = self
+            .model
+            .layers
+            .iter()
+            .map(|l| {
+                l.ffn_norm_weight
+                    .as_ref()
+                    .map_or(l.attn_norm_weight.as_slice(), |w| w.as_slice())
+            })
+            .collect();
+
+        total_bytes += self
+            .executor
+            .preload_rmsnorm_weights(num_layers, &attn_norms, &ffn_norms)
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "preload_weights_gpu".to_string(),
+                reason: format!("Failed to upload RMSNorm weights: {}", e),
+            })?;
+
+        // PAR-023: Pre-cache output norm (final layer norm) weight
+        // This enables fully GPU-resident forward pass including output norm + LM head
+        total_bytes += self
+            .executor
+            .preload_output_norm(&self.model.output_norm_weight)
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "preload_weights_gpu".to_string(),
+                reason: format!("Failed to upload output norm weights: {}", e),
+            })?;
+
+        Ok(total_bytes)
+    }
+
+    /// PAR-023: Check if model supports GPU-resident forward pass
+    ///
+    /// GPU-resident path requires:
+    /// - Separate Q/K/V weights (not fused)
+    /// - SwiGLU activation (ffn_gate_weight present)
+    /// - RMSNorm (LLaMA-style architecture)
+    #[must_use]
+    pub fn supports_gpu_resident(&self) -> bool {
+        // Check first layer for architecture detection
+        if let Some(layer) = self.model.layers.first() {
+            // Must have separate Q/K/V
+            let has_separate_qkv = matches!(layer.qkv_weight, OwnedQKVWeights::Separate { .. });
+            // Must have SwiGLU (gate weight present)
+            let has_swiglu = layer.ffn_gate_weight.is_some();
+            // Must have FFN norm (RMSNorm for pre-FFN)
+            let has_ffn_norm = layer.ffn_norm_weight.is_some();
+
+            has_separate_qkv && has_swiglu && has_ffn_norm
+        } else {
+            false
+        }
+    }
+
+    /// PAR-023: GPU-resident forward pass for single token (decode phase)
+    ///
+    /// This method chains ALL transformer layers GPU-resident, syncing only at start/end.
+    ///
+    /// # Sync Count (optimized)
+    ///
+    /// - Embedding upload: 1 sync
+    /// - All layers: 0 syncs (D2D transfers for KV cache)
+    /// - Hidden download: 1 sync
+    /// - LM head: 1 sync
+    /// - Total: ~3 syncs vs 22 syncs (per-layer) or 176 syncs (original)
+    ///
+    /// # Requirements
+    ///
+    /// Must call `preload_weights_gpu()` before first use.
+    ///
+    /// # Arguments
+    ///
+    /// * `token_id` - Current token ID
+    /// * `cache` - KV cache (only used for CPU fallback path position tracking)
+    /// * `_position` - Token position in sequence (unused, position tracked by GPU KV cache)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if GPU operations fail or model architecture unsupported.
+    #[allow(clippy::too_many_lines)]
+    pub fn forward_gpu_resident(
+        &mut self,
+        token_id: u32,
+        cache: &mut OwnedQuantizedKVCache,
+        _position: usize,
+    ) -> Result<Vec<f32>> {
+        let hidden_dim = self.model.config.hidden_dim;
+        let intermediate_dim = self.model.layers[0].ffn_up_weight.out_dim;
+        let num_layers = self.model.layers.len();
+        let vocab_size = self.model.lm_head_weight.out_dim;
+        let eps = self.model.config.eps;
+
+        // 1. Token embedding lookup (CPU - fast, single lookup)
+        let embedding = self.model.embed(&[token_id]);
+
+        // 2. Fully GPU-resident forward: layers + output norm + LM head
+        // Only 2 syncs total: embedding upload + logits download
+        let mut logits = vec![0.0f32; vocab_size];
+        self.executor
+            .forward_all_layers_gpu_to_logits(
+                &embedding,
+                &mut logits,
+                num_layers,
+                hidden_dim as u32,
+                intermediate_dim as u32,
+                vocab_size as u32,
+                eps,
+            )
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "forward_gpu_resident".to_string(),
+                reason: format!("forward_all_layers_gpu_to_logits failed: {}", e),
+            })?;
+
+        // 3. Add LM head bias if present (CPU - fast)
+        if let Some(ref bias) = self.model.lm_head_bias {
+            self.model.add_bias(&mut logits, bias);
+        }
+
+        // Advance cache position (for compatibility with cache-based generation)
+        cache.advance();
+
+        Ok(logits)
+    }
+
+    /// PAR-023: GPU-resident token generation
+    ///
+    /// Uses `forward_gpu_resident` for maximum GPU utilization with minimal syncs.
+    /// Target: ~22 syncs per layer vs ~176 syncs in standard path.
+    ///
+    /// # Performance Target
+    ///
+    /// - Standard path: ~121 tok/s (PAR-022 baseline)
+    /// - GPU-resident: >192 tok/s (M4 milestone)
+    /// - Ultimate goal: ~500 tok/s (llama.cpp parity)
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - Initial token IDs
+    /// * `config` - Generation configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns error if model doesn't support GPU-resident path or GPU operations fail.
+    pub fn generate_gpu_resident(
+        &mut self,
+        prompt: &[u32],
+        config: &QuantizedGenerateConfig,
+    ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check architecture support
+        if !self.supports_gpu_resident() {
+            return Err(RealizarError::UnsupportedOperation {
+                operation: "generate_gpu_resident".to_string(),
+                reason: "Model architecture not supported for GPU-resident path (requires separate Q/K/V, SwiGLU, RMSNorm)".to_string(),
+            });
+        }
+
+        // Pre-upload all weights to GPU
+        let bytes_uploaded = self.preload_weights_gpu()?;
+        eprintln!(
+            "PAR-023: Pre-uploaded {} MB of weights to GPU",
+            bytes_uploaded / (1024 * 1024)
+        );
+
+        // Create KV cache (for position tracking)
+        let mut cache = OwnedQuantizedKVCache::new(
+            self.model.config.num_layers,
+            self.model.config.hidden_dim,
+            prompt.len() + config.max_tokens,
+        );
+
+        let mut tokens = prompt.to_vec();
+
+        // Process prompt tokens (prefill)
+        for (pos, &token_id) in prompt.iter().enumerate() {
+            if pos < prompt.len() - 1 {
+                let _ = self.forward_gpu_resident(token_id, &mut cache, pos)?;
+            }
+        }
+
+        // Generate from last prompt token
+        let mut position = prompt.len() - 1;
+        let mut last_token = prompt[prompt.len() - 1];
+
+        for _ in 0..config.max_tokens {
+            let logits = self.forward_gpu_resident(last_token, &mut cache, position)?;
 
             // Greedy sampling (temperature=0)
             let next_token = if config.temperature == 0.0 || config.top_k == 1 {
@@ -16108,7 +16955,7 @@ impl ContiguousKVCache {
     #[must_use]
     pub fn is_cache_aligned(&self) -> bool {
         // Check that layer_stride is a multiple of cache line size
-        self.layer_stride % FLOATS_PER_CACHE_LINE == 0
+        self.layer_stride.is_multiple_of(FLOATS_PER_CACHE_LINE)
     }
 
     /// Get the layer stride (elements per layer, cache-aligned)
@@ -17200,7 +18047,7 @@ mod vocab_tests {
         data.extend_from_slice(&5u64.to_le_bytes());
         data.extend_from_slice(b"world");
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         let vocab = model.vocabulary().expect("Should have vocabulary");
 
         assert_eq!(vocab.len(), 3);
@@ -17230,7 +18077,7 @@ mod vocab_tests {
             data.extend_from_slice(token.as_bytes());
         }
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         let decoded = model.decode(&[0, 1, 2, 3]);
 
         assert_eq!(decoded, "The capital of France");
@@ -17256,7 +18103,7 @@ mod vocab_tests {
         data.extend_from_slice(&1u64.to_le_bytes());
         data.extend_from_slice(b"b");
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         // Token ID 5 is out of range (vocab only has 0, 1)
         let decoded = model.decode(&[0, 5, 1]);
 
@@ -17271,7 +18118,7 @@ mod vocab_tests {
         data.extend_from_slice(&0u64.to_le_bytes());
         data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert!(model.vocabulary().is_none());
     }
 
@@ -17283,7 +18130,7 @@ mod vocab_tests {
         data.extend_from_slice(&0u64.to_le_bytes());
         data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         // Falls back to ASCII: 72=H, 105=i
         let decoded = model.decode(&[72, 105]);
 
@@ -17312,8 +18159,8 @@ mod vocab_tests {
             data.extend_from_slice(token.as_bytes());
         }
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
-        let tokens = model.encode("Hello world").unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        let tokens = model.encode("Hello world").expect("test");
 
         assert_eq!(tokens, vec![0, 1]); // "Hello" + "▁world"
     }
@@ -17339,8 +18186,8 @@ mod vocab_tests {
             data.extend_from_slice(token.as_bytes());
         }
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
-        let tokens = model.encode("abc").unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        let tokens = model.encode("abc").expect("test");
 
         assert_eq!(tokens, vec![2]); // Should pick "abc" (longest match)
     }
@@ -17366,9 +18213,9 @@ mod vocab_tests {
             data.extend_from_slice(token.as_bytes());
         }
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         let text = "The capital of France";
-        let tokens = model.encode(text).unwrap();
+        let tokens = model.encode(text).expect("test");
         let decoded = model.decode(&tokens);
 
         // Decoded text has ▁ instead of spaces (SentencePiece format)
@@ -17429,7 +18276,7 @@ mod tests {
         data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
         data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.header.magic, GGUF_MAGIC);
         assert_eq!(model.header.version, 3);
         assert_eq!(model.header.tensor_count, 0);
@@ -17499,7 +18346,7 @@ mod tests {
         data.extend_from_slice(&4u32.to_le_bytes()); // value_type = UInt32
         data.extend_from_slice(&42u32.to_le_bytes()); // value = 42
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 1);
         assert_eq!(
             model.metadata.get("test.value"),
@@ -17525,7 +18372,7 @@ mod tests {
         data.extend_from_slice(&(value.len() as u64).to_le_bytes()); // string length
         data.extend_from_slice(value.as_bytes()); // string data
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 1);
         assert_eq!(
             model.metadata.get("model.name"),
@@ -17555,7 +18402,7 @@ mod tests {
         data.extend_from_slice(&5u64.to_le_bytes());
         data.extend_from_slice(b"llama");
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 2);
         assert_eq!(model.metadata.get("version"), Some(&GGUFValue::UInt32(1)));
         assert_eq!(
@@ -17583,7 +18430,7 @@ mod tests {
         data.extend_from_slice(&0u32.to_le_bytes()); // qtype = 0
         data.extend_from_slice(&1024u64.to_le_bytes()); // offset = 1024
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.tensors.len(), 1);
         let tensor = &model.tensors[0];
         assert_eq!(tensor.name, "weight");
@@ -17613,7 +18460,7 @@ mod tests {
         data.extend_from_slice(&2u32.to_le_bytes()); // qtype = 2 (quantized)
         data.extend_from_slice(&2048u64.to_le_bytes()); // offset = 2048
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.tensors.len(), 1);
         let tensor = &model.tensors[0];
         assert_eq!(tensor.name, "conv.weight");
@@ -17648,7 +18495,7 @@ mod tests {
         data.extend_from_slice(&1u32.to_le_bytes());
         data.extend_from_slice(&0u64.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 1);
         assert_eq!(model.tensors.len(), 1);
         assert_eq!(
@@ -17673,7 +18520,7 @@ mod tests {
         data.extend_from_slice(&0u32.to_le_bytes()); // value_type = UInt8
         data.push(255u8); // value = 255
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.get("byte_val"), Some(&GGUFValue::UInt8(255)));
     }
 
@@ -17691,7 +18538,7 @@ mod tests {
         data.extend_from_slice(&1u32.to_le_bytes()); // value_type = Int8
         data.extend_from_slice(&(-42i8).to_le_bytes()); // value = -42
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("signed_byte"),
             Some(&GGUFValue::Int8(-42))
@@ -17712,7 +18559,7 @@ mod tests {
         data.extend_from_slice(&2u32.to_le_bytes()); // value_type = UInt16
         data.extend_from_slice(&65535u16.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("short_val"),
             Some(&GGUFValue::UInt16(65535))
@@ -17733,7 +18580,7 @@ mod tests {
         data.extend_from_slice(&3u32.to_le_bytes()); // value_type = Int16
         data.extend_from_slice(&(-1000i16).to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("signed_short"),
             Some(&GGUFValue::Int16(-1000))
@@ -17754,7 +18601,7 @@ mod tests {
         data.extend_from_slice(&5u32.to_le_bytes()); // value_type = Int32
         data.extend_from_slice(&(-100_000_i32).to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("signed_int"),
             Some(&GGUFValue::Int32(-100_000))
@@ -17775,7 +18622,7 @@ mod tests {
         data.extend_from_slice(&6u32.to_le_bytes()); // value_type = Float32
         data.extend_from_slice(&1.25f32.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         if let Some(GGUFValue::Float32(val)) = model.metadata.get("float_val") {
             assert!((val - 1.25).abs() < 1e-5);
         } else {
@@ -17797,7 +18644,7 @@ mod tests {
         data.extend_from_slice(&7u32.to_le_bytes()); // value_type = Bool
         data.push(1u8); // true
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("is_enabled"),
             Some(&GGUFValue::Bool(true))
@@ -17818,7 +18665,7 @@ mod tests {
         data.extend_from_slice(&7u32.to_le_bytes()); // value_type = Bool
         data.push(0u8); // false
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("is_disabled"),
             Some(&GGUFValue::Bool(false))
@@ -17839,7 +18686,7 @@ mod tests {
         data.extend_from_slice(&10u32.to_le_bytes()); // value_type = UInt64
         data.extend_from_slice(&(u64::MAX).to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("big_uint"),
             Some(&GGUFValue::UInt64(u64::MAX))
@@ -17860,7 +18707,7 @@ mod tests {
         data.extend_from_slice(&11u32.to_le_bytes()); // value_type = Int64
         data.extend_from_slice(&(i64::MIN).to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(
             model.metadata.get("big_int"),
             Some(&GGUFValue::Int64(i64::MIN))
@@ -17881,7 +18728,7 @@ mod tests {
         data.extend_from_slice(&12u32.to_le_bytes()); // value_type = Float64
         data.extend_from_slice(&1.125f64.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         if let Some(GGUFValue::Float64(val)) = model.metadata.get("double_val") {
             assert!((val - 1.125).abs() < 1e-10);
         } else {
@@ -17992,7 +18839,7 @@ mod tests {
         data.extend_from_slice(&12u32.to_le_bytes());
         data.extend_from_slice(&2.5f64.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 12);
         assert_eq!(model.metadata.get("u8"), Some(&GGUFValue::UInt8(100)));
         assert_eq!(model.metadata.get("i8"), Some(&GGUFValue::Int8(-50)));
@@ -18044,7 +18891,7 @@ mod tests {
         data.extend_from_slice(&2u32.to_le_bytes()); // element 1
         data.extend_from_slice(&3u32.to_le_bytes()); // element 2
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 1);
         if let Some(GGUFValue::Array(arr)) = model.metadata.get("test.array") {
             assert_eq!(arr.len(), 3);
@@ -18081,7 +18928,7 @@ mod tests {
         data.extend_from_slice(&5u64.to_le_bytes());
         data.extend_from_slice(b"world");
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         assert_eq!(model.metadata.len(), 1);
         if let Some(GGUFValue::Array(arr)) = model.metadata.get("test.strings") {
             assert_eq!(arr.len(), 2);
@@ -18108,7 +18955,7 @@ mod tests {
         data.extend_from_slice(&4u32.to_le_bytes()); // element_type = UInt32
         data.extend_from_slice(&0u64.to_le_bytes()); // array_len = 0
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         if let Some(GGUFValue::Array(arr)) = model.metadata.get("empty") {
             assert_eq!(arr.len(), 0);
         } else {
@@ -18147,8 +18994,8 @@ mod tests {
             data.extend_from_slice(&val.to_le_bytes());
         }
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
-        let values = model.get_tensor_f32("weights", &data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        let values = model.get_tensor_f32("weights", &data).expect("test");
 
         assert_eq!(values.len(), 6);
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -18162,7 +19009,7 @@ mod tests {
         data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
         data.extend_from_slice(&0u64.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         let result = model.get_tensor_f32("nonexistent", &data);
 
         assert!(result.is_err());
@@ -18206,8 +19053,8 @@ mod tests {
         data.extend_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
         data.extend_from_slice(&[0x21; 16]);
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
-        let values = model.get_tensor_f32("quant_weights", &data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        let values = model.get_tensor_f32("quant_weights", &data).expect("test");
 
         // Verify size is correct
         assert_eq!(values.len(), 64);
@@ -18245,11 +19092,11 @@ mod tests {
         data.extend_from_slice(&0.5f32.to_le_bytes());
         for i in 0i32..32 {
             // Test data uses i8 range [0, 31] - safe to convert
-            data.push(u8::try_from(i).unwrap());
+            data.push(u8::try_from(i).expect("test"));
         }
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
-        let values = model.get_tensor_f32("q8_weights", &data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        let values = model.get_tensor_f32("q8_weights", &data).expect("test");
 
         assert_eq!(values.len(), 32);
         // First value should be approximately 0.5 * 0 = 0.0
@@ -18276,7 +19123,7 @@ mod tests {
         let tensor_offset = (data.len() + 8) as u64;
         data.extend_from_slice(&tensor_offset.to_le_bytes());
 
-        let model = GGUFModel::from_bytes(&data).unwrap();
+        let model = GGUFModel::from_bytes(&data).expect("test");
         let result = model.get_tensor_f32("bad_tensor", &data);
 
         assert!(result.is_err());
@@ -19035,13 +19882,13 @@ mod tests {
         for i in 0..batch_size {
             let single_input = &batch_input[i * hidden_dim..(i + 1) * hidden_dim];
             let result = model.fused_matmul(single_input, &model.layers[0].ffn_up_weight);
-            sequential_results.push(result.unwrap());
+            sequential_results.push(result.expect("test"));
         }
 
         // Batch processing (new approach)
         let batch_result = model
             .fused_matmul(&batch_input, &model.layers[0].ffn_up_weight)
-            .unwrap();
+            .expect("test");
 
         // Verify batch output has correct total length
         let expected_out_dim = model.layers[0].ffn_up_weight.out_dim;
@@ -19087,7 +19934,7 @@ mod tests {
         let tokens = vec![1u32, 5, 10, 20];
 
         // Forward batch should return [batch_size, vocab_size] logits
-        let logits = model.forward_batch(&tokens).unwrap();
+        let logits = model.forward_batch(&tokens).expect("test");
 
         assert_eq!(
             logits.len(),
@@ -19102,7 +19949,7 @@ mod tests {
         );
 
         // Verify output is deterministic (run twice, get same result)
-        let logits2 = model.forward_batch(&tokens).unwrap();
+        let logits2 = model.forward_batch(&tokens).expect("test");
         assert_eq!(
             logits, logits2,
             "IMP-106b: forward_batch should be deterministic"
@@ -19130,7 +19977,7 @@ mod tests {
 
         // Prefill with batch of 4 tokens
         let prompt = vec![1u32, 5, 10, 20];
-        let last_logits = model.prefill_batch(&prompt, &mut cache).unwrap();
+        let last_logits = model.prefill_batch(&prompt, &mut cache).expect("test");
 
         // Should return only the last position's logits
         assert_eq!(
@@ -19159,7 +20006,7 @@ mod tests {
         // Uses HybridScheduler which routes to GPU for batch_size > 1
         use crate::gpu::HybridScheduler;
 
-        let mut scheduler = HybridScheduler::with_threshold(100).unwrap();
+        let mut scheduler = HybridScheduler::with_threshold(100).expect("test");
 
         // Batch of 4 vectors (m=4), weight matrix 8x16 (k=8, n=16)
         // This exceeds threshold: 4 * 8 * 16 = 512 > 100
@@ -19171,7 +20018,7 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 8) as f32) * 0.1).collect();
 
-        let result = scheduler.matmul(&a, &b, m, k, n).unwrap();
+        let result = scheduler.matmul(&a, &b, m, k, n).expect("test");
 
         assert_eq!(
             result.len(),
@@ -19213,7 +20060,7 @@ mod tests {
 
         // Batch of 8 tokens - should trigger GPU path
         let tokens = vec![1u32, 5, 10, 20, 30, 40, 50, 60];
-        let logits = model.forward_batch_gpu(&tokens).unwrap();
+        let logits = model.forward_batch_gpu(&tokens).expect("test");
 
         assert_eq!(
             logits.len(),
@@ -19232,7 +20079,7 @@ mod tests {
         }
 
         // Verify determinism - same input produces same output
-        let logits2 = model.forward_batch_gpu(&tokens).unwrap();
+        let logits2 = model.forward_batch_gpu(&tokens).expect("test");
         for i in 0..logits.len() {
             assert!(
                 (logits[i] - logits2[i]).abs() < 1e-6,
@@ -19247,7 +20094,7 @@ mod tests {
         // IMP-107c: Verify HybridScheduler makes correct GPU vs CPU decisions
         use crate::gpu::HybridScheduler;
 
-        let scheduler = HybridScheduler::with_threshold(1000).unwrap();
+        let scheduler = HybridScheduler::with_threshold(1000).expect("test");
 
         // Single token (m=1) should always use CPU
         assert!(
@@ -19331,7 +20178,7 @@ mod tests {
         // Get batched result (GPU-accelerated when beneficial)
         let batched_output = model
             .batched_causal_attention_gpu(&q, &k, &v, seq_len)
-            .unwrap();
+            .expect("test");
 
         // Get sequential reference result
         let sequential_output = model.causal_attention(&q, &k, &v, seq_len);
@@ -19391,7 +20238,7 @@ mod tests {
 
         let output = model
             .batched_causal_attention_gpu(&q, &k, &v, seq_len)
-            .unwrap();
+            .expect("test");
 
         // Position 0 can only attend to position 0, so should NOT see the large K[3]/V[3]
         let pos0_norm: f32 = output[0..hidden_dim].iter().map(|x| x.abs()).sum();
@@ -19459,7 +20306,7 @@ mod tests {
 
         let output = model
             .batched_causal_attention_gpu(&q, &k, &v, seq_len)
-            .unwrap();
+            .expect("test");
 
         // Output should be valid (finite)
         assert!(
@@ -19500,7 +20347,7 @@ mod tests {
 
         // Batch of 8 tokens
         let tokens = vec![1u32, 5, 10, 20, 30, 40, 50, 60];
-        let logits = model.forward_batch_gpu_causal(&tokens).unwrap();
+        let logits = model.forward_batch_gpu_causal(&tokens).expect("test");
 
         // Should return [batch_size * vocab_size] logits
         assert_eq!(
@@ -19516,7 +20363,7 @@ mod tests {
         );
 
         // Verify determinism
-        let logits2 = model.forward_batch_gpu_causal(&tokens).unwrap();
+        let logits2 = model.forward_batch_gpu_causal(&tokens).expect("test");
         for i in 0..logits.len() {
             assert!(
                 (logits[i] - logits2[i]).abs() < 1e-5,
@@ -19560,7 +20407,7 @@ mod tests {
         let activations: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
 
         // Reference: separate dequant + matmul
-        let weight_dequant = dequantize_q4_k_simd(weight_data).unwrap();
+        let weight_dequant = dequantize_q4_k_simd(weight_data).expect("test");
         let reference: Vec<f32> = (0..out_dim)
             .map(|row| {
                 (0..in_dim)
@@ -19673,13 +20520,13 @@ mod tests {
                 let row_start = row * super_blocks_per_row * 144;
                 let row_end = row_start + super_blocks_per_row * 144;
                 let row_data = &weight.data[row_start..row_end];
-                let row_dequant = dequantize_q4_k_simd(row_data).unwrap();
+                let row_dequant = dequantize_q4_k_simd(row_data).expect("test");
                 output.extend_from_slice(&row_dequant[..in_dim.min(row_dequant.len())]);
             }
             output
         };
 
-        let mut scheduler = HybridScheduler::with_threshold(1000).unwrap();
+        let mut scheduler = HybridScheduler::with_threshold(1000).expect("test");
         let reference = scheduler
             .matmul(
                 &activations,
@@ -19737,7 +20584,7 @@ mod tests {
                 .collect();
 
             // Separate operations (reference)
-            let dequant = dequantize_q4_k_simd(weight_data).unwrap();
+            let dequant = dequantize_q4_k_simd(weight_data).expect("test");
             let separate_result: Vec<f32> = (0..out_dim)
                 .map(|row| {
                     (0..in_dim)
@@ -23485,7 +24332,7 @@ mod tests {
             result.is_ok(),
             "PARITY-005g: generate_with_contiguous_cache should succeed"
         );
-        let tokens = result.unwrap();
+        let tokens = result.expect("test");
         assert!(
             tokens.len() >= prompt.len(),
             "PARITY-005g: Output should include prompt tokens"
@@ -23521,12 +24368,14 @@ mod tests {
         let prompt = vec![1u32, 2, 3];
 
         // Generate with original Vec<Vec<f32>> cache
-        let result_original = model.generate_with_cache(&prompt, &gen_config).unwrap();
+        let result_original = model
+            .generate_with_cache(&prompt, &gen_config)
+            .expect("test");
 
         // Generate with contiguous cache
         let result_contiguous = model
             .generate_with_contiguous_cache(&prompt, &gen_config)
-            .unwrap();
+            .expect("test");
 
         // Both should produce the same output (deterministic greedy sampling)
         assert_eq!(
@@ -23666,7 +24515,7 @@ mod tests {
             "PARITY-006a: batch_generate should exist and work"
         );
 
-        let outputs = result.unwrap();
+        let outputs = result.expect("test");
         assert_eq!(
             outputs.len(),
             2,
@@ -23703,8 +24552,10 @@ mod tests {
         let prompt: &[u32] = &[1, 2, 3];
         let prompts = vec![prompt];
 
-        let batch_result = model.batch_generate(&prompts, &gen_config).unwrap();
-        let single_result = model.generate_with_cache(prompt, &gen_config).unwrap();
+        let batch_result = model.batch_generate(&prompts, &gen_config).expect("test");
+        let single_result = model
+            .generate_with_cache(prompt, &gen_config)
+            .expect("test");
 
         assert_eq!(
             batch_result[0], single_result,
@@ -23743,7 +24594,7 @@ mod tests {
         let prompt3: &[u32] = &[50];
         let prompts = vec![prompt1, prompt2, prompt3];
 
-        let outputs = model.batch_generate(&prompts, &gen_config).unwrap();
+        let outputs = model.batch_generate(&prompts, &gen_config).expect("test");
 
         // Each output should start with its prompt
         for (i, (prompt, output)) in prompts.iter().zip(outputs.iter()).enumerate() {
@@ -24040,7 +24891,7 @@ mod tests {
         }
 
         let mut latencies = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0];
-        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        latencies.sort_by(|a, b| a.partial_cmp(b).expect("test"));
 
         let p50 = percentile(&latencies, 0.5);
         let p95 = percentile(&latencies, 0.95);
@@ -24140,7 +24991,9 @@ mod tests {
 
         for _ in 0..num_runs {
             let start = Instant::now();
-            let tokens = model.generate_with_cache(&prompt, &gen_config).unwrap();
+            let tokens = model
+                .generate_with_cache(&prompt, &gen_config)
+                .expect("test");
             let elapsed = start.elapsed();
 
             let tokens_generated = tokens.len() - prompt.len();
@@ -24635,8 +25488,12 @@ mod tests {
         let prompt = vec![1u32, 2, 3];
 
         // Two runs with same config should produce same output
-        let run1 = model.generate_with_cache(&prompt, &gen_config).unwrap();
-        let run2 = model.generate_with_cache(&prompt, &gen_config).unwrap();
+        let run1 = model
+            .generate_with_cache(&prompt, &gen_config)
+            .expect("test");
+        let run2 = model
+            .generate_with_cache(&prompt, &gen_config)
+            .expect("test");
 
         assert_eq!(
             run1, run2,
@@ -24974,7 +25831,7 @@ mod tests {
         /// Median Absolute Deviation (MAD) outlier detection
         /// Per Fleming & Wallace: MAD is robust to outliers
         fn median(values: &mut [f64]) -> f64 {
-            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            values.sort_by(|a, b| a.partial_cmp(b).expect("test"));
             let mid = values.len() / 2;
             if values.len() % 2 == 0 {
                 (values[mid - 1] + values[mid]) / 2.0
@@ -25046,7 +25903,7 @@ mod tests {
         impl LatencyStats {
             fn from_latencies(latencies: &[f64]) -> Self {
                 let mut sorted = latencies.to_vec();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                sorted.sort_by(|a, b| a.partial_cmp(b).expect("test"));
 
                 let percentile = |p: f64| -> f64 {
                     let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
@@ -26057,17 +26914,17 @@ mod tests {
             .iter()
             .find(|(n, _)| n == "Scalar")
             .map(|(_, v)| *v)
-            .unwrap();
+            .expect("test");
         let sse2 = results
             .iter()
             .find(|(n, _)| n == "SSE2")
             .map(|(_, v)| *v)
-            .unwrap();
+            .expect("test");
         let avx2 = results
             .iter()
             .find(|(n, _)| n == "AVX2")
             .map(|(_, v)| *v)
-            .unwrap();
+            .expect("test");
 
         assert!(sse2 > scalar, "QA-043: SSE2 faster than Scalar");
         assert!(avx2 > sse2, "QA-043: AVX2 faster than SSE2");
@@ -26117,7 +26974,7 @@ mod tests {
             fn run(&self) -> std::result::Result<f64, String> {
                 match &self.gpu_status {
                     GpuStatus::Available { .. } => Ok(1000.0), // 1000 tok/s on GPU
-                    _ => Err(self.gpu_status.skip_reason().unwrap()),
+                    _ => Err(self.gpu_status.skip_reason().expect("test")),
                 }
             }
 
@@ -26160,7 +27017,11 @@ mod tests {
         };
         assert!(bench.gpu_status.should_skip(), "QA-044: No device = skip");
         assert!(
-            bench.gpu_status.skip_reason().unwrap().contains("No GPU"),
+            bench
+                .gpu_status
+                .skip_reason()
+                .expect("test")
+                .contains("No GPU"),
             "QA-044: Clear skip reason"
         );
 
@@ -26169,7 +27030,11 @@ mod tests {
             gpu_status: GpuStatus::DriverError("Vulkan 1.3 required".to_string()),
         };
         assert!(
-            bench.gpu_status.skip_reason().unwrap().contains("Vulkan"),
+            bench
+                .gpu_status
+                .skip_reason()
+                .expect("test")
+                .contains("Vulkan"),
             "QA-044: Driver error in reason"
         );
 
@@ -26279,7 +27144,7 @@ mod tests {
             .iter()
             .find(|(n, _)| n == "Realizar")
             .map(|(_, g)| *g)
-            .unwrap();
+            .expect("test");
         assert!(
             realizar_gap > 1000.0,
             "QA-045: Gap correctly computed (>1000x)"
@@ -26380,8 +27245,8 @@ mod tests {
         let results = bench.run();
         assert_eq!(results.len(), 2, "QA-046: Two formats compared");
 
-        let apr = results.iter().find(|r| r.format == "APR").unwrap();
-        let gguf = results.iter().find(|r| r.format == "GGUF").unwrap();
+        let apr = results.iter().find(|r| r.format == "APR").expect("test");
+        let gguf = results.iter().find(|r| r.format == "GGUF").expect("test");
 
         // GGUF should be smaller (quantized)
         assert!(
@@ -26670,7 +27535,7 @@ mod tests {
                     .map(|p| p.throughput_tps)
                     .sum::<f64>()
                     / 5.0;
-                let current = history.last().unwrap().throughput_tps;
+                let current = history.last().expect("test").throughput_tps;
                 let change = (current - baseline) / baseline * 100.0;
 
                 RegressionAnalysis {
@@ -29099,7 +29964,7 @@ mod tests {
                     let ffn_down = vec![0.0f32; self.intermediate_dim * self.hidden_dim];
                     DequantizedLayerCache { ffn_up, ffn_down }
                 });
-                cache.get(&layer_idx).unwrap().ffn_up.clone()
+                cache.get(&layer_idx).expect("test").ffn_up.clone()
             }
 
             fn memory_bytes(&self) -> usize {
@@ -29713,24 +30578,24 @@ mod tests {
                 layer_idx: usize,
                 init_fn: impl FnOnce() -> (Vec<f32>, Vec<f32>),
             ) -> (Vec<f32>, Vec<f32>) {
-                let mut cache = self.layers.lock().unwrap();
+                let mut cache = self.layers.lock().expect("mutex poisoned");
                 cache.entry(layer_idx).or_insert_with(|| {
                     let (up, down) = init_fn();
                     DequantizedFFNWeights { up, down }
                 });
-                let weights = cache.get(&layer_idx).unwrap();
+                let weights = cache.get(&layer_idx).expect("test");
                 (weights.up.clone(), weights.down.clone())
             }
 
             fn memory_bytes(&self) -> usize {
-                let cache = self.layers.lock().unwrap();
+                let cache = self.layers.lock().expect("mutex poisoned");
                 cache.len()
                     * (self.hidden_dim * self.intermediate_dim * 2)
                     * std::mem::size_of::<f32>()
             }
 
             fn clear(&self) {
-                let mut cache = self.layers.lock().unwrap();
+                let mut cache = self.layers.lock().expect("mutex poisoned");
                 cache.clear();
             }
         }
@@ -29962,7 +30827,7 @@ mod tests {
             where
                 F: Fn(usize) -> (Vec<f32>, Vec<f32>),
             {
-                let mut cache = self.layers.write().unwrap();
+                let mut cache = self.layers.write().expect("test");
                 for layer_idx in 0..self.num_layers {
                     cache.entry(layer_idx).or_insert_with(|| {
                         let (up, down) = dequant_fn(layer_idx);
@@ -29973,19 +30838,19 @@ mod tests {
 
             /// Get dequantized weights (read-only, concurrent access)
             fn get(&self, layer_idx: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-                let cache = self.layers.read().unwrap();
+                let cache = self.layers.read().expect("test");
                 cache
                     .get(&layer_idx)
                     .map(|w| (w.up.clone(), w.down.clone()))
             }
 
             fn is_warmed_up(&self) -> bool {
-                let cache = self.layers.read().unwrap();
+                let cache = self.layers.read().expect("test");
                 cache.len() == self.num_layers
             }
 
             fn memory_bytes(&self) -> usize {
-                let cache = self.layers.read().unwrap();
+                let cache = self.layers.read().expect("test");
                 cache.len()
                     * (self.hidden_dim * self.intermediate_dim * 2)
                     * std::mem::size_of::<f32>()
@@ -30037,7 +30902,7 @@ mod tests {
             weights.is_some(),
             "PARITY-018a: Should be able to get layer 0"
         );
-        let (up, down) = weights.unwrap();
+        let (up, down) = weights.expect("test");
         assert_eq!(up.len(), hidden_dim * intermediate_dim);
         assert_eq!(down.len(), intermediate_dim * hidden_dim);
 
@@ -30466,11 +31331,11 @@ mod tests {
         assert!(weights_with_bias.up_bias.is_some());
         assert!(weights_with_bias.down_bias.is_some());
         assert_eq!(
-            weights_with_bias.up_bias.as_ref().unwrap().len(),
+            weights_with_bias.up_bias.as_ref().expect("test").len(),
             intermediate_dim
         );
         assert_eq!(
-            weights_with_bias.down_bias.as_ref().unwrap().len(),
+            weights_with_bias.down_bias.as_ref().expect("test").len(),
             hidden_dim
         );
 
@@ -30587,28 +31452,28 @@ mod tests {
 
         assert_eq!(cache.cached_count(), num_layers);
 
-        let weights_0 = cache.get(0).unwrap();
+        let weights_0 = cache.get(0).expect("test");
         assert!(weights_0.up_bias.is_some());
         assert!(weights_0.down_bias.is_some());
 
-        let up_bias = weights_0.up_bias.as_ref().unwrap();
-        let down_bias = weights_0.down_bias.as_ref().unwrap();
+        let up_bias = weights_0.up_bias.as_ref().expect("test");
+        let down_bias = weights_0.down_bias.as_ref().expect("test");
         assert_eq!(up_bias.len(), intermediate_dim);
         assert_eq!(down_bias.len(), hidden_dim);
         assert!(up_bias.iter().all(|&v| v == 0.0)); // layer_idx = 0
         assert!(down_bias.iter().all(|&v| v == 10.0)); // layer_idx + 10
 
-        let weights_1 = cache.get(1).unwrap();
+        let weights_1 = cache.get(1).expect("test");
         assert!(weights_1
             .up_bias
             .as_ref()
-            .unwrap()
+            .expect("test")
             .iter()
             .all(|&v| v == 1.0));
         assert!(weights_1
             .down_bias
             .as_ref()
-            .unwrap()
+            .expect("test")
             .iter()
             .all(|&v| v == 11.0));
 
@@ -30655,7 +31520,7 @@ mod tests {
                 for layer_idx in 0..num_layers {
                     let weights = cache_clone.get(layer_idx);
                     assert!(weights.is_some());
-                    let w = weights.unwrap();
+                    let w = weights.expect("test");
                     assert_eq!(w.up[0], layer_idx as f32);
                     assert_eq!(w.down[0], (layer_idx * 10) as f32);
                 }
@@ -31444,7 +32309,7 @@ mod tests {
         // Collect the batch
         let batch = collector.collect_batch();
         assert!(batch.is_some(), "PARITY-023d: Should collect a batch");
-        let batch = batch.unwrap();
+        let batch = batch.expect("test");
         assert_eq!(batch.size(), 5, "PARITY-023d: Batch should have 5 requests");
 
         // Verify collector is now empty
@@ -32560,9 +33425,9 @@ mod tests {
         assert!(id2.is_some(), "Second request should succeed");
         assert!(id3.is_some(), "Third request should succeed");
 
-        println!("    Request 1: ID={}", id1.unwrap());
-        println!("    Request 2: ID={}", id2.unwrap());
-        println!("    Request 3: ID={}", id3.unwrap());
+        println!("    Request 1: ID={}", id1.expect("test"));
+        println!("    Request 2: ID={}", id2.expect("test"));
+        println!("    Request 3: ID={}", id3.expect("test"));
 
         // Check counts
         assert_eq!(scheduler.active_count(), 3, "Should have 3 active slots");
@@ -32596,10 +33461,10 @@ mod tests {
         let scheduler = ContinuousBatchScheduler::new(4, 32, 2560, 2048);
 
         // Fill all slots
-        let _id1 = scheduler.submit(vec![1], 10, 0.7, 40).unwrap();
-        let _id2 = scheduler.submit(vec![2], 10, 0.7, 40).unwrap();
-        let _id3 = scheduler.submit(vec![3], 10, 0.7, 40).unwrap();
-        let _id4 = scheduler.submit(vec![4], 10, 0.7, 40).unwrap();
+        let _id1 = scheduler.submit(vec![1], 10, 0.7, 40).expect("test");
+        let _id2 = scheduler.submit(vec![2], 10, 0.7, 40).expect("test");
+        let _id3 = scheduler.submit(vec![3], 10, 0.7, 40).expect("test");
+        let _id4 = scheduler.submit(vec![4], 10, 0.7, 40).expect("test");
 
         assert_eq!(scheduler.active_count(), 4, "All slots active");
         assert_eq!(scheduler.empty_count(), 0, "No empty slots");
@@ -33458,7 +34323,11 @@ mod tests {
         // Get output
         let result = queue.get_output(slot);
         assert!(result.is_some(), "Should have output");
-        assert_eq!(result.unwrap().len(), 256, "Output should be 256 elements");
+        assert_eq!(
+            result.expect("test").len(),
+            256,
+            "Output should be 256 elements"
+        );
 
         println!("\n  Status: VERIFIED");
     }
@@ -33658,7 +34527,7 @@ mod tests {
         assert!(result.is_some(), "Should find cached prefix");
         println!("  Lookup hit: OK");
 
-        let (cached_k, cached_v) = result.unwrap();
+        let (cached_k, cached_v) = result.expect("test");
         assert_eq!(cached_k.len(), 32, "K cache should have 32 layers");
         assert_eq!(cached_v.len(), 32, "V cache should have 32 layers");
 
@@ -34832,7 +35701,7 @@ mod tests {
 
         let result = model.generate_with_cache(&prompt, &gen_config);
         assert!(result.is_ok(), "Generation should succeed with SIMD path");
-        let tokens = result.unwrap();
+        let tokens = result.expect("test");
         println!(
             "  Generated {} tokens (including {} prompt tokens)",
             tokens.len(),
@@ -34890,7 +35759,7 @@ mod tests {
         };
         let matmul_result = model.fused_matmul(&input, qkv_tensor);
         assert!(matmul_result.is_ok(), "Fused matmul should succeed");
-        let output = matmul_result.unwrap();
+        let output = matmul_result.expect("test");
         println!(
             "  Matmul output size: {} (expected: {})",
             output.len(),
@@ -35387,7 +36256,7 @@ mod tests {
         let cuda_model = OwnedQuantizedModelCuda::new(model, 0);
         assert!(cuda_model.is_ok(), "Should create CUDA model wrapper");
 
-        let cuda_model = cuda_model.unwrap();
+        let cuda_model = cuda_model.expect("test");
         assert!(
             !cuda_model.device_name().is_empty(),
             "Should have device name"
@@ -42632,10 +43501,10 @@ mod tests {
             .sum();
 
         // Quantize to Q8 blocks (2 blocks of 32 values each)
-        let q_block1 = Q8_0Block::quantize(&q_vector[0..32].try_into().unwrap());
-        let q_block2 = Q8_0Block::quantize(&q_vector[32..64].try_into().unwrap());
-        let k_block1 = Q8_0Block::quantize(&k_vector[0..32].try_into().unwrap());
-        let k_block2 = Q8_0Block::quantize(&k_vector[32..64].try_into().unwrap());
+        let q_block1 = Q8_0Block::quantize(&q_vector[0..32].try_into().expect("test"));
+        let q_block2 = Q8_0Block::quantize(&q_vector[32..64].try_into().expect("test"));
+        let k_block1 = Q8_0Block::quantize(&k_vector[0..32].try_into().expect("test"));
+        let k_block2 = Q8_0Block::quantize(&k_vector[32..64].try_into().expect("test"));
 
         // Compute INT8 dot product (simplified - accumulate scaled results)
         let int8_dot1: i32 = q_block1
@@ -42830,8 +43699,8 @@ mod tests {
             softmax
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
+                .max_by(|a, b| a.1.partial_cmp(b.1).expect("test"))
+                .expect("test")
                 .0
         );
 
@@ -42882,8 +43751,12 @@ mod tests {
         let mut q_blocks = Vec::new();
         let mut k_blocks = Vec::new();
         for i in 0..seq_len {
-            let q_slice: &[f32; 32] = q_data[i * head_dim..(i + 1) * head_dim].try_into().unwrap();
-            let k_slice: &[f32; 32] = k_data[i * head_dim..(i + 1) * head_dim].try_into().unwrap();
+            let q_slice: &[f32; 32] = q_data[i * head_dim..(i + 1) * head_dim]
+                .try_into()
+                .expect("test");
+            let k_slice: &[f32; 32] = k_data[i * head_dim..(i + 1) * head_dim]
+                .try_into()
+                .expect("test");
             q_blocks.push(Q8_0Block::quantize(q_slice));
             k_blocks.push(Q8_0Block::quantize(k_slice));
         }
