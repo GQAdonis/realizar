@@ -9870,6 +9870,49 @@ impl OwnedQuantizedModel {
         }
     }
 
+    /// QKV projection - zero-allocation variant (P1-REV)
+    ///
+    /// Writes QKV output directly to pre-allocated buffer, eliminating
+    /// Vec allocation that was 42% of forward pass overhead.
+    ///
+    /// # Arguments
+    /// * `input` - Normalized hidden state [hidden_dim]
+    /// * `qkv` - QKV weights (fused or separate)
+    /// * `output` - Pre-allocated buffer [q_dim + k_dim + v_dim]
+    pub fn qkv_matmul_into(
+        &self,
+        input: &[f32],
+        qkv: &OwnedQKVWeights,
+        output: &mut [f32],
+    ) -> Result<()> {
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => self.fused_matmul_into(input, weight, output),
+            OwnedQKVWeights::Separate {
+                ref q,
+                ref k,
+                ref v,
+            } => {
+                // For single-token case (seq_len=1), write Q, K, V directly
+                let q_dim = q.out_dim;
+                let k_dim = k.out_dim;
+                let v_dim = v.out_dim;
+
+                // Write Q to output[0..q_dim]
+                self.fused_matmul_into(input, q, &mut output[..q_dim])?;
+                // Write K to output[q_dim..q_dim+k_dim]
+                self.fused_matmul_into(input, k, &mut output[q_dim..q_dim + k_dim])?;
+                // Write V to output[q_dim+k_dim..]
+                self.fused_matmul_into(
+                    input,
+                    v,
+                    &mut output[q_dim + k_dim..q_dim + k_dim + v_dim],
+                )?;
+
+                Ok(())
+            },
+        }
+    }
+
     /// Fused RMSNorm + matmul for Q4_0 weights
     ///
     /// Combines RMSNorm normalization with quantized matmul:
@@ -13039,9 +13082,7 @@ impl OwnedQuantizedModel {
                 );
             }
 
-            // 2b. QKV projection → scratch.qkv
-            // Fall back to allocating for now - _into version for QKV is complex
-            let qkv = self.qkv_matmul(&scratch.normed, &layer.qkv_weight)?;
+            // 2b. QKV projection → scratch.qkv (zero-allocation via P1-REV)
             let q_dim = layer.qkv_weight.q_dim();
             let k_dim = match &layer.qkv_weight {
                 OwnedQKVWeights::Fused(_) => q_dim,
@@ -13051,11 +13092,19 @@ impl OwnedQuantizedModel {
                 OwnedQKVWeights::Fused(_) => q_dim,
                 OwnedQKVWeights::Separate { v, .. } => v.out_dim,
             };
+            let qkv_dim = q_dim + k_dim + v_dim;
 
-            // Copy to scratch Q, K, V
-            scratch.q[..q_dim].copy_from_slice(&qkv[..q_dim]);
-            scratch.k[..k_dim].copy_from_slice(&qkv[q_dim..q_dim + k_dim]);
-            scratch.v[..v_dim].copy_from_slice(&qkv[q_dim + k_dim..q_dim + k_dim + v_dim]);
+            // Write directly to scratch.qkv, eliminating Vec allocation
+            self.qkv_matmul_into(
+                &scratch.normed,
+                &layer.qkv_weight,
+                &mut scratch.qkv[..qkv_dim],
+            )?;
+
+            // Copy from scratch.qkv to individual Q, K, V buffers
+            scratch.q[..q_dim].copy_from_slice(&scratch.qkv[..q_dim]);
+            scratch.k[..k_dim].copy_from_slice(&scratch.qkv[q_dim..q_dim + k_dim]);
+            scratch.v[..v_dim].copy_from_slice(&scratch.qkv[q_dim + k_dim..qkv_dim]);
 
             // Add bias if present
             if let Some(ref bias) = layer.qkv_bias {
