@@ -1157,9 +1157,23 @@ impl GGUFModel {
         }
     }
 
-    /// Get RoPE type from metadata
-    /// Returns: 0 = NORM (adjacent pairs, default), 2 = NEOX (split halves)
+    /// Get RMSNorm epsilon from metadata
+    /// Different models use different values (LLaMA: 1e-5, Qwen2: 1e-6)
+    pub fn rms_epsilon(&self) -> Option<f32> {
+        let arch = self.architecture()?;
+        let key = format!("{}.attention.layer_norm_rms_epsilon", arch);
+        if let Some(GGUFValue::Float32(eps)) = self.metadata.get(&key) {
+            Some(*eps)
+        } else {
+            None
+        }
+    }
+
+    /// Get RoPE type from metadata or infer from architecture
+    /// Returns: 0 = NORM (adjacent pairs), 2 = NEOX (split halves)
     /// Per llama.cpp: LLAMA_ROPE_TYPE_NORM = 0, LLAMA_ROPE_TYPE_NEOX = 2
+    ///
+    /// Architecture-based inference matches llama.cpp's llama-model.cpp:7763-7811
     pub fn rope_type(&self) -> Option<u32> {
         let arch = self.architecture()?;
         let key = format!("{}.rope.scaling.type", arch);
@@ -1171,9 +1185,45 @@ impl GGUFModel {
                 _ => {},
             }
         }
-        // Most LLaMA-family models use type 0 (adjacent pairs) by default
-        // This is confirmed by llama.cpp printing "rope type = 0" for TinyLlama
-        None
+        // Infer rope type from architecture (matches llama.cpp llama-model.cpp:7763-7811)
+        // NEOX style (type 2): pairs offset by n_rot/2
+        let arch_lower = arch.to_lowercase();
+        let neox_architectures = [
+            "qwen",
+            "qwen2",
+            "qwen3",
+            "stablelm",
+            "phi2",
+            "phi3",
+            "gemma",
+            "gemma2",
+            "gemma3",
+            "starcoder2",
+            "gptneox",
+            "falcon",
+            "codeshell",
+            "orion",
+            "bert",
+            "nomic-bert",
+            "dbrx",
+            "olmo2",
+            "olmoe",
+            "plamo",
+            "plamo2",
+            "openelm",
+            "exaone",
+            "minicpm3",
+            "nemotron",
+            "internlm2",
+            "deepseek2",
+        ];
+        for neox_arch in neox_architectures {
+            if arch_lower.contains(neox_arch) {
+                return Some(2); // NEOX style
+            }
+        }
+        // NORM style (type 0): adjacent pairs - default for LLaMA, TinyLlama
+        Some(0)
     }
 
     /// Get BOS (beginning of sentence) token ID
@@ -1427,7 +1477,10 @@ impl GGUFConfig {
         // Read rope_theta from metadata, or use default (10000.0 for LLaMA-style)
         // Qwen2 uses 1000000.0, which is read from qwen2.rope.freq_base
         let rope_theta = model.rope_freq_base().unwrap_or(10000.0);
-        let eps = 1e-5;
+
+        // Read RMSNorm epsilon from metadata, or use default (1e-5 for LLaMA-style)
+        // Qwen2 uses 1e-6, which is read from qwen2.attention.layer_norm_rms_epsilon
+        let eps = model.rms_epsilon().unwrap_or(1e-5);
 
         // num_kv_heads (for GQA - e.g., Qwen uses fewer KV heads than Q heads)
         let num_kv_heads = model.num_kv_heads().unwrap_or(num_heads);
@@ -2269,6 +2322,52 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             },
         };
 
+        // PAR-058-FIX: Validate byte size and auto-correct qtype if mismatch detected
+        // Some GGUF files have incorrect qtype in header (e.g., Q5_0 header but Q4_0 data)
+        // Detect this by checking if the calculated byte_size would exceed file bounds,
+        // and try alternative qtypes that match the actual data size.
+        let (byte_size, actual_qtype) = {
+            // Try the claimed qtype first
+            if offset + byte_size <= data.len() {
+                (byte_size, tensor.qtype)
+            } else {
+                // Mismatch! Try to infer correct qtype from available data
+                // This happens when GGUF header has wrong qtype (e.g., qwen2.5-coder-0.5b)
+                let avail = data.len().saturating_sub(offset);
+
+                // Try Q4_0 (18 bytes per 32 elements)
+                let q4_0_size = {
+                    const BLOCK_SIZE: usize = 32;
+                    const BLOCK_BYTES: usize = 18;
+                    num_elements.div_ceil(BLOCK_SIZE) * BLOCK_BYTES
+                };
+                if q4_0_size <= avail && q4_0_size > 0 {
+                    eprintln!(
+                        "[PAR-058-FIX] Tensor '{}' qtype mismatch: header says {} but byte size suggests Q4_0. Using Q4_0.",
+                        name, tensor.qtype
+                    );
+                    (q4_0_size, GGUF_TYPE_Q4_0)
+                } else {
+                    // Try Q8_0 (34 bytes per 32 elements)
+                    let q8_0_size = {
+                        const BLOCK_SIZE: usize = 32;
+                        const BLOCK_BYTES: usize = 34;
+                        num_elements.div_ceil(BLOCK_SIZE) * BLOCK_BYTES
+                    };
+                    if q8_0_size <= avail && q8_0_size > 0 {
+                        eprintln!(
+                            "[PAR-058-FIX] Tensor '{}' qtype mismatch: header says {} but byte size suggests Q8_0. Using Q8_0.",
+                            name, tensor.qtype
+                        );
+                        (q8_0_size, GGUF_TYPE_Q8_0)
+                    } else {
+                        // Fallback to original (will fail bounds check below)
+                        (byte_size, tensor.qtype)
+                    }
+                }
+            }
+        };
+
         // Validate bounds
         if offset + byte_size > data.len() {
             return Err(RealizarError::InvalidShape {
@@ -2286,7 +2385,7 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             offset,
             byte_size,
             num_elements,
-            qtype: tensor.qtype,
+            qtype: actual_qtype, // PAR-058-FIX: Use auto-corrected qtype
         })
     }
 
@@ -3284,6 +3383,29 @@ impl<'a> QuantizedGGUFTransformer<'a> {
 
         // 2. Process through transformer layers
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Track hidden state across layers
+            if debug_forward
+                && position == 1
+                && (layer_idx == 0 || layer_idx == 12 || layer_idx == 23)
+            {
+                let hidden_sum: f32 = hidden.iter().sum();
+                let hidden_norm: f32 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!(
+                    "[PAR-062-L{}] hidden sum={:.4}, norm={:.4}, first4={:?}",
+                    layer_idx,
+                    hidden_sum,
+                    hidden_norm,
+                    &hidden[..4]
+                );
+            }
+            // Print RoPE config on first layer
+            if debug_forward && position == 0 && layer_idx == 0 {
+                eprintln!(
+                    "[PAR-063] RoPE: theta={}, type={}",
+                    self.config.rope_theta, self.config.rope_type
+                );
+            }
+
             // 2a. Attention layer norm
             let normed = if use_rmsnorm {
                 self.rms_norm(&hidden, &layer.attn_norm_weight, self.config.eps)
@@ -3383,6 +3505,17 @@ impl<'a> QuantizedGGUFTransformer<'a> {
             // 2e. Store K and V in cache
             cache.append(layer_idx, &k, &v);
 
+            if debug_forward && layer_idx == 0 && position == 0 {
+                eprintln!(
+                    "[PAR-051-L0] attn_out sum: {:.6}",
+                    attn_out.iter().sum::<f32>()
+                );
+                eprintln!(
+                    "[PAR-051-L0] attn_out[0..8]: {:?}",
+                    &attn_out[..8.min(attn_out.len())]
+                );
+            }
+
             // 2f. Attention output projection
             let mut attn_output =
                 self.fused_matmul(&attn_out, &layer.attn_output_weight, hidden_dim, hidden_dim)?;
@@ -3390,9 +3523,31 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 self.add_bias(&mut attn_output, bias);
             }
 
+            if debug_forward && layer_idx == 0 && position == 0 {
+                eprintln!(
+                    "[PAR-051-L0] attn_output (after proj) sum: {:.6}",
+                    attn_output.iter().sum::<f32>()
+                );
+                eprintln!(
+                    "[PAR-051-L0] attn_output[0..8]: {:?}",
+                    &attn_output[..8.min(attn_output.len())]
+                );
+                eprintln!(
+                    "[PAR-051-L0] hidden (before 1st residual) sum: {:.6}",
+                    hidden.iter().sum::<f32>()
+                );
+            }
+
             // 2g. Residual connection
             for i in 0..hidden_dim {
                 hidden[i] += attn_output[i];
+            }
+
+            if debug_forward && layer_idx == 0 && position == 0 {
+                eprintln!(
+                    "[PAR-051-L0] hidden (after 1st residual) sum: {:.6}",
+                    hidden.iter().sum::<f32>()
+                );
             }
 
             // 2h. Pre-FFN layer norm
@@ -3411,6 +3566,13 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 hidden.clone()
             };
 
+            if debug_forward && layer_idx == 0 && position == 0 {
+                eprintln!(
+                    "[PAR-051-L0] ffn_input sum: {:.6}",
+                    ffn_input.iter().sum::<f32>()
+                );
+            }
+
             // 2i. FFN with SwiGLU or GELU
             let ffn_output = if let Some(ref gate_weight) = layer.ffn_gate_weight {
                 // SwiGLU path (LLaMA)
@@ -3424,6 +3586,14 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                     self.add_bias(&mut ffn_up, bias);
                 }
 
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!("[PAR-051-L0] ffn_up sum: {:.6}", ffn_up.iter().sum::<f32>());
+                    eprintln!(
+                        "[PAR-051-L0] ffn_up[0..8]: {:?}",
+                        &ffn_up[..8.min(ffn_up.len())]
+                    );
+                }
+
                 let mut ffn_gate = self.fused_matmul(
                     &ffn_input,
                     gate_weight,
@@ -3434,10 +3604,32 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                     self.add_bias(&mut ffn_gate, bias);
                 }
 
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_gate (pre-silu) sum: {:.6}",
+                        ffn_gate.iter().sum::<f32>()
+                    );
+                }
+
                 // SiLU on gate, then multiply with up
                 self.silu(&mut ffn_gate);
+
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_gate (post-silu) sum: {:.6}",
+                        ffn_gate.iter().sum::<f32>()
+                    );
+                }
+
                 for i in 0..ffn_gate.len() {
                     ffn_gate[i] *= ffn_up[i];
+                }
+
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_gate*up sum: {:.6}",
+                        ffn_gate.iter().sum::<f32>()
+                    );
                 }
 
                 let mut output = self.fused_matmul(
@@ -3449,6 +3641,18 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 if let Some(ref bias) = layer.ffn_down_bias {
                     self.add_bias(&mut output, bias);
                 }
+
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_down (SwiGLU) sum: {:.6}",
+                        output.iter().sum::<f32>()
+                    );
+                    eprintln!(
+                        "[PAR-051-L0] ffn_down[0..8]: {:?}",
+                        &output[..8.min(output.len())]
+                    );
+                }
+
                 output
             } else {
                 // GELU path (phi-2)
@@ -3461,7 +3665,22 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 if let Some(ref bias) = layer.ffn_up_bias {
                     self.add_bias(&mut ffn_hidden, bias);
                 }
+
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_hidden (pre-gelu) sum: {:.6}",
+                        ffn_hidden.iter().sum::<f32>()
+                    );
+                }
+
                 self.gelu(&mut ffn_hidden);
+
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_hidden (post-gelu) sum: {:.6}",
+                        ffn_hidden.iter().sum::<f32>()
+                    );
+                }
 
                 let mut output = self.fused_matmul(
                     &ffn_hidden,
@@ -3472,12 +3691,35 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 if let Some(ref bias) = layer.ffn_down_bias {
                     self.add_bias(&mut output, bias);
                 }
+
+                if debug_forward && layer_idx == 0 && position == 0 {
+                    eprintln!(
+                        "[PAR-051-L0] ffn_down (GELU) sum: {:.6}",
+                        output.iter().sum::<f32>()
+                    );
+                    eprintln!(
+                        "[PAR-051-L0] ffn_down[0..8]: {:?}",
+                        &output[..8.min(output.len())]
+                    );
+                }
+
                 output
             };
 
             // 2j. Residual connection
             for i in 0..hidden_dim {
                 hidden[i] += ffn_output[i];
+            }
+
+            if debug_forward && layer_idx == 0 && position == 0 {
+                eprintln!(
+                    "[PAR-051-L0] hidden (after 2nd residual) sum: {:.6}",
+                    hidden.iter().sum::<f32>()
+                );
+                eprintln!(
+                    "[PAR-051-L0] hidden[0..8]: {:?}",
+                    &hidden[..8.min(hidden.len())]
+                );
             }
         }
 
@@ -3495,6 +3737,14 @@ impl<'a> QuantizedGGUFTransformer<'a> {
                 self.config.eps,
             )
         };
+
+        // PAR-060-DEBUG: Always print CPU normed hidden for comparison with GPU
+        let cpu_normed_sum: f32 = normed.iter().sum();
+        eprintln!(
+            "[PAR-060-CPU] Normed hidden: first 5: {:?}, sum: {:.4}",
+            &normed[..5.min(normed.len())],
+            cpu_normed_sum
+        );
 
         if debug_forward && (position == 0 || position == 5) {
             eprintln!(
@@ -3534,6 +3784,84 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         )?;
         if let Some(ref bias) = self.lm_head_bias {
             self.add_bias(&mut logits, bias);
+        }
+
+        // PAR-060-DEBUG: Print CPU digit logits for comparison with GPU
+        if logits.len() > 20 {
+            eprintln!(
+                "[PAR-060-CPU] Digit logits: 0={:.2}, 1={:.2}, 2={:.2}, 3={:.2}, 4={:.2}, 5={:.2}",
+                logits[15], logits[16], logits[17], logits[18], logits[19], logits[20]
+            );
+        }
+
+        // PAR-061-DEBUG: Print first few logits and find argmax
+        if debug_forward && (position == 0 || position == 1) {
+            eprintln!(
+                "[PAR-061-P{}] First 10 logits: {:?}",
+                position,
+                &logits[..10.min(logits.len())]
+            );
+            let (argmax_idx, argmax_val) = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((0, &0.0));
+            eprintln!(
+                "[PAR-061-P{}] Argmax: token {} with logit {:.4}",
+                position, argmax_idx, argmax_val
+            );
+            // Print logits around argmax
+            let start = argmax_idx.saturating_sub(3);
+            let end = (argmax_idx + 4).min(logits.len());
+            eprintln!(
+                "[PAR-061-P{}] Logits around argmax: {:?}",
+                position,
+                &logits[start..end]
+            );
+            // Print lm_head weight info
+            eprintln!(
+                "[PAR-061-P{}] lm_head qtype: {:?}, len: {}",
+                position, self.lm_head_weight.qtype, self.lm_head_weight.byte_size
+            );
+            // Print logit for common tokens: "4" is likely around token 19 in many vocabs
+            eprintln!(
+                "[PAR-061-P{}] Logits[15..25]: {:?}",
+                position,
+                &logits[15..25.min(logits.len())]
+            );
+            // Verify with manual computation for token 0
+            let lm_head_data = self.tensor_data(&self.lm_head_weight);
+            // Dequantize first row (token 0's projection weights) manually
+            let bytes_per_row = (hidden_dim / 32) * 34;
+            let first_row_data = &lm_head_data[0..bytes_per_row];
+            // Dequantize Q8_0 manually for verification
+            let mut first_row_f32 = vec![0.0f32; hidden_dim];
+            for block_idx in 0..(hidden_dim / 32) {
+                let block_start = block_idx * 34;
+                let scale = half::f16::from_le_bytes([
+                    first_row_data[block_start],
+                    first_row_data[block_start + 1],
+                ])
+                .to_f32();
+                for j in 0..32 {
+                    let quant = first_row_data[block_start + 2 + j] as i8;
+                    first_row_f32[block_idx * 32 + j] = scale * (quant as f32);
+                }
+            }
+            // Manual dot product
+            let manual_logit_0: f32 = normed
+                .iter()
+                .zip(first_row_f32.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            eprintln!(
+                "[PAR-061-P0] Manual logit[0] = {:.4}, computed = {:.4}",
+                manual_logit_0, logits[0]
+            );
+            eprintln!(
+                "[PAR-061-P0] First row weights[0..8]: {:?}",
+                &first_row_f32[..8]
+            );
         }
 
         Ok(logits)
@@ -10050,6 +10378,15 @@ impl OwnedQuantizedModel {
 
         // Fallback to separate RMSNorm + matmul for other types
         let normed = self.rms_norm(input, &self.output_norm_weight, self.config.eps);
+
+        // PAR-060-DEBUG: Print CPU normed hidden for comparison with GPU
+        let normed_sum: f32 = normed.iter().sum();
+        eprintln!(
+            "[PAR-060-CPU] Normed hidden: first 5: {:?}, sum: {:.4}",
+            &normed[..5.min(normed.len())],
+            normed_sum
+        );
+
         self.fused_matmul(&normed, &self.lm_head_weight)
     }
 
@@ -16111,6 +16448,13 @@ impl OwnedQuantizedModelCuda {
                 reason: format!("GPU KV cache initialization failed: {e}"),
             })?;
 
+        // PAR-060: Set RoPE theta for position embeddings
+        eprintln!(
+            "[PAR-060] Setting rope_theta = {} for GPU path",
+            model.config.rope_theta
+        );
+        executor.set_rope_theta(model.config.rope_theta);
+
         Ok(Self {
             model,
             executor,
@@ -16917,8 +17261,8 @@ impl OwnedQuantizedModelCuda {
             let attn_out = if k_cache.is_empty() {
                 // First token - no cache yet
                 // PAR-021: Use GPU incremental attention for GQA
-                // PAR-049-DEBUG: Temporarily force CPU attention for debugging
-                if false && self.executor.has_kv_cache_gpu() {
+                // PAR-057: Re-enable GPU attention now that TiledQ4KGemvKernel underflow is fixed
+                if self.executor.has_kv_cache_gpu() {
                     // For first token, attention output = V (weighted by 1.0)
                     // Still need to populate GPU cache for subsequent tokens
                     let mut attn_output = vec![0.0f32; hidden_dim];
@@ -16953,8 +17297,8 @@ impl OwnedQuantizedModelCuda {
                 let _total_len = cache_len + 1;
 
                 // PAR-020/021: Use GPU-resident KV cache with GQA support
-                // PAR-049-DEBUG: Temporarily force CPU attention for debugging
-                if false && self.executor.has_kv_cache_gpu() {
+                // PAR-057: Re-enable GPU attention now that TiledQ4KGemvKernel underflow is fixed
+                if self.executor.has_kv_cache_gpu() {
                     let mut attn_output = vec![0.0f32; hidden_dim];
                     self.executor
                         .incremental_attention_gpu(layer_idx, &q, &k, &v, &mut attn_output)
@@ -16972,10 +17316,10 @@ impl OwnedQuantizedModelCuda {
                 }
             };
 
-            // 2e. Store K and V in cache
-            // PAR-049-DEBUG: Always store in CPU cache for debugging
-            // Original: if !self.executor.has_kv_cache_gpu() { cache.append(layer_idx, &k, &v); }
-            cache.append(layer_idx, &k, &v);
+            // 2e. Store K and V in cache (only CPU cache if no GPU cache)
+            if !self.executor.has_kv_cache_gpu() {
+                cache.append(layer_idx, &k, &v);
+            }
 
             // 2f. Attention output projection (GPU - PAR-014: use pre-captured cache key)
             let mut attn_output = self.fused_matmul_cuda_with_key(
@@ -16992,8 +17336,10 @@ impl OwnedQuantizedModelCuda {
                 hidden[i] += attn_output[i];
             }
 
-            // PAR-049-DEBUG: Compare attention output with CPU
-            if layer_idx == 0 && (position == 0 || position == 1) {
+            // PAR-049-DEBUG: Compare attention output with CPU (disabled for performance)
+            // Re-enable by changing `false` to `true` for debugging
+            #[allow(clippy::never_loop, clippy::while_let_on_iterator)]
+            if false && layer_idx == 0 && (position == 0 || position == 1) {
                 let cpu_attn = self.model.fused_matmul(&attn_out, &attn_output_weight)?;
                 let max_diff = attn_output
                     .iter()
@@ -17018,12 +17364,10 @@ impl OwnedQuantizedModelCuda {
                 }
             }
 
-            // 2h/2i. FFN (PAR-014: fused path temporarily disabled for debugging)
-            // NOTE: Fused FFN path is disabled by setting condition to false
-            // This will be re-enabled once CUDA kernel correctness is verified
+            // 2h/2i. FFN
+            // PAR-057: Re-enable fused FFN path now that kernels are fixed
             #[allow(clippy::overly_complex_bool_expr)]
-            let ffn_output = if false
-                && ffn_up_bias.is_none()
+            let ffn_output = if ffn_up_bias.is_none()
                 && ffn_down_bias.is_none()
                 && ffn_up_weight.qtype == 12
                 && ffn_down_weight.qtype == 12
@@ -17140,10 +17484,11 @@ impl OwnedQuantizedModelCuda {
                 ffn_output
             };
 
-            // PAR-049-DEBUG: Compare FFN output with CPU
-            if layer_idx == 0 && position == 0 {
+            // PAR-049-DEBUG: Compare FFN output with CPU (disabled for performance)
+            #[allow(clippy::never_loop)]
+            if false && layer_idx == 0 && position == 0 {
                 // Compute CPU FFN for comparison
-                let ffn_input_cpu =
+                let _ffn_input_cpu =
                     if let Some(ref ffn_norm) = self.model.layers[layer_idx].ffn_norm_weight {
                         self.model.layer_norm(
                             &hidden,
@@ -17175,8 +17520,10 @@ impl OwnedQuantizedModelCuda {
                 hidden[i] += ffn_output[i];
             }
 
-            // PAR-049-DEBUG: Print hidden state after layer 0 and compute CPU reference
-            if layer_idx == 0 && position == 0 {
+            // PAR-049-DEBUG: Print hidden state after layer 0 and compute CPU reference (disabled for performance)
+            // Re-enable by changing `false` to `true` for debugging
+            #[allow(clippy::never_loop)]
+            if false && layer_idx == 0 && position == 0 {
                 eprintln!(
                     "[PAR-049] L0 GPU hidden[0..5]: {:?}",
                     &hidden[..5.min(hidden.len())]
@@ -17280,8 +17627,10 @@ impl OwnedQuantizedModelCuda {
             self.model.add_bias(&mut logits, bias);
         }
 
-        // PAR-049-DEBUG: Compare final logits with CPU for position 1
-        if position == 1 {
+        // PAR-049-DEBUG: Compare final logits with CPU for position 1 (disabled for performance)
+        // Re-enable by changing `false` to `true` for debugging
+        #[allow(clippy::never_loop)]
+        if false && position == 1 {
             let cpu_logits = self.model.fused_matmul(&normed, &lm_head_weight)?;
             let max_diff = logits
                 .iter()
@@ -17613,12 +17962,12 @@ impl OwnedQuantizedModelCuda {
             // Upload Q, K, V weights (requires separate format for GPU-resident path)
             match &layer.qkv_weight {
                 OwnedQKVWeights::Separate { q, k, v } => {
-                    // Q projection
+                    // Q projection - PAR-058: pass qtype for mixed-quant models (e.g., Q5_0 in Qwen 0.5B)
                     let q_name = format!("{}.attn_q.weight", prefix);
                     if !self.executor.has_quantized_weights(&q_name) {
                         total_bytes += self
                             .executor
-                            .load_quantized_weights(&q_name, &q.data)
+                            .load_quantized_weights_with_type(&q_name, &q.data, q.qtype)
                             .map_err(|e| RealizarError::UnsupportedOperation {
                                 operation: "preload_weights_gpu".to_string(),
                                 reason: format!(
@@ -17628,12 +17977,12 @@ impl OwnedQuantizedModelCuda {
                             })?;
                     }
 
-                    // K projection
+                    // K projection - PAR-058: pass qtype for mixed-quant models
                     let k_name = format!("{}.attn_k.weight", prefix);
                     if !self.executor.has_quantized_weights(&k_name) {
                         total_bytes += self
                             .executor
-                            .load_quantized_weights(&k_name, &k.data)
+                            .load_quantized_weights_with_type(&k_name, &k.data, k.qtype)
                             .map_err(|e| RealizarError::UnsupportedOperation {
                                 operation: "preload_weights_gpu".to_string(),
                                 reason: format!(
@@ -17643,12 +17992,12 @@ impl OwnedQuantizedModelCuda {
                             })?;
                     }
 
-                    // V projection
+                    // V projection - PAR-058: pass qtype for mixed-quant models
                     let v_name = format!("{}.attn_v.weight", prefix);
                     if !self.executor.has_quantized_weights(&v_name) {
                         total_bytes += self
                             .executor
-                            .load_quantized_weights(&v_name, &v.data)
+                            .load_quantized_weights_with_type(&v_name, &v.data, v.qtype)
                             .map_err(|e| RealizarError::UnsupportedOperation {
                                 operation: "preload_weights_gpu".to_string(),
                                 reason: format!(
@@ -17671,12 +18020,16 @@ impl OwnedQuantizedModelCuda {
                 },
             }
 
-            // Output projection
+            // Output projection - PAR-058: pass qtype for mixed-quant models
             let o_name = format!("{}.attn_output.weight", prefix);
             if !self.executor.has_quantized_weights(&o_name) {
                 total_bytes += self
                     .executor
-                    .load_quantized_weights(&o_name, &layer.attn_output_weight.data)
+                    .load_quantized_weights_with_type(
+                        &o_name,
+                        &layer.attn_output_weight.data,
+                        layer.attn_output_weight.qtype,
+                    )
                     .map_err(|e| RealizarError::UnsupportedOperation {
                         operation: "preload_weights_gpu".to_string(),
                         reason: format!(
@@ -17686,13 +18039,13 @@ impl OwnedQuantizedModelCuda {
                     })?;
             }
 
-            // FFN gate (SwiGLU models)
+            // FFN gate (SwiGLU models) - PAR-058: pass qtype
             if let Some(ref gate) = layer.ffn_gate_weight {
                 let gate_name = format!("{}.ffn_gate.weight", prefix);
                 if !self.executor.has_quantized_weights(&gate_name) {
                     total_bytes += self
                         .executor
-                        .load_quantized_weights(&gate_name, &gate.data)
+                        .load_quantized_weights_with_type(&gate_name, &gate.data, gate.qtype)
                         .map_err(|e| RealizarError::UnsupportedOperation {
                             operation: "preload_weights_gpu".to_string(),
                             reason: format!(
@@ -17703,12 +18056,16 @@ impl OwnedQuantizedModelCuda {
                 }
             }
 
-            // FFN up
+            // FFN up - PAR-058: pass qtype
             let up_name = format!("{}.ffn_up.weight", prefix);
             if !self.executor.has_quantized_weights(&up_name) {
                 total_bytes += self
                     .executor
-                    .load_quantized_weights(&up_name, &layer.ffn_up_weight.data)
+                    .load_quantized_weights_with_type(
+                        &up_name,
+                        &layer.ffn_up_weight.data,
+                        layer.ffn_up_weight.qtype,
+                    )
                     .map_err(|e| RealizarError::UnsupportedOperation {
                         operation: "preload_weights_gpu".to_string(),
                         reason: format!(
@@ -17718,12 +18075,16 @@ impl OwnedQuantizedModelCuda {
                     })?;
             }
 
-            // FFN down
+            // FFN down - PAR-058: pass qtype
             let down_name = format!("{}.ffn_down.weight", prefix);
             if !self.executor.has_quantized_weights(&down_name) {
                 total_bytes += self
                     .executor
-                    .load_quantized_weights(&down_name, &layer.ffn_down_weight.data)
+                    .load_quantized_weights_with_type(
+                        &down_name,
+                        &layer.ffn_down_weight.data,
+                        layer.ffn_down_weight.qtype,
+                    )
                     .map_err(|e| RealizarError::UnsupportedOperation {
                         operation: "preload_weights_gpu".to_string(),
                         reason: format!(
@@ -17737,9 +18098,24 @@ impl OwnedQuantizedModelCuda {
         // Also upload LM head weights
         let lm_head_name = "output.weight".to_string();
         if !self.executor.has_quantized_weights(&lm_head_name) {
+            // PAR-060-DEBUG: Print first bytes of LM head weight for verification
+            let lm_data = &self.model.lm_head_weight.data;
+            eprintln!(
+                "[PAR-060-DEBUG] LM head weight: len={}, first 20 bytes: {:?}",
+                lm_data.len(),
+                &lm_data[..20.min(lm_data.len())]
+            );
+            eprintln!(
+                "[PAR-060-DEBUG] LM head dims: in_dim={}, out_dim={}",
+                self.model.lm_head_weight.in_dim, self.model.lm_head_weight.out_dim
+            );
             total_bytes += self
                 .executor
-                .load_quantized_weights(&lm_head_name, &self.model.lm_head_weight.data)
+                .load_quantized_weights_with_type(
+                    &lm_head_name,
+                    lm_data,
+                    self.model.lm_head_weight.qtype,
+                )
                 .map_err(|e| RealizarError::UnsupportedOperation {
                     operation: "preload_weights_gpu".to_string(),
                     reason: format!("Failed to upload LM head weights: {}", e),
@@ -17860,7 +18236,7 @@ impl OwnedQuantizedModelCuda {
         &mut self,
         token_id: u32,
         cache: &mut OwnedQuantizedKVCache,
-        _position: usize,
+        position: usize,
     ) -> Result<Vec<f32>> {
         let hidden_dim = self.model.config.hidden_dim;
         let intermediate_dim = self.model.layers[0].ffn_up_weight.out_dim;
@@ -17871,13 +18247,23 @@ impl OwnedQuantizedModelCuda {
         // 1. Token embedding lookup (CPU - fast, single lookup)
         let embedding = self.model.embed(&[token_id]);
 
+        // PAR-060-DEBUG: Compare embedding sum
+        let embed_sum: f32 = embedding.iter().sum();
+        eprintln!(
+            "[PAR-060-DEBUG] Embedding sum: {:.6}, first 5: {:?}",
+            embed_sum,
+            &embedding[..5.min(embedding.len())]
+        );
+
         // 2. Fully GPU-resident forward: layers + output norm + LM head
+        // PAR-054: Use CUDA graph-captured path for decode (reduces 280 launches to 1)
         // Only 2 syncs total: embedding upload + logits download
         let mut logits = vec![0.0f32; vocab_size];
         self.executor
-            .forward_all_layers_gpu_to_logits(
+            .forward_all_layers_gpu_to_logits_graphed(
                 &embedding,
                 &mut logits,
+                position as u32,
                 num_layers,
                 hidden_dim as u32,
                 intermediate_dim as u32,
@@ -17886,7 +18272,7 @@ impl OwnedQuantizedModelCuda {
             )
             .map_err(|e| RealizarError::UnsupportedOperation {
                 operation: "forward_gpu_resident".to_string(),
-                reason: format!("forward_all_layers_gpu_to_logits failed: {}", e),
+                reason: format!("forward_all_layers_gpu_to_logits_graphed failed: {}", e),
             })?;
 
         // 3. Add LM head bias if present (CPU - fast)
@@ -17954,6 +18340,10 @@ impl OwnedQuantizedModelCuda {
             prompt.len() + config.max_tokens,
         );
 
+        // PAR-055 FIX: Reset GPU KV cache positions before new generation
+        // Without this, cache positions accumulate across generate calls causing degradation
+        self.executor.reset_kv_cache_gpu();
+
         let mut tokens = prompt.to_vec();
 
         // Process prompt tokens (prefill)
@@ -17967,8 +18357,29 @@ impl OwnedQuantizedModelCuda {
         let mut position = prompt.len() - 1;
         let mut last_token = prompt[prompt.len() - 1];
 
-        for _ in 0..config.max_tokens {
+        for token_num in 0..config.max_tokens {
             let logits = self.forward_gpu_resident(last_token, &mut cache, position)?;
+
+            // PAR-058-DEBUG: Print first few and last few logits
+            if token_num == 0 {
+                eprintln!("[PAR-058-GPU] Logits len: {}", logits.len());
+                eprintln!(
+                    "[PAR-058-GPU] First 5: {:?}",
+                    &logits[..5.min(logits.len())]
+                );
+                eprintln!(
+                    "[PAR-058-GPU] Last 5: {:?}",
+                    &logits[logits.len().saturating_sub(5)..]
+                );
+                // Print top 5 logits
+                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.truncate(5);
+                eprintln!("[PAR-058-GPU] Top 5: {:?}", indexed);
+                // PAR-060: Show digit token logits (15="0", 19="4")
+                eprintln!("[PAR-060-GPU] Digit logits: 0={:.2}, 1={:.2}, 2={:.2}, 3={:.2}, 4={:.2}, 5={:.2}",
+                    logits[15], logits[16], logits[17], logits[18], logits[19], logits[20]);
+            }
 
             // Greedy sampling (temperature=0)
             let next_token = if config.temperature == 0.0 || config.top_k == 1 {
