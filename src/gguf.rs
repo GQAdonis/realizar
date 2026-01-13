@@ -13830,13 +13830,11 @@ impl OwnedQuantizedModel {
         }
 
         // Generate new tokens - zero allocations per token
+        // PAR-126: Fixed loop structure to match generate_with_cache:
+        // 1. Sample from current logits (prefill on first iter, previous forward otherwise)
+        // 2. Then run forward on the new token to get logits for next iteration
         for gen_idx in 0..config.max_tokens {
-            let position = prompt.len() + gen_idx;
-            let last_token = *tokens.last().expect("tokens must be non-empty");
-
-            self.forward_single_with_scratch(last_token, &mut cache, position, &mut scratch)?;
-
-            // Sample next token from pre-allocated logits buffer
+            // Sample next token from current logits (prefill logits on first iter)
             let next_token = if config.temperature == 0.0 || config.top_k == 1 {
                 Self::argmax(&scratch.logits)
             } else {
@@ -13854,6 +13852,10 @@ impl OwnedQuantizedModel {
             if tokens.len() >= max_seq_len {
                 break;
             }
+
+            // Get logits for next iteration by forwarding the new token
+            let position = prompt.len() + gen_idx;
+            self.forward_single_with_scratch(next_token, &mut cache, position, &mut scratch)?;
         }
 
         Ok(tokens)
@@ -13903,15 +13905,15 @@ impl OwnedQuantizedModel {
             }
 
             // 2b. QKV projection → scratch.qkv (zero-allocation via P1-REV)
-            let q_dim = layer.qkv_weight.q_dim();
-            let k_dim = match &layer.qkv_weight {
-                OwnedQKVWeights::Fused(_) => q_dim,
-                OwnedQKVWeights::Separate { k, .. } => k.out_dim,
-            };
-            let v_dim = match &layer.qkv_weight {
-                OwnedQKVWeights::Fused(_) => q_dim,
-                OwnedQKVWeights::Separate { v, .. } => v.out_dim,
-            };
+            // PAR-126: Fix GQA dimension bug - use config instead of q_dim() which
+            // incorrectly assumes Q=K=V for fused weights
+            let num_kv_heads = self.config.num_kv_heads;
+            let head_dim = hidden_dim / self.config.num_heads;
+            let kv_dim = num_kv_heads * head_dim;
+            // Q uses all heads, K/V use only kv_heads (GQA)
+            let q_dim = hidden_dim;
+            let k_dim = kv_dim;
+            let v_dim = kv_dim;
             let qkv_dim = q_dim + k_dim + v_dim;
 
             // Write directly to scratch.qkv, eliminating Vec allocation
