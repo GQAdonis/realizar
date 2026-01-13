@@ -17137,6 +17137,14 @@ impl OwnedQuantizedModelCuda {
         &self.model
     }
 
+    /// PAR-111: Get mutable reference to CUDA executor
+    ///
+    /// Allows direct access for batched forward path and workspace initialization.
+    #[must_use]
+    pub fn executor_mut(&mut self) -> &mut crate::cuda::CudaExecutor {
+        &mut self.executor
+    }
+
     /// Forward pass using CUDA GEMM acceleration (IMP-800a)
     ///
     /// Uses CudaExecutor for matrix multiplications in the FFN layers.
