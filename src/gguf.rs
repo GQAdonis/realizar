@@ -19684,9 +19684,12 @@ impl OwnedQuantizedModelCuda {
             total_drafts += draft_tokens.len();
 
             // Step 2: Verify using TARGET model
-            // Rollback draft cache (will re-fill during verification if accepted)
+            // PAR-105: Rollback draft cache to snapshot position, preserving prefill history
+            // BUG FIX: reset_kv_cache_gpu() was clearing ALL history, causing 1/k acceptance
             draft_cache.rollback_to(draft_cache_snapshot, draft_kv_dim);
-            draft_model.executor.reset_kv_cache_gpu();
+            draft_model
+                .executor
+                .rollback_kv_cache_gpu(draft_cache_snapshot);
 
             let mut num_accepted = 0usize;
 
@@ -19733,10 +19736,13 @@ impl OwnedQuantizedModelCuda {
 
             // Handle edge case: all drafts rejected
             if num_accepted == 0 && !draft_tokens.is_empty() {
+                // PAR-105: Use rollback instead of reset to preserve prefill history
                 target_cache.rollback_to(target_cache_snapshot, target_kv_dim);
                 draft_cache.rollback_to(draft_cache_snapshot, draft_kv_dim);
-                self.executor.reset_kv_cache_gpu();
-                draft_model.executor.reset_kv_cache_gpu();
+                self.executor.rollback_kv_cache_gpu(target_cache_snapshot);
+                draft_model
+                    .executor
+                    .rollback_kv_cache_gpu(draft_cache_snapshot);
 
                 let fallback =
                     self.forward_gpu_resident_to_token_id(last_token, &mut target_cache, position)?;
@@ -19753,11 +19759,15 @@ impl OwnedQuantizedModelCuda {
             position += num_accepted;
             last_token = *tokens.last().unwrap_or(&0);
 
-            // Rollback caches to accepted length
+            // Rollback caches to accepted length (CPU AND GPU must stay in sync)
             let target_len = target_cache_snapshot + num_accepted;
             let draft_len = draft_cache_snapshot + num_accepted;
             target_cache.rollback_to(target_len, target_kv_dim);
             draft_cache.rollback_to(draft_len, draft_kv_dim);
+            // PAR-105: BUG FIX - must also rollback GPU caches to match CPU
+            // Without this, GPU cache has stale entries from rejected verifications
+            self.executor.rollback_kv_cache_gpu(target_len);
+            draft_model.executor.rollback_kv_cache_gpu(draft_len);
         }
 
         let decode_time = decode_start.elapsed();
