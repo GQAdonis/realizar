@@ -19320,6 +19320,268 @@ impl OwnedQuantizedModelCuda {
         Ok(tokens)
     }
 
+    /// PAR-099: Speculative decoding with separate draft model
+    ///
+    /// Uses a smaller draft model (e.g., 0.5B) for fast token generation,
+    /// then verifies with the target model (e.g., 1.5B).
+    ///
+    /// # Theory (Five-Whys Root Cause)
+    ///
+    /// WHY does draft model help?
+    /// → Draft model is 3x smaller = 3x faster = 3x fewer weight reads
+    /// → Verification with target model amortizes quality check
+    ///
+    /// Expected speedup with 0.5B draft + 1.5B target:
+    /// - Draft 4 tokens: 4 × (2.5ms/3) = 3.3ms
+    /// - Verify 4 tokens: 1 × 2.5ms = 2.5ms (batched)
+    /// - Total: 5.8ms for ~3 accepted tokens = 517 tok/s (1.3x improvement)
+    ///
+    /// With k=8, 80% acceptance: theoretical ~700-800 tok/s
+    ///
+    /// # Arguments
+    ///
+    /// * `draft_model` - Smaller model for fast token drafting
+    /// * `prompt` - Initial token IDs
+    /// * `config` - Generation configuration
+    /// * `speculation_k` - Number of tokens to draft (typically 4-8)
+    ///
+    /// # Returns
+    ///
+    /// Generated token sequence including prompt
+    pub fn generate_speculative_with_draft(
+        &mut self,
+        draft_model: &mut OwnedQuantizedModelCuda,
+        prompt: &[u32],
+        config: &QuantizedGenerateConfig,
+        speculation_k: usize,
+    ) -> Result<Vec<u32>> {
+        use std::time::Instant;
+
+        if prompt.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check architecture support for both models
+        if !self.supports_gpu_resident() {
+            return Err(RealizarError::UnsupportedOperation {
+                operation: "generate_speculative_with_draft".to_string(),
+                reason: "Target model architecture not supported for GPU-resident path".to_string(),
+            });
+        }
+        if !draft_model.supports_gpu_resident() {
+            return Err(RealizarError::UnsupportedOperation {
+                operation: "generate_speculative_with_draft".to_string(),
+                reason: "Draft model architecture not supported for GPU-resident path".to_string(),
+            });
+        }
+
+        // Pre-upload weights for both models
+        let target_bytes = self.preload_weights_gpu()?;
+        let draft_bytes = draft_model.preload_weights_gpu()?;
+        eprintln!(
+            "PAR-099: Pre-uploaded {} MB (target) + {} MB (draft) to GPU",
+            target_bytes / (1024 * 1024),
+            draft_bytes / (1024 * 1024)
+        );
+
+        // Setup KV caches for both models
+        let target_kv_dim = {
+            let num_kv_heads = self.model.config.num_kv_heads;
+            let head_dim = self.model.config.hidden_dim / self.model.config.num_heads;
+            num_kv_heads * head_dim
+        };
+        let draft_kv_dim = {
+            let num_kv_heads = draft_model.model.config.num_kv_heads;
+            let head_dim = draft_model.model.config.hidden_dim / draft_model.model.config.num_heads;
+            num_kv_heads * head_dim
+        };
+
+        let mut target_cache = OwnedQuantizedKVCache::new(
+            self.model.config.num_layers,
+            target_kv_dim,
+            prompt.len() + config.max_tokens + speculation_k,
+        );
+        let mut draft_cache = OwnedQuantizedKVCache::new(
+            draft_model.model.config.num_layers,
+            draft_kv_dim,
+            prompt.len() + config.max_tokens + speculation_k,
+        );
+
+        // Reset GPU KV cache positions
+        self.executor.reset_kv_cache_gpu();
+        draft_model.executor.reset_kv_cache_gpu();
+
+        let mut tokens = prompt.to_vec();
+
+        // Prefill both models
+        let prefill_start = Instant::now();
+        for (pos, &token_id) in prompt.iter().enumerate() {
+            if pos < prompt.len() - 1 {
+                let _ = self.forward_gpu_resident(token_id, &mut target_cache, pos)?;
+                let _ = draft_model.forward_gpu_resident(token_id, &mut draft_cache, pos)?;
+            }
+        }
+        let prefill_time = prefill_start.elapsed();
+
+        // Start decode from last prompt token
+        let mut position = prompt.len() - 1;
+        let mut last_token = prompt[prompt.len() - 1];
+
+        // Statistics
+        let decode_start = Instant::now();
+        let mut accepted_tokens = 0usize;
+        let mut total_drafts = 0usize;
+        let mut total_speculative_batches = 0usize;
+
+        while tokens.len() - prompt.len() < config.max_tokens {
+            // Step 1: Draft k tokens using DRAFT model (fast, smaller)
+            let draft_cache_snapshot = draft_cache.snapshot_len();
+            let target_cache_snapshot = target_cache.snapshot_len();
+            let mut draft_tokens = Vec::with_capacity(speculation_k);
+
+            // Draft using the smaller model
+            for i in 0..speculation_k {
+                let draft_pos = position + i;
+                let input_token = if i == 0 {
+                    last_token
+                } else {
+                    *draft_tokens.last().unwrap_or(&last_token)
+                };
+
+                let draft = draft_model.forward_gpu_resident_to_token_id(
+                    input_token,
+                    &mut draft_cache,
+                    draft_pos,
+                )?;
+
+                if config.stop_tokens.contains(&draft) {
+                    if i == 0 {
+                        tokens.push(draft);
+                    }
+                    break;
+                }
+
+                draft_tokens.push(draft);
+            }
+
+            if draft_tokens.is_empty() {
+                break;
+            }
+
+            total_drafts += draft_tokens.len();
+
+            // Step 2: Verify using TARGET model
+            // Rollback draft cache (will re-fill during verification if accepted)
+            draft_cache.rollback_to(draft_cache_snapshot, draft_kv_dim);
+            draft_model.executor.reset_kv_cache_gpu();
+
+            let mut num_accepted = 0usize;
+
+            for (i, &draft) in draft_tokens.iter().enumerate() {
+                let verify_pos = position + i;
+                let input_token = if i == 0 {
+                    last_token
+                } else {
+                    *draft_tokens.get(i - 1).unwrap_or(&last_token)
+                };
+
+                // Verify with target model
+                let verified = self.forward_gpu_resident_to_token_id(
+                    input_token,
+                    &mut target_cache,
+                    verify_pos,
+                )?;
+
+                if verified == draft {
+                    // Accept: also update draft cache for consistency
+                    let _ = draft_model.forward_gpu_resident(
+                        input_token,
+                        &mut draft_cache,
+                        verify_pos,
+                    )?;
+                    tokens.push(draft);
+                    num_accepted += 1;
+                } else {
+                    // Reject: accept target's correction
+                    if !config.stop_tokens.contains(&verified) {
+                        let _ = draft_model.forward_gpu_resident(
+                            input_token,
+                            &mut draft_cache,
+                            verify_pos,
+                        )?;
+                        tokens.push(verified);
+                        num_accepted += 1;
+                    }
+                    break;
+                }
+            }
+
+            total_speculative_batches += 1;
+
+            // Handle edge case: all drafts rejected
+            if num_accepted == 0 && !draft_tokens.is_empty() {
+                target_cache.rollback_to(target_cache_snapshot, target_kv_dim);
+                draft_cache.rollback_to(draft_cache_snapshot, draft_kv_dim);
+                self.executor.reset_kv_cache_gpu();
+                draft_model.executor.reset_kv_cache_gpu();
+
+                let fallback =
+                    self.forward_gpu_resident_to_token_id(last_token, &mut target_cache, position)?;
+                let _ = draft_model.forward_gpu_resident(last_token, &mut draft_cache, position)?;
+
+                if config.stop_tokens.contains(&fallback) {
+                    break;
+                }
+                tokens.push(fallback);
+                num_accepted = 1;
+            }
+
+            accepted_tokens += num_accepted;
+            position += num_accepted;
+            last_token = *tokens.last().unwrap_or(&0);
+
+            // Rollback caches to accepted length
+            let target_len = target_cache_snapshot + num_accepted;
+            let draft_len = draft_cache_snapshot + num_accepted;
+            target_cache.rollback_to(target_len, target_kv_dim);
+            draft_cache.rollback_to(draft_len, draft_kv_dim);
+        }
+
+        let decode_time = decode_start.elapsed();
+        let generated_tokens = tokens.len() - prompt.len();
+        let decode_tok_s = if decode_time.as_secs_f64() > 0.0 {
+            generated_tokens as f64 / decode_time.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let acceptance_rate = if total_drafts > 0 {
+            accepted_tokens as f64 / total_drafts as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "[PAR-099] Speculative decode (draft model): {} tokens in {:.2}ms ({:.1} tok/s)",
+            generated_tokens,
+            decode_time.as_secs_f64() * 1000.0,
+            decode_tok_s
+        );
+        eprintln!(
+            "[PAR-099] Prefill: {:.2}ms, Drafts: {}, Accepted: {}, Rate: {:.1}%",
+            prefill_time.as_secs_f64() * 1000.0,
+            total_drafts,
+            accepted_tokens,
+            acceptance_rate
+        );
+        eprintln!(
+            "[PAR-099] Speculative batches: {}",
+            total_speculative_batches
+        );
+
+        Ok(tokens)
+    }
+
     // =========================================================================
     // PAR-023: GPU-Resident Transformer Layer Integration
     // =========================================================================
