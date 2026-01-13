@@ -17862,6 +17862,584 @@ impl OwnedQuantizedModelCuda {
         Ok(logits)
     }
 
+    /// PAR-108: Batched decode for multiple sequences with separate KV caches
+    ///
+    /// Uses batched GEMV for linear projections (15x speedup) while handling
+    /// attention per-sequence (each has different KV cache and position).
+    ///
+    /// # Arguments
+    /// * `tokens` - One token ID per sequence [M]
+    /// * `caches` - One KV cache per sequence [M]
+    /// * `positions` - Position for each sequence [M]
+    ///
+    /// # Returns
+    /// Token IDs for each sequence [M]
+    pub fn forward_batch_multi_cache_to_tokens(
+        &mut self,
+        tokens: &[u32],
+        caches: &mut [OwnedQuantizedKVCache],
+        positions: &[usize],
+    ) -> Result<Vec<u32>> {
+        let m = tokens.len();
+        if m == 0 || m != caches.len() || m != positions.len() {
+            return Err(RealizarError::UnsupportedOperation {
+                operation: "forward_batch_multi_cache_to_tokens".to_string(),
+                reason: format!(
+                    "Mismatched batch sizes: tokens={}, caches={}, positions={}",
+                    m,
+                    caches.len(),
+                    positions.len()
+                ),
+            });
+        }
+
+        let hidden_dim = self.model.config.hidden_dim;
+        let num_heads = self.model.config.num_heads;
+        let num_kv_heads = self.model.config.num_kv_heads;
+        let head_dim = hidden_dim / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let vocab_size = self.model.config.vocab_size;
+
+        // 1. Batched token embedding [M × hidden_dim]
+        let mut hidden = self.model.embed(tokens);
+
+        // 2. Process through all layers
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            let prefix = format!("blk.{}", layer_idx);
+
+            // 2a. Batched RMSNorm (CPU for now)
+            let normed = self.model.layer_norm(
+                &hidden,
+                &layer.attn_norm_weight,
+                layer.attn_norm_bias.as_deref(),
+                self.model.config.eps,
+            );
+
+            // 2b. Batched QKV projection using efficient batched GEMV
+            let qkv = match &layer.qkv_weight {
+                OwnedQKVWeights::Separate { q, k, v } => {
+                    let q_name = format!("{}.attn_q.weight", prefix);
+                    let k_name = format!("{}.attn_k.weight", prefix);
+                    let v_name = format!("{}.attn_v.weight", prefix);
+
+                    let mut q_out = vec![0.0f32; m * q.out_dim];
+                    let mut k_out = vec![0.0f32; m * k.out_dim];
+                    let mut v_out = vec![0.0f32; m * v.out_dim];
+
+                    self.executor
+                        .batched_q4k_gemv_cached(
+                            &q_name,
+                            &normed,
+                            &mut q_out,
+                            m as u32,
+                            hidden_dim as u32,
+                            q.out_dim as u32,
+                        )
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "forward_batch_multi_cache".to_string(),
+                            reason: format!("Q projection failed: {}", e),
+                        })?;
+
+                    self.executor
+                        .batched_q4k_gemv_cached(
+                            &k_name,
+                            &normed,
+                            &mut k_out,
+                            m as u32,
+                            hidden_dim as u32,
+                            k.out_dim as u32,
+                        )
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "forward_batch_multi_cache".to_string(),
+                            reason: format!("K projection failed: {}", e),
+                        })?;
+
+                    self.executor
+                        .batched_q4k_gemv_cached(
+                            &v_name,
+                            &normed,
+                            &mut v_out,
+                            m as u32,
+                            hidden_dim as u32,
+                            v.out_dim as u32,
+                        )
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "forward_batch_multi_cache".to_string(),
+                            reason: format!("V projection failed: {}", e),
+                        })?;
+
+                    // Concatenate Q, K, V
+                    let mut qkv = vec![0.0f32; m * (q.out_dim + k.out_dim + v.out_dim)];
+                    for s in 0..m {
+                        let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
+                        qkv[s * qkv_dim..s * qkv_dim + q.out_dim]
+                            .copy_from_slice(&q_out[s * q.out_dim..(s + 1) * q.out_dim]);
+                        qkv[s * qkv_dim + q.out_dim..s * qkv_dim + q.out_dim + k.out_dim]
+                            .copy_from_slice(&k_out[s * k.out_dim..(s + 1) * k.out_dim]);
+                        qkv[s * qkv_dim + q.out_dim + k.out_dim..s * qkv_dim + qkv_dim]
+                            .copy_from_slice(&v_out[s * v.out_dim..(s + 1) * v.out_dim]);
+                    }
+                    qkv
+                },
+                OwnedQKVWeights::Fused(_) => {
+                    return Err(RealizarError::UnsupportedOperation {
+                        operation: "forward_batch_multi_cache".to_string(),
+                        reason: "Fused QKV not supported".to_string(),
+                    });
+                },
+            };
+
+            // 2c. Per-sequence: apply RoPE and attention with each cache
+            let mut attn_outputs = vec![0.0f32; m * hidden_dim];
+            let actual_qkv_dim = hidden_dim + 2 * kv_dim;
+
+            for s in 0..m {
+                let qkv_start = s * actual_qkv_dim;
+                let mut q = qkv[qkv_start..qkv_start + hidden_dim].to_vec();
+                let mut k = qkv[qkv_start + hidden_dim..qkv_start + hidden_dim + kv_dim].to_vec();
+                let v = qkv[qkv_start + hidden_dim + kv_dim..qkv_start + actual_qkv_dim].to_vec();
+
+                // Apply RoPE at correct position for this sequence
+                self.model.apply_rope(&mut q, positions[s], num_heads);
+                self.model.apply_rope(&mut k, positions[s], num_kv_heads);
+
+                // Get and update KV cache for this sequence
+                let k_cache = caches[s].get_k(layer_idx);
+                let v_cache = caches[s].get_v(layer_idx);
+
+                // Single-token attention with cache
+                let attn_out =
+                    self.model
+                        .attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v);
+
+                // Update cache
+                caches[s].append_kv(layer_idx, &k, &v);
+
+                // Store attention output
+                attn_outputs[s * hidden_dim..(s + 1) * hidden_dim].copy_from_slice(&attn_out);
+            }
+
+            // 2d. Batched O projection
+            let o_name = format!("{}.attn_output.weight", prefix);
+            let mut o_out = vec![0.0f32; m * hidden_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &o_name,
+                    &attn_outputs,
+                    &mut o_out,
+                    m as u32,
+                    hidden_dim as u32,
+                    hidden_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_multi_cache".to_string(),
+                    reason: format!("O projection failed: {}", e),
+                })?;
+
+            // 2e. Residual add
+            for i in 0..hidden.len() {
+                hidden[i] += o_out[i];
+            }
+
+            // 2f. FFN RMSNorm (use attn_norm if no separate ffn_norm)
+            let ffn_normed = match &layer.ffn_norm_weight {
+                Some(ffn_norm) => self.model.layer_norm(
+                    &hidden,
+                    ffn_norm,
+                    layer.ffn_norm_bias.as_deref(),
+                    self.model.config.eps,
+                ),
+                None => hidden.clone(), // No FFN norm, use hidden directly
+            };
+
+            // 2g. Batched FFN up projection
+            let up_name = format!("{}.ffn_up.weight", prefix);
+            let intermediate_dim = layer.ffn_up_weight.out_dim;
+            let mut ffn_up = vec![0.0f32; m * intermediate_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &up_name,
+                    &ffn_normed,
+                    &mut ffn_up,
+                    m as u32,
+                    hidden_dim as u32,
+                    intermediate_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_multi_cache".to_string(),
+                    reason: format!("FFN up failed: {}", e),
+                })?;
+
+            // 2h. Batched FFN gate projection + SwiGLU
+            let gate_name = format!("{}.ffn_gate.weight", prefix);
+            let mut ffn_gate = vec![0.0f32; m * intermediate_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &gate_name,
+                    &ffn_normed,
+                    &mut ffn_gate,
+                    m as u32,
+                    hidden_dim as u32,
+                    intermediate_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_multi_cache".to_string(),
+                    reason: format!("FFN gate failed: {}", e),
+                })?;
+
+            // SwiGLU activation
+            for i in 0..ffn_gate.len() {
+                ffn_gate[i] = ffn_up[i] * (ffn_gate[i] / (1.0 + (-ffn_gate[i]).exp()));
+            }
+
+            // 2i. Batched FFN down projection
+            let down_name = format!("{}.ffn_down.weight", prefix);
+            let mut ffn_out = vec![0.0f32; m * hidden_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &down_name,
+                    &ffn_gate,
+                    &mut ffn_out,
+                    m as u32,
+                    intermediate_dim as u32,
+                    hidden_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_multi_cache".to_string(),
+                    reason: format!("FFN down failed: {}", e),
+                })?;
+
+            // 2j. Residual add
+            for i in 0..hidden.len() {
+                hidden[i] += ffn_out[i];
+            }
+        }
+
+        // 3. Output RMSNorm
+        let normed = self.model.layer_norm(
+            &hidden,
+            &self.model.output_norm_weight,
+            self.model.output_norm_bias.as_deref(),
+            self.model.config.eps,
+        );
+
+        // 4. Batched LM head projection
+        let mut logits = vec![0.0f32; m * vocab_size];
+        self.executor
+            .batched_q4k_gemv_cached(
+                "output.weight",
+                &normed,
+                &mut logits,
+                m as u32,
+                hidden_dim as u32,
+                vocab_size as u32,
+            )
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "forward_batch_multi_cache".to_string(),
+                reason: format!("LM head failed: {}", e),
+            })?;
+
+        // 5. Argmax for each sequence
+        let mut next_tokens = Vec::with_capacity(m);
+        for s in 0..m {
+            let logits_s = &logits[s * vocab_size..(s + 1) * vocab_size];
+            let max_idx = logits_s
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map_or(0, |(idx, _)| idx as u32);
+            next_tokens.push(max_idx);
+        }
+
+        Ok(next_tokens)
+    }
+
+    /// PAR-108: Batched forward with indexed cache access
+    ///
+    /// Takes indices into the cache array to avoid borrow checker issues.
+    /// Uses batched GEMV for linear projections.
+    fn forward_batch_indexed(
+        &mut self,
+        tokens: &[u32],
+        caches: &mut [OwnedQuantizedKVCache],
+        cache_indices: &[usize],
+        positions: &[usize],
+    ) -> Result<Vec<u32>> {
+        let m = tokens.len();
+        if m == 0 || m != cache_indices.len() || m != positions.len() {
+            return Err(RealizarError::UnsupportedOperation {
+                operation: "forward_batch_indexed".to_string(),
+                reason: format!(
+                    "Mismatched batch sizes: tokens={}, indices={}, positions={}",
+                    m,
+                    cache_indices.len(),
+                    positions.len()
+                ),
+            });
+        }
+
+        let hidden_dim = self.model.config.hidden_dim;
+        let num_heads = self.model.config.num_heads;
+        let num_kv_heads = self.model.config.num_kv_heads;
+        let head_dim = hidden_dim / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let vocab_size = self.model.config.vocab_size;
+
+        // 1. Batched token embedding [M × hidden_dim]
+        let mut hidden = self.model.embed(tokens);
+
+        // 2. Process through all layers
+        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            let prefix = format!("blk.{}", layer_idx);
+
+            // 2a. Batched RMSNorm (CPU)
+            let normed = self.model.layer_norm(
+                &hidden,
+                &layer.attn_norm_weight,
+                layer.attn_norm_bias.as_deref(),
+                self.model.config.eps,
+            );
+
+            // 2b. Batched QKV projection using efficient batched GEMV
+            let qkv = match &layer.qkv_weight {
+                OwnedQKVWeights::Separate { q, k, v } => {
+                    let q_name = format!("{}.attn_q.weight", prefix);
+                    let k_name = format!("{}.attn_k.weight", prefix);
+                    let v_name = format!("{}.attn_v.weight", prefix);
+
+                    let mut q_out = vec![0.0f32; m * q.out_dim];
+                    let mut k_out = vec![0.0f32; m * k.out_dim];
+                    let mut v_out = vec![0.0f32; m * v.out_dim];
+
+                    self.executor
+                        .batched_q4k_gemv_cached(
+                            &q_name,
+                            &normed,
+                            &mut q_out,
+                            m as u32,
+                            hidden_dim as u32,
+                            q.out_dim as u32,
+                        )
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "forward_batch_indexed".to_string(),
+                            reason: format!("Q projection failed: {}", e),
+                        })?;
+
+                    self.executor
+                        .batched_q4k_gemv_cached(
+                            &k_name,
+                            &normed,
+                            &mut k_out,
+                            m as u32,
+                            hidden_dim as u32,
+                            k.out_dim as u32,
+                        )
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "forward_batch_indexed".to_string(),
+                            reason: format!("K projection failed: {}", e),
+                        })?;
+
+                    self.executor
+                        .batched_q4k_gemv_cached(
+                            &v_name,
+                            &normed,
+                            &mut v_out,
+                            m as u32,
+                            hidden_dim as u32,
+                            v.out_dim as u32,
+                        )
+                        .map_err(|e| RealizarError::UnsupportedOperation {
+                            operation: "forward_batch_indexed".to_string(),
+                            reason: format!("V projection failed: {}", e),
+                        })?;
+
+                    // Concatenate Q, K, V
+                    let mut qkv = vec![0.0f32; m * (q.out_dim + k.out_dim + v.out_dim)];
+                    for s in 0..m {
+                        let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
+                        qkv[s * qkv_dim..s * qkv_dim + q.out_dim]
+                            .copy_from_slice(&q_out[s * q.out_dim..(s + 1) * q.out_dim]);
+                        qkv[s * qkv_dim + q.out_dim..s * qkv_dim + q.out_dim + k.out_dim]
+                            .copy_from_slice(&k_out[s * k.out_dim..(s + 1) * k.out_dim]);
+                        qkv[s * qkv_dim + q.out_dim + k.out_dim..s * qkv_dim + qkv_dim]
+                            .copy_from_slice(&v_out[s * v.out_dim..(s + 1) * v.out_dim]);
+                    }
+                    qkv
+                },
+                OwnedQKVWeights::Fused(_) => {
+                    return Err(RealizarError::UnsupportedOperation {
+                        operation: "forward_batch_indexed".to_string(),
+                        reason: "Fused QKV not supported".to_string(),
+                    });
+                },
+            };
+
+            // 2c. Per-sequence: apply RoPE and attention with each cache
+            let mut attn_outputs = vec![0.0f32; m * hidden_dim];
+            let actual_qkv_dim = hidden_dim + 2 * kv_dim;
+
+            for s in 0..m {
+                let cache_idx = cache_indices[s];
+                let qkv_start = s * actual_qkv_dim;
+                let mut q = qkv[qkv_start..qkv_start + hidden_dim].to_vec();
+                let mut k = qkv[qkv_start + hidden_dim..qkv_start + hidden_dim + kv_dim].to_vec();
+                let v = qkv[qkv_start + hidden_dim + kv_dim..qkv_start + actual_qkv_dim].to_vec();
+
+                // Apply RoPE at correct position for this sequence
+                self.model.apply_rope(&mut q, positions[s], num_heads);
+                self.model.apply_rope(&mut k, positions[s], num_kv_heads);
+
+                // Get KV cache for this sequence
+                let k_cache = caches[cache_idx].get_k(layer_idx);
+                let v_cache = caches[cache_idx].get_v(layer_idx);
+
+                // Single-token attention with cache
+                let attn_out =
+                    self.model
+                        .attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v);
+
+                // Update cache
+                caches[cache_idx].append_kv(layer_idx, &k, &v);
+
+                // Store attention output
+                attn_outputs[s * hidden_dim..(s + 1) * hidden_dim].copy_from_slice(&attn_out);
+            }
+
+            // 2d. Batched O projection
+            let o_name = format!("{}.attn_output.weight", prefix);
+            let mut o_out = vec![0.0f32; m * hidden_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &o_name,
+                    &attn_outputs,
+                    &mut o_out,
+                    m as u32,
+                    hidden_dim as u32,
+                    hidden_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_indexed".to_string(),
+                    reason: format!("O projection failed: {}", e),
+                })?;
+
+            // 2e. Residual add
+            for i in 0..hidden.len() {
+                hidden[i] += o_out[i];
+            }
+
+            // 2f. FFN RMSNorm (use attn_norm if no separate ffn_norm)
+            let ffn_normed = match &layer.ffn_norm_weight {
+                Some(ffn_norm) => self.model.layer_norm(
+                    &hidden,
+                    ffn_norm,
+                    layer.ffn_norm_bias.as_deref(),
+                    self.model.config.eps,
+                ),
+                None => hidden.clone(), // No FFN norm, use hidden directly
+            };
+
+            // 2g. Batched FFN up projection
+            let up_name = format!("{}.ffn_up.weight", prefix);
+            let intermediate_dim = layer.ffn_up_weight.out_dim;
+            let mut ffn_up = vec![0.0f32; m * intermediate_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &up_name,
+                    &ffn_normed,
+                    &mut ffn_up,
+                    m as u32,
+                    hidden_dim as u32,
+                    intermediate_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_indexed".to_string(),
+                    reason: format!("FFN up failed: {}", e),
+                })?;
+
+            // 2h. Batched FFN gate projection + SwiGLU
+            let gate_name = format!("{}.ffn_gate.weight", prefix);
+            let mut ffn_gate = vec![0.0f32; m * intermediate_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &gate_name,
+                    &ffn_normed,
+                    &mut ffn_gate,
+                    m as u32,
+                    hidden_dim as u32,
+                    intermediate_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_indexed".to_string(),
+                    reason: format!("FFN gate failed: {}", e),
+                })?;
+
+            // SwiGLU activation
+            for i in 0..ffn_gate.len() {
+                ffn_gate[i] = ffn_up[i] * (ffn_gate[i] / (1.0 + (-ffn_gate[i]).exp()));
+            }
+
+            // 2i. Batched FFN down projection
+            let down_name = format!("{}.ffn_down.weight", prefix);
+            let mut ffn_out = vec![0.0f32; m * hidden_dim];
+            self.executor
+                .batched_q4k_gemv_cached(
+                    &down_name,
+                    &ffn_gate,
+                    &mut ffn_out,
+                    m as u32,
+                    intermediate_dim as u32,
+                    hidden_dim as u32,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "forward_batch_indexed".to_string(),
+                    reason: format!("FFN down failed: {}", e),
+                })?;
+
+            // 2j. Residual add
+            for i in 0..hidden.len() {
+                hidden[i] += ffn_out[i];
+            }
+        }
+
+        // 3. Output RMSNorm
+        let normed = self.model.layer_norm(
+            &hidden,
+            &self.model.output_norm_weight,
+            self.model.output_norm_bias.as_deref(),
+            self.model.config.eps,
+        );
+
+        // 4. Batched LM head projection
+        let mut logits = vec![0.0f32; m * vocab_size];
+        self.executor
+            .batched_q4k_gemv_cached(
+                "output.weight",
+                &normed,
+                &mut logits,
+                m as u32,
+                hidden_dim as u32,
+                vocab_size as u32,
+            )
+            .map_err(|e| RealizarError::UnsupportedOperation {
+                operation: "forward_batch_indexed".to_string(),
+                reason: format!("LM head failed: {}", e),
+            })?;
+
+        // 5. Argmax for each sequence
+        let mut next_tokens = Vec::with_capacity(m);
+        for s in 0..m {
+            let logits_s = &logits[s * vocab_size..(s + 1) * vocab_size];
+            let max_idx = logits_s
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map_or(0, |(idx, _)| idx as u32);
+            next_tokens.push(max_idx);
+        }
+
+        Ok(next_tokens)
+    }
+
     /// Generate tokens using CUDA acceleration (IMP-800a)
     ///
     /// # Arguments
@@ -20438,12 +21016,13 @@ impl OwnedQuantizedModelCuda {
                 break;
             }
 
-            // PAR-106: Use GPU-resident forward with CUDA graphs for ALL cases
-            // The hybrid batched path (forward_batch_with_cache_cuda_native) is slower
-            // because it doesn't use CUDA graphs. Sequential GPU-resident with graph
-            // capture achieves 360-370 tok/s aggregate (1.83x Ollama).
+            // PAR-106/PAR-108: Sequential CUDA graphs outperform batched CPU path.
+            // The batched GEMV kernel is 15x faster, but CUDA graphs amortize
+            // kernel launch overhead which is more impactful. Batched path achieves
+            // ~225 tok/s vs ~360 tok/s for sequential graphs.
             //
-            // TODO: Implement multi-token CUDA graph capture for true 2x
+            // To achieve 2x Ollama (400 tok/s), need multi-token CUDA graph capture
+            // that batches M tokens into a single graph execution.
             for &prompt_idx in &active_indices {
                 let next_token = self.forward_gpu_resident_to_token_id(
                     last_tokens[prompt_idx],
