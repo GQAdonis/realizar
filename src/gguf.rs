@@ -20029,24 +20029,31 @@ impl OwnedQuantizedModelCuda {
 
         // PAR-043: Build indexed weight lookup table for O(1) access during decode
         // This eliminates ~10ms constant CPU overhead per token from string formatting + HashMap lookups
-        self.executor
-            .build_indexed_weights(num_layers, |i| format!("blk.{}", i))
-            .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "preload_weights_gpu".to_string(),
-                reason: format!("PAR-043: Failed to build indexed weights: {}", e),
-            })?;
+        // PAR-107: Skip if already indexed to preserve CUDA graph (graph captures buffer addresses)
+        if !self.executor.has_indexed_weights() {
+            self.executor
+                .build_indexed_weights(num_layers, |i| format!("blk.{}", i))
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "preload_weights_gpu".to_string(),
+                    reason: format!("PAR-043: Failed to build indexed weights: {}", e),
+                })?;
+        }
 
         // PAR-044: Initialize workspace buffers for zero-allocation forward pass
         // This eliminates ~288 buffer allocations per token
-        self.executor
-            .init_workspace(
-                self.model.config.hidden_dim,
-                self.model.config.intermediate_dim,
-            )
-            .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "preload_weights_gpu".to_string(),
-                reason: format!("PAR-044: Failed to initialize workspace: {}", e),
-            })?;
+        // PAR-107: Skip if already initialized to preserve CUDA graph (graph captures buffer addresses)
+        // ROOT CAUSE FIX: Reallocating workspace invalidates graph since addresses change
+        if !self.executor.has_workspace() {
+            self.executor
+                .init_workspace(
+                    self.model.config.hidden_dim,
+                    self.model.config.intermediate_dim,
+                )
+                .map_err(|e| RealizarError::UnsupportedOperation {
+                    operation: "preload_weights_gpu".to_string(),
+                    reason: format!("PAR-044: Failed to initialize workspace: {}", e),
+                })?;
+        }
 
         Ok(total_bytes)
     }
