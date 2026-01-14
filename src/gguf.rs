@@ -4414,6 +4414,8 @@ impl<'a> QuantizedGGUFTransformer<'a> {
 /// Buffer layout optimized for sequential access pattern:
 /// - First use: hidden → normed → qkv → q/k/v → attn_out
 /// - FFN pass: normed → ffn_up/ffn_gate → ffn_down → hidden
+///
+/// PAR-126: Added Q8K scratch buffers for VNNI-accelerated Q4K×Q8K matmul path.
 #[derive(Debug)]
 pub struct InferenceScratchBuffer {
     /// Hidden state buffer [hidden_dim]
@@ -4440,6 +4442,15 @@ pub struct InferenceScratchBuffer {
     pub ffn_down: Vec<f32>,
     /// Output logits [vocab_size]
     pub logits: Vec<f32>,
+    // PAR-126: Q8K scratch buffers for VNNI-accelerated matmul
+    /// Q8K scales for hidden-dim activations [hidden_dim/256]
+    pub q8k_hidden_scales: Vec<f32>,
+    /// Q8K quants for hidden-dim activations [hidden_dim]
+    pub q8k_hidden_quants: Vec<i8>,
+    /// Q8K scales for intermediate-dim activations [intermediate_dim/256]
+    pub q8k_inter_scales: Vec<f32>,
+    /// Q8K quants for intermediate-dim activations [intermediate_dim]
+    pub q8k_inter_quants: Vec<i8>,
 }
 
 impl InferenceScratchBuffer {
@@ -4454,6 +4465,11 @@ impl InferenceScratchBuffer {
         let vocab_size = config.vocab_size;
         let qkv_dim = hidden_dim * 3; // Max for fused QKV
 
+        // PAR-126: Q8K uses 256-element super-blocks for VNNI path
+        const QK_K: usize = 256;
+        let q8k_hidden_padded = hidden_dim.div_ceil(QK_K) * QK_K;
+        let q8k_inter_padded = intermediate_dim.div_ceil(QK_K) * QK_K;
+
         Self {
             hidden: vec![0.0; hidden_dim],
             normed: vec![0.0; hidden_dim],
@@ -4467,6 +4483,11 @@ impl InferenceScratchBuffer {
             ffn_gate: vec![0.0; intermediate_dim],
             ffn_down: vec![0.0; hidden_dim],
             logits: vec![0.0; vocab_size],
+            // PAR-126: Q8K scratch for VNNI-accelerated matmul
+            q8k_hidden_scales: vec![0.0f32; q8k_hidden_padded / QK_K],
+            q8k_hidden_quants: vec![0i8; q8k_hidden_padded],
+            q8k_inter_scales: vec![0.0f32; q8k_inter_padded / QK_K],
+            q8k_inter_quants: vec![0i8; q8k_inter_padded],
         }
     }
 
@@ -10314,6 +10335,77 @@ impl OwnedQuantizedModel {
         }
     }
 
+    /// PAR-126: Q8K-accelerated fused matmul using VNNI instructions
+    ///
+    /// This variant quantizes f32 activations to Q8K format and uses the
+    /// AVX-512 VNNI path which is ~30% faster than AVX2 for Q4K weights.
+    ///
+    /// # Arguments
+    /// * `input` - f32 activations [in_dim]
+    /// * `weight` - Q4K quantized weight tensor
+    /// * `output` - Pre-allocated output buffer [out_dim]
+    /// * `q8k_scales` - Pre-allocated Q8K scales scratch [in_dim/256]
+    /// * `q8k_quants` - Pre-allocated Q8K quants scratch [in_dim padded to 256]
+    fn fused_matmul_q8k_into(
+        &self,
+        input: &[f32],
+        weight: &OwnedQuantizedTensor,
+        output: &mut [f32],
+        q8k_scales: &mut [f32],
+        q8k_quants: &mut [i8],
+    ) -> Result<()> {
+        use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+
+        let in_dim = weight.in_dim;
+        let out_dim = weight.out_dim;
+        let seq_len = input.len() / in_dim;
+
+        // Only support single-token case for now (most common in generation)
+        if seq_len != 1 {
+            // Fall back to allocating version for batch
+            let result = self.fused_matmul(input, weight)?;
+            output[..result.len()].copy_from_slice(&result);
+            return Ok(());
+        }
+
+        // Only use Q8K path for Q4K weights (has VNNI optimization)
+        if weight.qtype != GGUF_TYPE_Q4_K {
+            return self.fused_matmul_into(input, weight, output);
+        }
+
+        // Pad input if needed for Q8K (256-element super-blocks)
+        let padded_len = in_dim.next_multiple_of(256);
+        let num_sb = padded_len / 256;
+
+        // Ensure scratch buffers are large enough
+        if q8k_scales.len() < num_sb || q8k_quants.len() < padded_len {
+            // Scratch too small, fall back to allocating version
+            return self.fused_matmul_into(input, weight, output);
+        }
+
+        // Quantize activations to Q8K format using scratch buffers
+        if in_dim < padded_len {
+            // Need to pad - copy input and zero-pad
+            q8k_quants[in_dim..padded_len].iter_mut().for_each(|x| *x = 0);
+            // Create temporary padded buffer (small allocation for edge case)
+            let mut padded = vec![0.0f32; padded_len];
+            padded[..in_dim].copy_from_slice(input);
+            quantize_activations_q8k_into(&padded, &mut q8k_scales[..num_sb], &mut q8k_quants[..padded_len])?;
+        } else {
+            quantize_activations_q8k_into(&input[..padded_len], &mut q8k_scales[..num_sb], &mut q8k_quants[..padded_len])?;
+        }
+
+        // Use VNNI-accelerated Q4K×Q8K path
+        fused_q4k_q8k_parallel_matvec_into(
+            &weight.data,
+            &q8k_scales[..num_sb],
+            &q8k_quants[..padded_len],
+            in_dim,
+            out_dim,
+            &mut output[..out_dim],
+        )
+    }
+
     /// QKV projection supporting both fused (phi-2) and separate (llama) formats
     ///
     /// Five Whys Root Cause Fix: This method handles both tensor layouts
@@ -10384,6 +10476,77 @@ impl OwnedQuantizedModel {
                     v,
                     &mut output[q_dim + k_dim..q_dim + k_dim + v_dim],
                 )?;
+
+                Ok(())
+            },
+        }
+    }
+
+    /// PAR-126: Q8K-accelerated QKV matmul using pre-quantized activations
+    ///
+    /// Uses pre-quantized Q8K activations for VNNI-accelerated matmul.
+    /// This avoids re-quantizing for each of Q, K, V when using separate weights.
+    pub fn qkv_matmul_q8k_into(
+        &self,
+        input: &[f32],
+        qkv: &OwnedQKVWeights,
+        output: &mut [f32],
+        q8k_scales: &[f32],
+        q8k_quants: &[i8],
+    ) -> Result<()> {
+        use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
+
+        match qkv {
+            OwnedQKVWeights::Fused(ref weight) => {
+                // Use Q8K path if Q4K weights, otherwise fall back to f32
+                if weight.qtype == GGUF_TYPE_Q4_K {
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &weight.data,
+                        q8k_scales,
+                        q8k_quants,
+                        weight.in_dim,
+                        weight.out_dim,
+                        output,
+                    )
+                } else {
+                    self.fused_matmul_into(input, weight, output)
+                }
+            },
+            OwnedQKVWeights::Separate {
+                ref q,
+                ref k,
+                ref v,
+            } => {
+                let q_dim = q.out_dim;
+                let k_dim = k.out_dim;
+                let v_dim = v.out_dim;
+
+                // Use Q8K path for Q4K weights
+                if q.qtype == GGUF_TYPE_Q4_K {
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &q.data, q8k_scales, q8k_quants, q.in_dim, q_dim, &mut output[..q_dim],
+                    )?;
+                } else {
+                    self.fused_matmul_into(input, q, &mut output[..q_dim])?;
+                }
+
+                if k.qtype == GGUF_TYPE_Q4_K {
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &k.data, q8k_scales, q8k_quants, k.in_dim, k_dim,
+                        &mut output[q_dim..q_dim + k_dim],
+                    )?;
+                } else {
+                    self.fused_matmul_into(input, k, &mut output[q_dim..q_dim + k_dim])?;
+                }
+
+                if v.qtype == GGUF_TYPE_Q4_K {
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &v.data, q8k_scales, q8k_quants, v.in_dim, v_dim,
+                        &mut output[q_dim + k_dim..q_dim + k_dim + v_dim],
+                    )?;
+                } else {
+                    self.fused_matmul_into(input, v, &mut output[q_dim + k_dim..q_dim + k_dim + v_dim])?;
+                }
 
                 Ok(())
             },
@@ -13738,13 +13901,11 @@ impl OwnedQuantizedModel {
         }
 
         // Generate new tokens - zero allocations per token
+        // PAR-126: Fixed loop structure to match generate_with_cache:
+        // 1. Sample from current logits (prefill on first iter, previous forward otherwise)
+        // 2. Then run forward on the new token to get logits for next iteration
         for gen_idx in 0..config.max_tokens {
-            let position = prompt.len() + gen_idx;
-            let last_token = *tokens.last().expect("tokens must be non-empty");
-
-            self.forward_single_with_scratch(last_token, &mut cache, position, &mut scratch)?;
-
-            // Sample next token from pre-allocated logits buffer
+            // Sample next token from current logits (prefill logits on first iter)
             let next_token = if config.temperature == 0.0 || config.top_k == 1 {
                 Self::argmax(&scratch.logits)
             } else {
@@ -13762,6 +13923,10 @@ impl OwnedQuantizedModel {
             if tokens.len() >= max_seq_len {
                 break;
             }
+
+            // Get logits for next iteration by forwarding the new token
+            let position = prompt.len() + gen_idx;
+            self.forward_single_with_scratch(next_token, &mut cache, position, &mut scratch)?;
         }
 
         Ok(tokens)
@@ -13811,23 +13976,44 @@ impl OwnedQuantizedModel {
             }
 
             // 2b. QKV projection → scratch.qkv (zero-allocation via P1-REV)
-            let q_dim = layer.qkv_weight.q_dim();
-            let k_dim = match &layer.qkv_weight {
-                OwnedQKVWeights::Fused(_) => q_dim,
-                OwnedQKVWeights::Separate { k, .. } => k.out_dim,
-            };
-            let v_dim = match &layer.qkv_weight {
-                OwnedQKVWeights::Fused(_) => q_dim,
-                OwnedQKVWeights::Separate { v, .. } => v.out_dim,
-            };
+            // PAR-126: Fix GQA dimension bug - use config instead of q_dim() which
+            // incorrectly assumes Q=K=V for fused weights
+            let num_kv_heads = self.config.num_kv_heads;
+            let head_dim = hidden_dim / self.config.num_heads;
+            let kv_dim = num_kv_heads * head_dim;
+            // Q uses all heads, K/V use only kv_heads (GQA)
+            let q_dim = hidden_dim;
+            let k_dim = kv_dim;
+            let v_dim = kv_dim;
             let qkv_dim = q_dim + k_dim + v_dim;
 
-            // Write directly to scratch.qkv, eliminating Vec allocation
-            self.qkv_matmul_into(
-                &scratch.normed,
-                &layer.qkv_weight,
-                &mut scratch.qkv[..qkv_dim],
-            )?;
+            // PAR-126: Pre-quantize normalized hidden to Q8K for VNNI-accelerated matmul
+            // This allows reusing quantized activations for QKV projection
+            // NOTE: Q8K requires hidden_dim to be multiple of 256. For smaller models
+            // like 0.5B (hidden=896), fall back to f32 path.
+            let use_q8k_path = hidden_dim.is_multiple_of(256);
+
+            if use_q8k_path {
+                use crate::quantize::quantize_activations_q8k_into;
+                let hidden_sb = hidden_dim / 256;
+                quantize_activations_q8k_into(
+                    &scratch.normed[..hidden_dim],
+                    &mut scratch.q8k_hidden_scales[..hidden_sb],
+                    &mut scratch.q8k_hidden_quants[..hidden_dim],
+                )?;
+
+                // Write directly to scratch.qkv, using Q8K-accelerated path
+                self.qkv_matmul_q8k_into(
+                    &scratch.normed,
+                    &layer.qkv_weight,
+                    &mut scratch.qkv[..qkv_dim],
+                    &scratch.q8k_hidden_scales[..hidden_sb],
+                    &scratch.q8k_hidden_quants[..hidden_dim],
+                )?;
+            } else {
+                // Fall back to f32 path for non-256-aligned hidden dims
+                self.qkv_matmul_into(&scratch.normed, &layer.qkv_weight, &mut scratch.qkv[..qkv_dim])?;
+            }
 
             // Copy from scratch.qkv to individual Q, K, V buffers
             scratch.q[..q_dim].copy_from_slice(&scratch.qkv[..q_dim]);
@@ -13926,16 +14112,59 @@ impl OwnedQuantizedModel {
             // 2g. FFN
             if let Some(ref gate_weight) = layer.ffn_gate_weight {
                 // SwiGLU path (LLaMA)
-                self.fused_matmul_into(
-                    &scratch.normed[..hidden_dim],
-                    &layer.ffn_up_weight,
-                    &mut scratch.ffn_up,
-                )?;
-                self.fused_matmul_into(
-                    &scratch.normed[..hidden_dim],
-                    gate_weight,
-                    &mut scratch.ffn_gate,
-                )?;
+                // PAR-126: Use Q8K-accelerated path only if hidden_dim is 256-aligned
+                if use_q8k_path {
+                    // Pre-quantize normed hidden to Q8K for VNNI-accelerated FFN matmul
+                    // Quantize once, reuse for both up and gate matmuls
+                    use crate::quantize::quantize_activations_q8k_into;
+                    let hidden_sb = hidden_dim / 256;
+                    quantize_activations_q8k_into(
+                        &scratch.normed[..hidden_dim],
+                        &mut scratch.q8k_hidden_scales[..hidden_sb],
+                        &mut scratch.q8k_hidden_quants[..hidden_dim],
+                    )?;
+
+                    // Use Q8K-accelerated parallel FFN up/gate computation
+                    let up_weight = &layer.ffn_up_weight;
+                    let q8k_scales = &scratch.q8k_hidden_scales[..hidden_sb];
+                    let q8k_quants = &scratch.q8k_hidden_quants[..hidden_dim];
+
+                    let (up_result, gate_result) = rayon::join(
+                        || {
+                            if up_weight.qtype == GGUF_TYPE_Q4_K {
+                                use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
+                                fused_q4k_q8k_parallel_matvec_into(
+                                    &up_weight.data, q8k_scales, q8k_quants,
+                                    up_weight.in_dim, up_weight.out_dim, &mut scratch.ffn_up,
+                                )
+                            } else {
+                                self.fused_matmul_into(&scratch.normed[..hidden_dim], up_weight, &mut scratch.ffn_up)
+                            }
+                        },
+                        || {
+                            if gate_weight.qtype == GGUF_TYPE_Q4_K {
+                                use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
+                                fused_q4k_q8k_parallel_matvec_into(
+                                    &gate_weight.data, q8k_scales, q8k_quants,
+                                    gate_weight.in_dim, gate_weight.out_dim, &mut scratch.ffn_gate,
+                                )
+                            } else {
+                                self.fused_matmul_into(&scratch.normed[..hidden_dim], gate_weight, &mut scratch.ffn_gate)
+                            }
+                        },
+                    );
+                    up_result?;
+                    gate_result?;
+                } else {
+                    // Fall back to f32 path for non-256-aligned hidden dims
+                    let up_weight = &layer.ffn_up_weight;
+                    let (up_result, gate_result) = rayon::join(
+                        || self.fused_matmul_into(&scratch.normed[..hidden_dim], up_weight, &mut scratch.ffn_up),
+                        || self.fused_matmul_into(&scratch.normed[..hidden_dim], gate_weight, &mut scratch.ffn_gate),
+                    );
+                    up_result?;
+                    gate_result?;
+                }
 
                 if let Some(ref bias) = layer.ffn_up_bias {
                     for i in 0..intermediate_dim {
@@ -21285,6 +21514,10 @@ impl OwnedQuantizedKVCache {
 ///
 /// Eliminates per-token allocations by reusing buffers across forward passes.
 /// For Qwen2.5-0.5B with intermediate_dim=4864, this saves ~40KB per token.
+///
+/// PAR-126: Added Q8K scratch buffers for fused Q4K×Q8K matmul path.
+/// Q8K uses 256-element super-blocks vs Q8_0's 32-element blocks.
+/// This enables VNNI instruction path which is 30% faster than AVX2.
 #[derive(Debug)]
 pub struct OwnedInferenceScratchBuffer {
     /// QKV output buffer [hidden_dim + 2*kv_dim]
@@ -21305,6 +21538,15 @@ pub struct OwnedInferenceScratchBuffer {
     pub q8_scales: Vec<f32>,
     /// Q8 quantization values scratch [num_blocks * 32]
     pub q8_quants: Vec<i8>,
+    // PAR-126: Q8K scratch buffers for VNNI-accelerated matmul
+    /// Q8K scales for hidden-dim activations [hidden_dim/256]
+    pub q8k_hidden_scales: Vec<f32>,
+    /// Q8K quants for hidden-dim activations [hidden_dim]
+    pub q8k_hidden_quants: Vec<i8>,
+    /// Q8K scales for intermediate-dim activations [intermediate_dim/256]
+    pub q8k_inter_scales: Vec<f32>,
+    /// Q8K quants for intermediate-dim activations [intermediate_dim]
+    pub q8k_inter_quants: Vec<i8>,
 }
 
 impl OwnedInferenceScratchBuffer {
@@ -21321,6 +21563,11 @@ impl OwnedInferenceScratchBuffer {
                                                // Q8 quantization uses 32-element blocks
         let num_blocks = hidden_dim.div_ceil(32);
 
+        // PAR-126: Q8K uses 256-element super-blocks for VNNI path
+        const QK_K: usize = 256;
+        let q8k_hidden_padded = hidden_dim.div_ceil(QK_K) * QK_K;
+        let q8k_inter_padded = intermediate_dim.div_ceil(QK_K) * QK_K;
+
         Self {
             qkv: vec![0.0f32; qkv_dim],
             attn_out: vec![0.0f32; hidden_dim],
@@ -21331,6 +21578,11 @@ impl OwnedInferenceScratchBuffer {
             logits: vec![0.0f32; config.vocab_size],
             q8_scales: vec![0.0f32; num_blocks],
             q8_quants: vec![0i8; num_blocks * 32],
+            // PAR-126: Q8K scratch for VNNI-accelerated matmul
+            q8k_hidden_scales: vec![0.0f32; q8k_hidden_padded / QK_K],
+            q8k_hidden_quants: vec![0i8; q8k_hidden_padded],
+            q8k_inter_scales: vec![0.0f32; q8k_inter_padded / QK_K],
+            q8k_inter_quants: vec![0i8; q8k_inter_padded],
         }
     }
 
@@ -21346,6 +21598,11 @@ impl OwnedInferenceScratchBuffer {
         self.logits.clear();
         self.q8_scales.clear();
         self.q8_quants.clear();
+        // PAR-126: Q8K buffers
+        self.q8k_hidden_scales.clear();
+        self.q8k_hidden_quants.clear();
+        self.q8k_inter_scales.clear();
+        self.q8k_inter_quants.clear();
     }
 }
 
