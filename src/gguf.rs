@@ -11097,7 +11097,7 @@ impl OwnedQuantizedModel {
                 let k_dim = k.out_dim;
                 let v_dim = v.out_dim;
 
-                // Use Q8K path for Q4K weights
+                // Use Q8K path for Q4K weights (sequential to avoid overhead)
                 if q.qtype == GGUF_TYPE_Q4_K {
                     fused_q4k_q8k_parallel_matvec_into(
                         &q.data,
@@ -14828,53 +14828,69 @@ impl OwnedQuantizedModel {
                         &mut scratch.q8k_hidden_quants[..hidden_dim],
                     )?;
 
-                    // Use Q8K-accelerated parallel FFN up/gate computation
+                    // Use fused FFN up+gate kernel to eliminate rayon::join overhead
+                    // This reduces parallel region spawns from 2 to 1 per layer
                     let up_weight = &layer.ffn_up_weight;
                     let q8k_scales = &scratch.q8k_hidden_scales[..hidden_sb];
                     let q8k_quants = &scratch.q8k_hidden_quants[..hidden_dim];
 
-                    let (up_result, gate_result) = rayon::join(
-                        || {
-                            if up_weight.qtype == GGUF_TYPE_Q4_K {
-                                use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
-                                fused_q4k_q8k_parallel_matvec_into(
-                                    &up_weight.data,
-                                    q8k_scales,
-                                    q8k_quants,
-                                    up_weight.in_dim,
-                                    up_weight.out_dim,
-                                    &mut scratch.ffn_up,
-                                )
-                            } else {
-                                self.fused_matmul_into(
-                                    &scratch.normed[..hidden_dim],
-                                    up_weight,
-                                    &mut scratch.ffn_up,
-                                )
-                            }
-                        },
-                        || {
-                            if gate_weight.qtype == GGUF_TYPE_Q4_K {
-                                use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
-                                fused_q4k_q8k_parallel_matvec_into(
-                                    &gate_weight.data,
-                                    q8k_scales,
-                                    q8k_quants,
-                                    gate_weight.in_dim,
-                                    gate_weight.out_dim,
-                                    &mut scratch.ffn_gate,
-                                )
-                            } else {
-                                self.fused_matmul_into(
-                                    &scratch.normed[..hidden_dim],
-                                    gate_weight,
-                                    &mut scratch.ffn_gate,
-                                )
-                            }
-                        },
-                    );
-                    up_result?;
-                    gate_result?;
+                    // Check if both weights are Q4K for fused path
+                    if up_weight.qtype == GGUF_TYPE_Q4_K && gate_weight.qtype == GGUF_TYPE_Q4_K {
+                        use crate::quantize::fused_q4k_q8k_ffn_up_gate_into;
+                        fused_q4k_q8k_ffn_up_gate_into(
+                            &up_weight.data,
+                            &gate_weight.data,
+                            q8k_scales,
+                            q8k_quants,
+                            up_weight.in_dim,
+                            up_weight.out_dim,
+                            &mut scratch.ffn_up,
+                            &mut scratch.ffn_gate,
+                        )?;
+                    } else {
+                        // Fallback to separate matmuls if not both Q4K
+                        use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
+                        let (up_result, gate_result) = rayon::join(
+                            || {
+                                if up_weight.qtype == GGUF_TYPE_Q4_K {
+                                    fused_q4k_q8k_parallel_matvec_into(
+                                        &up_weight.data,
+                                        q8k_scales,
+                                        q8k_quants,
+                                        up_weight.in_dim,
+                                        up_weight.out_dim,
+                                        &mut scratch.ffn_up,
+                                    )
+                                } else {
+                                    self.fused_matmul_into(
+                                        &scratch.normed[..hidden_dim],
+                                        up_weight,
+                                        &mut scratch.ffn_up,
+                                    )
+                                }
+                            },
+                            || {
+                                if gate_weight.qtype == GGUF_TYPE_Q4_K {
+                                    fused_q4k_q8k_parallel_matvec_into(
+                                        &gate_weight.data,
+                                        q8k_scales,
+                                        q8k_quants,
+                                        gate_weight.in_dim,
+                                        gate_weight.out_dim,
+                                        &mut scratch.ffn_gate,
+                                    )
+                                } else {
+                                    self.fused_matmul_into(
+                                        &scratch.normed[..hidden_dim],
+                                        gate_weight,
+                                        &mut scratch.ffn_gate,
+                                    )
+                                }
+                            },
+                        );
+                        up_result?;
+                        gate_result?;
+                    }
                 } else {
                     // Fall back to f32 path for non-256-aligned hidden dims
                     let up_weight = &layer.ffn_up_weight;
