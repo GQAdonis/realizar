@@ -10918,7 +10918,8 @@ impl OwnedQuantizedModel {
             return Ok(());
         }
 
-        // Only use Q8K path for Q4K weights (has VNNI optimization)
+        // Only use Q8K path for Q4_K weights (has VNNI optimization)
+        // Q6_K uses f32 path since Q8K conversion overhead > memory bandwidth savings
         if weight.qtype != GGUF_TYPE_Q4_K {
             return self.fused_matmul_into(input, weight, output);
         }
@@ -14667,6 +14668,7 @@ impl OwnedQuantizedModel {
             // like 0.5B (hidden=896), fall back to f32 path.
             let use_q8k_path = hidden_dim.is_multiple_of(256);
 
+
             if use_q8k_path {
                 use crate::quantize::quantize_activations_q8k_into;
                 let hidden_sb = hidden_dim / 256;
@@ -14749,11 +14751,35 @@ impl OwnedQuantizedModel {
             cache.append(layer_idx, &scratch.k[..k_dim], &scratch.v[..v_dim]);
 
             // 2d. Attention output projection → scratch.attn_proj
-            self.fused_matmul_into(
-                &scratch.attn_out[..hidden_dim],
-                &layer.attn_output_weight,
-                &mut scratch.attn_proj,
-            )?;
+            // PAR-128: Use Q8K-accelerated path for attention output projection
+            // attn_out is hidden_dim sized, reuse hidden Q8K buffers
+            let use_q8k_attn_out = use_q8k_path
+                && layer.attn_output_weight.qtype == GGUF_TYPE_Q4_K;
+
+            if use_q8k_attn_out {
+                use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+                let hidden_sb = hidden_dim / 256;
+                // Quantize attention output to Q8K (reuse hidden Q8K buffers)
+                quantize_activations_q8k_into(
+                    &scratch.attn_out[..hidden_dim],
+                    &mut scratch.q8k_hidden_scales[..hidden_sb],
+                    &mut scratch.q8k_hidden_quants[..hidden_dim],
+                )?;
+                fused_q4k_q8k_parallel_matvec_into(
+                    &layer.attn_output_weight.data,
+                    &scratch.q8k_hidden_scales[..hidden_sb],
+                    &scratch.q8k_hidden_quants[..hidden_dim],
+                    layer.attn_output_weight.in_dim,
+                    layer.attn_output_weight.out_dim,
+                    &mut scratch.attn_proj,
+                )?;
+            } else {
+                self.fused_matmul_into(
+                    &scratch.attn_out[..hidden_dim],
+                    &layer.attn_output_weight,
+                    &mut scratch.attn_proj,
+                )?;
+            }
             if let Some(ref bias) = layer.attn_output_bias {
                 for i in 0..hidden_dim {
                     scratch.attn_proj[i] += bias[i];
@@ -14889,11 +14915,34 @@ impl OwnedQuantizedModel {
                     scratch.ffn_gate[i] *= scratch.ffn_up[i];
                 }
 
-                self.fused_matmul_into(
-                    &scratch.ffn_gate[..intermediate_dim],
-                    &layer.ffn_down_weight,
-                    &mut scratch.ffn_down,
-                )?;
+                // PAR-127: Use Q8K-accelerated FFN down projection for Q4K weights
+                // Q6K uses f32 path since Q8K conversion overhead > bandwidth savings
+                let use_q8k_down = intermediate_dim.is_multiple_of(256)
+                    && layer.ffn_down_weight.qtype == GGUF_TYPE_Q4_K;
+
+                if use_q8k_down {
+                    use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+                    let inter_sb = intermediate_dim / 256;
+                    quantize_activations_q8k_into(
+                        &scratch.ffn_gate[..intermediate_dim],
+                        &mut scratch.q8k_inter_scales[..inter_sb],
+                        &mut scratch.q8k_inter_quants[..intermediate_dim],
+                    )?;
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &layer.ffn_down_weight.data,
+                        &scratch.q8k_inter_scales[..inter_sb],
+                        &scratch.q8k_inter_quants[..intermediate_dim],
+                        layer.ffn_down_weight.in_dim,
+                        layer.ffn_down_weight.out_dim,
+                        &mut scratch.ffn_down,
+                    )?;
+                } else {
+                    self.fused_matmul_into(
+                        &scratch.ffn_gate[..intermediate_dim],
+                        &layer.ffn_down_weight,
+                        &mut scratch.ffn_down,
+                    )?;
+                }
                 if let Some(ref bias) = layer.ffn_down_bias {
                     for i in 0..hidden_dim {
                         scratch.ffn_down[i] += bias[i];
@@ -14901,11 +14950,31 @@ impl OwnedQuantizedModel {
                 }
             } else {
                 // GELU path (phi-2)
-                self.fused_matmul_into(
-                    &scratch.normed[..hidden_dim],
-                    &layer.ffn_up_weight,
-                    &mut scratch.ffn_up,
-                )?;
+                // PAR-129: Use Q8K-accelerated FFN for GELU models (Q4K only)
+                let use_q8k_gelu_up = use_q8k_path
+                    && layer.ffn_up_weight.qtype == GGUF_TYPE_Q4_K;
+                let use_q8k_gelu_down = intermediate_dim.is_multiple_of(256)
+                    && layer.ffn_down_weight.qtype == GGUF_TYPE_Q4_K;
+
+                if use_q8k_gelu_up {
+                    // Reuse already-quantized hidden from QKV (scratch.q8k_hidden_*)
+                    use crate::quantize::fused_q4k_q8k_parallel_matvec_into;
+                    let hidden_sb = hidden_dim / 256;
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &layer.ffn_up_weight.data,
+                        &scratch.q8k_hidden_scales[..hidden_sb],
+                        &scratch.q8k_hidden_quants[..hidden_dim],
+                        layer.ffn_up_weight.in_dim,
+                        layer.ffn_up_weight.out_dim,
+                        &mut scratch.ffn_up,
+                    )?;
+                } else {
+                    self.fused_matmul_into(
+                        &scratch.normed[..hidden_dim],
+                        &layer.ffn_up_weight,
+                        &mut scratch.ffn_up,
+                    )?;
+                }
                 if let Some(ref bias) = layer.ffn_up_bias {
                     for i in 0..intermediate_dim {
                         scratch.ffn_up[i] += bias[i];
@@ -14913,11 +14982,29 @@ impl OwnedQuantizedModel {
                 }
                 self.gelu(&mut scratch.ffn_up[..intermediate_dim]);
 
-                self.fused_matmul_into(
-                    &scratch.ffn_up[..intermediate_dim],
-                    &layer.ffn_down_weight,
-                    &mut scratch.ffn_down,
-                )?;
+                if use_q8k_gelu_down {
+                    use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+                    let inter_sb = intermediate_dim / 256;
+                    quantize_activations_q8k_into(
+                        &scratch.ffn_up[..intermediate_dim],
+                        &mut scratch.q8k_inter_scales[..inter_sb],
+                        &mut scratch.q8k_inter_quants[..intermediate_dim],
+                    )?;
+                    fused_q4k_q8k_parallel_matvec_into(
+                        &layer.ffn_down_weight.data,
+                        &scratch.q8k_inter_scales[..inter_sb],
+                        &scratch.q8k_inter_quants[..intermediate_dim],
+                        layer.ffn_down_weight.in_dim,
+                        layer.ffn_down_weight.out_dim,
+                        &mut scratch.ffn_down,
+                    )?;
+                } else {
+                    self.fused_matmul_into(
+                        &scratch.ffn_up[..intermediate_dim],
+                        &layer.ffn_down_weight,
+                        &mut scratch.ffn_down,
+                    )?;
+                }
                 if let Some(ref bias) = layer.ffn_down_bias {
                     for i in 0..hidden_dim {
                         scratch.ffn_down[i] += bias[i];
