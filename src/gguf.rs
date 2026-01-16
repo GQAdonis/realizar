@@ -14665,7 +14665,7 @@ impl OwnedQuantizedModel {
         // Process prompt tokens (prefill), keeping the logits from the last position
         let mut logits = Vec::new();
         for (pos, &token_id) in prompt.iter().enumerate() {
-            tracer.start_step(TraceStep::Transformer);
+            tracer.start_step(TraceStep::TransformerBlock);
             logits = self.forward_single_with_cache(token_id, &mut cache, pos)?;
 
             // Only trace last layer for prefill to avoid noise
@@ -14721,7 +14721,7 @@ impl OwnedQuantizedModel {
             }
 
             // Forward pass for next token
-            tracer.start_step(TraceStep::Transformer);
+            tracer.start_step(TraceStep::TransformerBlock);
             let position = prompt.len() + gen_idx;
             logits = self.forward_single_with_cache(next_token, &mut cache, position)?;
             tracer.trace_layer(
@@ -22405,7 +22405,7 @@ impl OwnedQuantizedModelCuda {
         // Process prompt tokens (prefill) with tracing
         for (pos, &token_id) in prompt.iter().enumerate() {
             if pos < prompt.len() - 1 {
-                tracer.start_step(TraceStep::Transformer);
+                tracer.start_step(TraceStep::TransformerBlock);
                 let _ = self.forward_gpu_resident(token_id, &mut cache, pos)?;
                 // Trace last layer for prefill
                 if pos == prompt.len() - 2 {
@@ -22427,7 +22427,7 @@ impl OwnedQuantizedModelCuda {
 
         for gen_idx in 0..config.max_tokens {
             // Trace TRANSFORMER step
-            tracer.start_step(TraceStep::Transformer);
+            tracer.start_step(TraceStep::TransformerBlock);
 
             // GPU generation with argmax or full logits
             let next_token = if config.temperature == 0.0 || config.top_k == 1 {
