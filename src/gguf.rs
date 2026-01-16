@@ -53530,4 +53530,638 @@ mod tests {
         }
         assert_eq!(buf.len(), HIDDEN_BUFFER_INLINE_CAP);
     }
+
+    // =========================================================================
+    // Coverage Tests: GGUFConfig Debug/Clone
+    // =========================================================================
+
+    #[test]
+    fn test_gguf_config_debug_cov() {
+        let config = GGUFConfig {
+            architecture: "llama".to_string(),
+            vocab_size: 32000,
+            hidden_dim: 2048,
+            num_heads: 32,
+            num_kv_heads: 8,
+            num_layers: 24,
+            intermediate_dim: 5504,
+            context_length: 4096,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("GGUFConfig"));
+        assert!(debug.contains("vocab_size"));
+    }
+
+    #[test]
+    fn test_gguf_config_clone_cov() {
+        let config = GGUFConfig {
+            architecture: "llama".to_string(),
+            vocab_size: 32000,
+            hidden_dim: 2048,
+            num_heads: 32,
+            num_kv_heads: 8,
+            num_layers: 24,
+            intermediate_dim: 5504,
+            context_length: 4096,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let cloned = config.clone();
+        assert_eq!(config.vocab_size, cloned.vocab_size);
+        assert_eq!(config.hidden_dim, cloned.hidden_dim);
+    }
+
+    // =========================================================================
+    // Coverage Tests: InferenceScratchBuffer
+    // =========================================================================
+
+    #[test]
+    fn test_inference_scratch_buffer_from_config_cov() {
+        let config = GGUFConfig {
+            architecture: "llama".to_string(),
+            vocab_size: 32000,
+            hidden_dim: 2048,
+            num_heads: 32,
+            num_kv_heads: 8,
+            num_layers: 24,
+            intermediate_dim: 5504,
+            context_length: 4096,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let buf = InferenceScratchBuffer::from_config(&config);
+        assert_eq!(buf.hidden.len(), config.hidden_dim);
+    }
+
+    #[test]
+    fn test_inference_scratch_buffer_reset_cov() {
+        let config = GGUFConfig {
+            architecture: "phi".to_string(),
+            vocab_size: 1000,
+            hidden_dim: 64,
+            num_heads: 4,
+            num_kv_heads: 4,
+            num_layers: 2,
+            intermediate_dim: 128,
+            context_length: 512,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let mut buf = InferenceScratchBuffer::from_config(&config);
+        // Modify buffer
+        if !buf.hidden.is_empty() {
+            buf.hidden[0] = 99.0;
+        }
+        buf.reset();
+        // After reset, values should be zeroed
+        assert!(buf.hidden.iter().all(|&x| x == 0.0));
+    }
+
+    // =========================================================================
+    // Coverage Tests: GPU Feature-Gated Types
+    // =========================================================================
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_batch_generation_stats_debug_cov() {
+        let stats = BatchGenerationStats {
+            gpu_cache_ready: true,
+            cache_memory_gb: 4.5,
+            num_layers: 32,
+            hidden_dim: 4096,
+            intermediate_dim: 11008,
+            recommended_batch_size: 8,
+            max_batch_size: 32,
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("BatchGenerationStats"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_batch_generation_stats_clone_cov() {
+        let stats = BatchGenerationStats {
+            gpu_cache_ready: true,
+            cache_memory_gb: 4.5,
+            num_layers: 32,
+            hidden_dim: 4096,
+            intermediate_dim: 11008,
+            recommended_batch_size: 8,
+            max_batch_size: 32,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats.gpu_cache_ready, cloned.gpu_cache_ready);
+        assert_eq!(stats.cache_memory_gb, cloned.cache_memory_gb);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_batching_config_debug_cov() {
+        let config = BatchingConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("BatchingConfig"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_batching_config_clone_cov() {
+        let config = BatchingConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.batch_threshold, cloned.batch_threshold);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_batching_config_latency_cov() {
+        let config = BatchingConfig::latency_optimized();
+        assert!(config.batch_threshold < 32);
+        assert!(!config.prefer_throughput);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_batching_config_throughput_cov() {
+        let config = BatchingConfig::throughput_optimized();
+        assert!(config.batch_threshold >= 32);
+        assert!(config.prefer_throughput);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_slot_state_variants_cov() {
+        // Empty variant
+        let empty = SlotState::Empty;
+        assert!(empty.is_empty());
+        assert!(!empty.is_active());
+        assert!(!empty.is_completed());
+        assert!(empty.request_id().is_none());
+
+        // Active variant
+        let active = SlotState::Active {
+            request_id: 42,
+            prompt_tokens: vec![1, 2, 3],
+            generated_tokens: vec![4, 5],
+            max_tokens: 100,
+            temperature: 0.7,
+            top_k: 50,
+        };
+        assert!(!active.is_empty());
+        assert!(active.is_active());
+        assert!(!active.is_completed());
+        assert_eq!(active.request_id(), Some(42));
+
+        // Completed variant
+        let completed = SlotState::Completed {
+            request_id: 99,
+            generated_tokens: vec![1, 2, 3, 4, 5],
+        };
+        assert!(!completed.is_empty());
+        assert!(!completed.is_active());
+        assert!(completed.is_completed());
+        assert_eq!(completed.request_id(), Some(99));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_speculative_config_debug_cov() {
+        let config = SpeculativeConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("SpeculativeConfig"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_speculative_config_clone_cov() {
+        let config = SpeculativeConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.speculation_length, cloned.speculation_length);
+        assert_eq!(config.draft_temperature, cloned.draft_temperature);
+        assert_eq!(config.self_speculative, cloned.self_speculative);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_verification_result_debug_cov() {
+        let result = VerificationResult {
+            accepted_count: 3,
+            draft_count: 5,
+            accepted_tokens: vec![10, 20, 30],
+            all_accepted: false,
+        };
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("VerificationResult"));
+        assert!(debug.contains("accepted_count"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_verification_result_clone_cov() {
+        let result = VerificationResult {
+            accepted_count: 3,
+            draft_count: 5,
+            accepted_tokens: vec![10, 20, 30],
+            all_accepted: false,
+        };
+        let cloned = result.clone();
+        assert_eq!(result.accepted_count, cloned.accepted_count);
+        assert_eq!(result.draft_count, cloned.draft_count);
+        assert_eq!(result.all_accepted, cloned.all_accepted);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_buffer_pool_stats_debug_cov() {
+        let stats = GpuBufferPoolStats {
+            borrows: 100,
+            returns: 95,
+            post_warmup_allocs: 0,
+            warmed_up: true,
+            hidden_available: 10,
+            intermediate_available: 10,
+            attention_available: 10,
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("GpuBufferPoolStats"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_buffer_pool_stats_clone_cov() {
+        let stats = GpuBufferPoolStats {
+            borrows: 100,
+            returns: 95,
+            post_warmup_allocs: 0,
+            warmed_up: true,
+            hidden_available: 10,
+            intermediate_available: 10,
+            attention_available: 10,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats.borrows, cloned.borrows);
+        assert_eq!(stats.warmed_up, cloned.warmed_up);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_command_slot_state_variants_cov() {
+        let empty = CommandSlotState::Empty;
+        let preparing = CommandSlotState::Preparing;
+        let submitted = CommandSlotState::Submitted;
+        let complete = CommandSlotState::Complete;
+        // Each variant should be distinct
+        assert!(matches!(empty, CommandSlotState::Empty));
+        assert!(matches!(preparing, CommandSlotState::Preparing));
+        assert!(matches!(submitted, CommandSlotState::Submitted));
+        assert!(matches!(complete, CommandSlotState::Complete));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_command_slot_default_cov() {
+        let slot = CommandSlot::default();
+        assert!(matches!(slot.state, CommandSlotState::Empty));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_async_queue_stats_debug_cov() {
+        let stats = AsyncQueueStats {
+            commands_submitted: 1000,
+            commands_completed: 950,
+            pipeline_stalls: 10,
+            in_flight: 40,
+            gpu_utilization_percent: 85.0,
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("AsyncQueueStats"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_async_queue_stats_clone_cov() {
+        let stats = AsyncQueueStats {
+            commands_submitted: 1000,
+            commands_completed: 950,
+            pipeline_stalls: 10,
+            in_flight: 40,
+            gpu_utilization_percent: 85.0,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats.commands_submitted, cloned.commands_submitted);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_prefix_cache_stats_debug_cov() {
+        let stats = PrefixCacheStats {
+            hits: 800,
+            misses: 200,
+            evictions: 50,
+            entries: 100,
+            hit_rate: 0.8,
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("PrefixCacheStats"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_prefix_cache_stats_clone_cov() {
+        let stats = PrefixCacheStats {
+            hits: 800,
+            misses: 200,
+            evictions: 50,
+            entries: 100,
+            hit_rate: 0.8,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats.entries, cloned.entries);
+        assert_eq!(stats.hits, cloned.hits);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_multi_request_state_variants_cov() {
+        let pending = MultiRequestState::Pending;
+        let prefilling = MultiRequestState::Prefilling;
+        let decoding = MultiRequestState::Decoding;
+
+        assert!(matches!(pending, MultiRequestState::Pending));
+        assert!(matches!(prefilling, MultiRequestState::Prefilling));
+        assert!(matches!(decoding, MultiRequestState::Decoding));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_scheduling_policy_variants_cov() {
+        let fcfs = SchedulingPolicy::Fcfs;
+        let sjf = SchedulingPolicy::Sjf;
+        let rr = SchedulingPolicy::RoundRobin;
+
+        assert!(matches!(fcfs, SchedulingPolicy::Fcfs));
+        assert!(matches!(sjf, SchedulingPolicy::Sjf));
+        assert!(matches!(rr, SchedulingPolicy::RoundRobin));
+    }
+
+    // Note: MultiRequestStats doesn't implement Debug/Clone - testing not possible
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_chunked_prefill_config_default_cov() {
+        let config = ChunkedPrefillConfig::default();
+        assert!(config.chunk_size > 0);
+        assert!(config.max_context > 0);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_chunked_prefill_config_with_chunk_size_cov() {
+        let config = ChunkedPrefillConfig::with_chunk_size(256);
+        assert_eq!(config.chunk_size, 256);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_chunk_progress_debug_cov() {
+        let progress = ChunkProgress {
+            chunk_idx: 5,
+            total_chunks: 10,
+            tokens_processed: 500,
+            total_tokens: 1000,
+            chunk_time_ms: 10.5,
+            cumulative_time_ms: 50.0,
+        };
+        let debug = format!("{:?}", progress);
+        assert!(debug.contains("ChunkProgress"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_chunk_progress_clone_cov() {
+        let progress = ChunkProgress {
+            chunk_idx: 5,
+            total_chunks: 10,
+            tokens_processed: 500,
+            total_tokens: 1000,
+            chunk_time_ms: 10.5,
+            cumulative_time_ms: 50.0,
+        };
+        let cloned = progress.clone();
+        assert_eq!(progress.chunk_idx, cloned.chunk_idx);
+        assert_eq!(progress.total_tokens, cloned.total_tokens);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_chunked_prefill_stats_debug_cov() {
+        let stats = ChunkedPrefillStats {
+            total_chunks: 10,
+            chunk_size: 512,
+            total_tokens: 5000,
+            total_time_ms: 100.0,
+            avg_chunk_time_ms: 10.0,
+            ttft_ms: 5.0,
+            tokens_per_second: 50000.0,
+        };
+        let debug = format!("{:?}", stats);
+        assert!(debug.contains("ChunkedPrefillStats"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_chunked_prefill_stats_clone_cov() {
+        let stats = ChunkedPrefillStats {
+            total_chunks: 10,
+            chunk_size: 512,
+            total_tokens: 5000,
+            total_time_ms: 100.0,
+            avg_chunk_time_ms: 10.0,
+            ttft_ms: 5.0,
+            tokens_per_second: 50000.0,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats.total_chunks, cloned.total_chunks);
+    }
+
+    #[test]
+    fn test_quantized_generate_config_default_cov() {
+        let config = QuantizedGenerateConfig::default();
+        assert!(config.max_tokens > 0);
+        assert!(config.temperature >= 0.0);
+    }
+
+    #[test]
+    fn test_quantized_generate_config_deterministic_cov() {
+        let config = QuantizedGenerateConfig::deterministic(256);
+        assert_eq!(config.max_tokens, 256);
+        assert_eq!(config.temperature, 0.0);
+        assert_eq!(config.top_k, 1);
+    }
+
+    #[test]
+    fn test_owned_quantized_kv_cache_default_cov() {
+        let cache = OwnedQuantizedKVCache::default();
+        // Default cache created - fields are private
+        drop(cache);
+    }
+
+    #[test]
+    fn test_owned_quantized_kv_cache_new_cov() {
+        let cache = OwnedQuantizedKVCache::new(4, 64, 512);
+        // Cache created with specified dimensions - fields are private
+        drop(cache);
+    }
+
+    #[test]
+    fn test_owned_quantized_kv_cache_from_config_cov() {
+        let config = GGUFConfig {
+            architecture: "llama".to_string(),
+            vocab_size: 32000,
+            hidden_dim: 64,
+            num_heads: 8,
+            num_kv_heads: 8,
+            num_layers: 4,
+            intermediate_dim: 256,
+            context_length: 4096,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let cache = OwnedQuantizedKVCache::from_config(&config, 512);
+        // Cache created from config - fields are private
+        drop(cache);
+    }
+
+    // Note: QKVWeights and OwnedQKVWeights use internal types (QuantizedTensorRef,
+    // OwnedQuantizedTensor) that require complex setup - skipping direct tests
+
+    // =========================================================================
+    // Coverage Tests: OwnedInferenceScratchBuffer
+    // =========================================================================
+
+    #[test]
+    fn test_owned_inference_scratch_buffer_from_config_cov() {
+        let config = GGUFConfig {
+            architecture: "llama".to_string(),
+            vocab_size: 1000,
+            hidden_dim: 64,
+            num_heads: 8,
+            num_kv_heads: 8,
+            num_layers: 4,
+            intermediate_dim: 256,
+            context_length: 4096,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let buf = OwnedInferenceScratchBuffer::from_config(&config);
+        // Buffer created - has public fields
+        assert!(!buf.qkv.is_empty());
+        assert!(!buf.attn_out.is_empty());
+    }
+
+    // =========================================================================
+    // Coverage Tests: ContiguousKVCache
+    // =========================================================================
+
+    #[test]
+    fn test_contiguous_kv_cache_new_cov() {
+        let cache = ContiguousKVCache::new(4, 64, 512);
+        // Cache created - fields are private
+        drop(cache);
+    }
+
+    #[test]
+    fn test_contiguous_kv_cache_from_config_cov() {
+        let config = GGUFConfig {
+            architecture: "llama".to_string(),
+            vocab_size: 1000,
+            hidden_dim: 64,
+            num_heads: 8,
+            num_kv_heads: 8,
+            num_layers: 4,
+            intermediate_dim: 256,
+            context_length: 4096,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+            rope_type: 0,
+        };
+        let cache = ContiguousKVCache::from_config(&config, 512);
+        // Cache created from config - fields are private
+        drop(cache);
+    }
+
+    // =========================================================================
+    // Coverage Tests: DispatchMetrics
+    // =========================================================================
+
+    #[test]
+    fn test_dispatch_metrics_new_cov() {
+        let metrics = DispatchMetrics::new();
+        // Metrics created with atomic counters
+        drop(metrics);
+    }
+
+    #[test]
+    fn test_dispatch_metrics_default_cov() {
+        let metrics = DispatchMetrics::default();
+        // Default metrics created
+        drop(metrics);
+    }
+
+    // =========================================================================
+    // Coverage Tests: Buffer constants
+    // =========================================================================
+
+    #[test]
+    fn test_buffer_constants_cov() {
+        // Verify constants are sensible
+        assert!(BUFFER_LW_SIZE < BUFFER_HW_SIZE);
+        assert!(BUFFER_HW_SIZE < BUFFER_MAX_SIZE);
+        assert!(TOKEN_BUFFER_INLINE_CAP > 0);
+        assert!(ATTENTION_BUFFER_INLINE_CAP > 0);
+        assert!(HIDDEN_BUFFER_INLINE_CAP > 0);
+    }
+
+    // =========================================================================
+    // Coverage Tests: GGUF Type Constants
+    // =========================================================================
+
+    #[test]
+    fn test_gguf_type_constants_cov() {
+        assert_eq!(GGUF_TYPE_F32, 0);
+        assert_eq!(GGUF_TYPE_F16, 1);
+        assert_eq!(GGUF_TYPE_Q4_0, 2);
+        assert_eq!(GGUF_TYPE_Q4_1, 3);
+        assert_eq!(GGUF_TYPE_Q5_0, 6);
+        assert_eq!(GGUF_TYPE_Q5_1, 7);
+        assert_eq!(GGUF_TYPE_Q8_0, 8);
+        assert_eq!(GGUF_TYPE_Q4_K, 12);
+        assert_eq!(GGUF_TYPE_Q5_K, 13);
+        assert_eq!(GGUF_TYPE_Q6_K, 14);
+    }
+
+    #[test]
+    fn test_gguf_magic_constant_cov() {
+        assert_eq!(GGUF_MAGIC, 0x4655_4747);
+        // This should spell "GGUF" in little-endian
+        let bytes = GGUF_MAGIC.to_le_bytes();
+        assert_eq!(&bytes, b"GGUF");
+    }
+
+    #[test]
+    fn test_gguf_version_constant_cov() {
+        assert_eq!(GGUF_VERSION_V3, 3);
+    }
+
+    #[test]
+    fn test_gguf_alignment_constant_cov() {
+        assert_eq!(GGUF_ALIGNMENT, 32);
+    }
 }
