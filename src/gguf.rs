@@ -53185,4 +53185,349 @@ mod tests {
         }
         let _ = _type_check;
     }
+
+    // =========================================================================
+    // Coverage Tests: GGUFModel helper methods
+    // =========================================================================
+
+    /// Helper to create GGUF data with architecture metadata
+    fn create_gguf_data_with_arch(arch: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
+        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
+
+        // Add architecture metadata
+        let key = "general.architecture";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes()); // String type
+        data.extend_from_slice(&(arch.len() as u64).to_le_bytes());
+        data.extend_from_slice(arch.as_bytes());
+        data
+    }
+
+    #[test]
+    fn test_gguf_model_architecture_present() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.architecture(), Some("llama"));
+    }
+
+    #[test]
+    fn test_gguf_model_architecture_missing() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
+
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.architecture(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_embedding_dim_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        // No embedding_length metadata, so should return None
+        assert_eq!(model.embedding_dim(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_num_layers_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.num_layers(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_num_heads_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.num_heads(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_context_length_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.context_length(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_rope_freq_base_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.rope_freq_base(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_rms_epsilon_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.rms_epsilon(), None);
+    }
+
+    #[test]
+    fn test_gguf_model_rope_type_llama() {
+        // LLaMA uses NORM style (type 0)
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.rope_type(), Some(0));
+    }
+
+    #[test]
+    fn test_gguf_model_rope_type_qwen2() {
+        // Qwen2 uses NEOX style (type 2)
+        let data = create_gguf_data_with_arch("qwen2");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.rope_type(), Some(2));
+    }
+
+    #[test]
+    fn test_gguf_model_rope_type_phi2() {
+        // Phi2 uses NEOX style (type 2)
+        let data = create_gguf_data_with_arch("phi2");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.rope_type(), Some(2));
+    }
+
+    #[test]
+    fn test_gguf_model_rope_type_gemma() {
+        // Gemma uses NEOX style (type 2)
+        let data = create_gguf_data_with_arch("gemma");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.rope_type(), Some(2));
+    }
+
+    #[test]
+    fn test_gguf_model_num_kv_heads_missing() {
+        let data = create_gguf_data_with_arch("llama");
+        let model = GGUFModel::from_bytes(&data).expect("test");
+        assert_eq!(model.num_kv_heads(), None);
+    }
+
+    // =========================================================================
+    // Coverage Tests: GGUFValue enum
+    // =========================================================================
+
+    #[test]
+    fn test_gguf_value_uint8_eq() {
+        let a = GGUFValue::UInt8(42);
+        let b = GGUFValue::UInt8(42);
+        let c = GGUFValue::UInt8(43);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_gguf_value_int8_eq() {
+        let a = GGUFValue::Int8(-42);
+        let b = GGUFValue::Int8(-42);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_uint16_eq() {
+        let a = GGUFValue::UInt16(1000);
+        let b = GGUFValue::UInt16(1000);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_int16_eq() {
+        let a = GGUFValue::Int16(-1000);
+        let b = GGUFValue::Int16(-1000);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_float32_eq() {
+        let a = GGUFValue::Float32(3.14);
+        let b = GGUFValue::Float32(3.14);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_bool_eq() {
+        let a = GGUFValue::Bool(true);
+        let b = GGUFValue::Bool(true);
+        let c = GGUFValue::Bool(false);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_gguf_value_int64_eq() {
+        let a = GGUFValue::Int64(-9999999999i64);
+        let b = GGUFValue::Int64(-9999999999i64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_uint64_eq() {
+        let a = GGUFValue::UInt64(9999999999u64);
+        let b = GGUFValue::UInt64(9999999999u64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_float64_eq() {
+        let a = GGUFValue::Float64(3.14159265358979);
+        let b = GGUFValue::Float64(3.14159265358979);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_array_eq() {
+        let a = GGUFValue::Array(vec![GGUFValue::UInt32(1), GGUFValue::UInt32(2)]);
+        let b = GGUFValue::Array(vec![GGUFValue::UInt32(1), GGUFValue::UInt32(2)]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_gguf_value_debug() {
+        let val = GGUFValue::String("test".to_string());
+        let debug_str = format!("{:?}", val);
+        assert!(debug_str.contains("String"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_gguf_value_clone() {
+        let val = GGUFValue::UInt32(42);
+        let cloned = val.clone();
+        assert_eq!(val, cloned);
+    }
+
+    // =========================================================================
+    // Coverage Tests: GGUFHeader
+    // =========================================================================
+
+    #[test]
+    fn test_gguf_header_debug() {
+        let header = GGUFHeader {
+            magic: GGUF_MAGIC,
+            version: 3,
+            tensor_count: 10,
+            metadata_count: 5,
+        };
+        let debug_str = format!("{:?}", header);
+        assert!(debug_str.contains("GGUFHeader"));
+        assert!(debug_str.contains("magic"));
+    }
+
+    #[test]
+    fn test_gguf_header_clone() {
+        let header = GGUFHeader {
+            magic: GGUF_MAGIC,
+            version: 3,
+            tensor_count: 10,
+            metadata_count: 5,
+        };
+        let cloned = header.clone();
+        assert_eq!(header, cloned);
+    }
+
+    #[test]
+    fn test_gguf_header_eq() {
+        let h1 = GGUFHeader {
+            magic: GGUF_MAGIC,
+            version: 3,
+            tensor_count: 10,
+            metadata_count: 5,
+        };
+        let h2 = GGUFHeader {
+            magic: GGUF_MAGIC,
+            version: 3,
+            tensor_count: 10,
+            metadata_count: 5,
+        };
+        assert_eq!(h1, h2);
+    }
+
+    // =========================================================================
+    // Coverage Tests: TensorInfo
+    // =========================================================================
+
+    #[test]
+    fn test_tensor_info_debug() {
+        let info = TensorInfo {
+            name: "test.weight".to_string(),
+            n_dims: 2,
+            dims: vec![128, 256],
+            qtype: 0,
+            offset: 1024,
+        };
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("TensorInfo"));
+        assert!(debug_str.contains("test.weight"));
+    }
+
+    #[test]
+    fn test_tensor_info_clone() {
+        let info = TensorInfo {
+            name: "test.weight".to_string(),
+            n_dims: 2,
+            dims: vec![128, 256],
+            qtype: 0,
+            offset: 1024,
+        };
+        let cloned = info.clone();
+        assert_eq!(info, cloned);
+    }
+
+    #[test]
+    fn test_tensor_info_eq() {
+        let t1 = TensorInfo {
+            name: "w".to_string(),
+            n_dims: 1,
+            dims: vec![100],
+            qtype: 0,
+            offset: 0,
+        };
+        let t2 = TensorInfo {
+            name: "w".to_string(),
+            n_dims: 1,
+            dims: vec![100],
+            qtype: 0,
+            offset: 0,
+        };
+        assert_eq!(t1, t2);
+    }
+
+    // =========================================================================
+    // Coverage Tests: TokenBudget from gguf module
+    // =========================================================================
+
+    #[test]
+    fn test_token_buffer_small_vec() {
+        // Test TokenBuffer inline capacity
+        let mut buf: TokenBuffer = smallvec::smallvec![];
+        for i in 0..TOKEN_BUFFER_INLINE_CAP {
+            buf.push(i as u32);
+        }
+        // Should still be inline (not spilled to heap)
+        assert_eq!(buf.len(), TOKEN_BUFFER_INLINE_CAP);
+    }
+
+    #[test]
+    fn test_attention_buffer_small_vec() {
+        let mut buf: AttentionBuffer = smallvec::smallvec![];
+        for i in 0..ATTENTION_BUFFER_INLINE_CAP {
+            buf.push(i as f32 * 0.1);
+        }
+        assert_eq!(buf.len(), ATTENTION_BUFFER_INLINE_CAP);
+    }
+
+    #[test]
+    fn test_hidden_buffer_small_vec() {
+        let mut buf: HiddenBuffer = smallvec::smallvec![];
+        for i in 0..HIDDEN_BUFFER_INLINE_CAP {
+            buf.push(i as f32 * 0.01);
+        }
+        assert_eq!(buf.len(), HIDDEN_BUFFER_INLINE_CAP);
+    }
 }
