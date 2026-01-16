@@ -182,7 +182,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
- "trueno 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "trueno 0.11.0",
 ]
 
 [[package]]
@@ -3220,7 +3220,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
- "trueno 0.12.1",
+ "trueno 0.12.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "uuid",
  "wasm-bindgen",
  "web-sys",
@@ -4903,7 +4903,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
- "trueno 0.11.0",
+ "trueno 0.12.1",
  "trueno-db",
  "trueno-gpu",
  "trueno-viz",
@@ -6277,6 +6277,17 @@ dependencies = [
 [[package]]
 name = "trueno"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a0756605a19a0b79f5dca9b61fba7e428c497abe9ebeac2ef91b39d90b6da91"
+dependencies = [
+ "anyhow",
+ "num_cpus",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "trueno"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6286,20 +6297,10 @@ dependencies = [
  "num_cpus",
  "pollster",
  "serde",
+ "serde_json",
  "thiserror 2.0.17",
  "toml",
  "wgpu",
-]
-
-[[package]]
-name = "trueno"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0756605a19a0b79f5dca9b61fba7e428c497abe9ebeac2ef91b39d90b6da91"
-dependencies = [
- "anyhow",
- "num_cpus",
- "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -6345,7 +6346,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "trueno 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "trueno 0.11.0",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -6353,7 +6354,7 @@ dependencies = [
 
 [[package]]
 name = "trueno-gpu"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "libloading",
  "thiserror 2.0.17",
@@ -6369,7 +6370,7 @@ dependencies = [
  "libc",
  "png 0.17.16",
  "thiserror 2.0.17",
- "trueno 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "trueno 0.11.0",
 ]
 
 [[package]]

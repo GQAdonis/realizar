@@ -5241,11 +5241,15 @@ mod tests {
                     role: "system".to_string(),
                     content: Some("You are a helpful assistant.".to_string()),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: Some("Hello".to_string()),
                     name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
             max_tokens: Some(10),
@@ -5255,6 +5259,8 @@ mod tests {
             stream: false,
             stop: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
 
         let response = app
@@ -5322,6 +5328,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Hello".to_string()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         // Raw format (None model) just concatenates content
@@ -5335,6 +5343,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Hello".to_string()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         // Qwen2 uses ChatML format
@@ -5352,11 +5362,15 @@ mod tests {
                 role: "system".to_string(),
                 content: Some("You are helpful.".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("Hi".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -5376,16 +5390,22 @@ mod tests {
                 role: "user".to_string(),
                 content: Some("Hello".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some("Hi there!".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("How are you?".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -5403,6 +5423,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Test".to_string()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         // Phi format
@@ -5417,6 +5439,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Test".to_string()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         // Alpaca format
@@ -5437,6 +5461,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Hello".to_string()),
             name: Some("test_user".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
         };
 
         let json = serde_json::to_string(&msg).expect("test");
@@ -5586,6 +5612,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Hello".to_string()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let (result, truncated) = manager.truncate_messages(&messages);
@@ -5600,8 +5628,10 @@ mod tests {
 
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: "x".repeat(500),
+            content: Some("x".repeat(500)),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         assert!(manager.needs_truncation(&messages));
@@ -5618,16 +5648,22 @@ mod tests {
                 role: "system".to_string(),
                 content: Some("You are helpful.".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: "x".repeat(200), // Large old message
+                content: Some("x".repeat(200)), // Large old message
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("Recent".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -5651,16 +5687,22 @@ mod tests {
                 role: "user".to_string(),
                 content: Some("Old message 1".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("Old message 2".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("Recent".to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -5678,6 +5720,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("Hello".to_string()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let tokens = manager.estimate_total_tokens(&messages);
@@ -5704,8 +5748,10 @@ mod tests {
         // Message larger than available space
         let messages = vec![ChatMessage {
             role: "user".to_string(),
-            content: "x".repeat(1000),
+            content: Some("x".repeat(1000)),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         let (result, truncated) = manager.truncate_messages(&messages);
