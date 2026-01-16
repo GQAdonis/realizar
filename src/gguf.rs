@@ -22337,6 +22337,173 @@ impl OwnedQuantizedModelCuda {
 
         Ok(sequences)
     }
+
+    /// PAR-TRACE-001: GPU-resident token generation with inference tracing
+    ///
+    /// Same as `generate_gpu_resident` but emits trace events at each step
+    /// for debugging and observability per APR-TRACE-001 spec.
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - Initial token IDs
+    /// * `config` - Generation configuration
+    /// * `tracer` - Inference tracer for emitting trace events
+    /// * `decode_fn` - Optional function to decode token IDs to text
+    ///
+    /// # Errors
+    ///
+    /// Returns error if model doesn't support GPU-resident path or GPU operations fail.
+    pub fn generate_gpu_resident_traced<F>(
+        &mut self,
+        prompt: &[u32],
+        config: &QuantizedGenerateConfig,
+        tracer: &mut crate::inference_trace::InferenceTracer,
+        decode_fn: Option<F>,
+    ) -> Result<Vec<u32>>
+    where
+        F: Fn(u32) -> String,
+    {
+        use crate::inference_trace::TraceStep;
+
+        if prompt.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check architecture support
+        if !self.supports_gpu_resident() {
+            return Err(RealizarError::UnsupportedOperation {
+                operation: "generate_gpu_resident_traced".to_string(),
+                reason: "Model architecture not supported for GPU-resident path".to_string(),
+            });
+        }
+
+        // Pre-upload weights to GPU
+        let bytes_uploaded = self.preload_weights_gpu()?;
+        eprintln!(
+            "PAR-023: Pre-uploaded {} MB of weights to GPU",
+            bytes_uploaded / (1024 * 1024)
+        );
+
+        // Trace EMBED step - embedding lookup happens during forward pass
+        tracer.start_step(TraceStep::Embed);
+        // Note: GPU path does embedding on-device, we trace the shape
+        tracer.trace_embed(prompt.len(), self.model.config.hidden_dim, None);
+
+        // Create KV cache
+        let num_kv_heads = self.model.config.num_kv_heads;
+        let head_dim = self.model.config.hidden_dim / self.model.config.num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let mut cache = OwnedQuantizedKVCache::new(
+            self.model.config.num_layers,
+            kv_dim,
+            prompt.len() + config.max_tokens,
+        );
+
+        self.executor.reset_kv_cache_gpu();
+        let mut tokens = prompt.to_vec();
+
+        // Process prompt tokens (prefill) with tracing
+        for (pos, &token_id) in prompt.iter().enumerate() {
+            if pos < prompt.len() - 1 {
+                tracer.start_step(TraceStep::Transformer);
+                let _ = self.forward_gpu_resident(token_id, &mut cache, pos)?;
+                // Trace last layer for prefill
+                if pos == prompt.len() - 2 {
+                    tracer.trace_layer(
+                        self.model.config.num_layers - 1,
+                        0,
+                        None,
+                        1,
+                        self.model.config.hidden_dim,
+                    );
+                }
+            }
+        }
+
+        // Generate from last prompt token
+        let mut position = prompt.len() - 1;
+        let mut last_token = prompt[prompt.len() - 1];
+        let vocab_size = self.model.config.vocab_size;
+
+        for gen_idx in 0..config.max_tokens {
+            // Trace TRANSFORMER step
+            tracer.start_step(TraceStep::Transformer);
+
+            // GPU generation with argmax or full logits
+            let next_token = if config.temperature == 0.0 || config.top_k == 1 {
+                // Greedy sampling via GPU argmax
+                let token =
+                    self.forward_gpu_resident_to_token_id(last_token, &mut cache, position)?;
+
+                // Trace LM_HEAD (no logits available in argmax path)
+                tracer.start_step(TraceStep::LmHead);
+                // Create placeholder logits with peak at selected token
+                let mut placeholder = vec![0.0f32; vocab_size.min(100)];
+                if (token as usize) < placeholder.len() {
+                    placeholder[token as usize] = 10.0;
+                }
+                tracer.trace_lm_head(gen_idx, &placeholder, vocab_size);
+
+                // Trace SAMPLE
+                tracer.start_step(TraceStep::Sample);
+                tracer.trace_sample(gen_idx + 1, &placeholder, token, 0.0, 1);
+
+                token
+            } else {
+                // Non-greedy: get full logits
+                let logits = self.forward_gpu_resident(last_token, &mut cache, position)?;
+
+                // Trace transformer layer
+                tracer.trace_layer(
+                    self.model.config.num_layers - 1,
+                    gen_idx,
+                    None,
+                    1,
+                    self.model.config.hidden_dim,
+                );
+
+                // Trace LM_HEAD
+                tracer.start_step(TraceStep::LmHead);
+                tracer.trace_lm_head(gen_idx, &logits, vocab_size);
+
+                // Sample from logits
+                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.truncate(config.top_k);
+                let token = indexed[0].0 as u32;
+
+                // Trace SAMPLE
+                tracer.start_step(TraceStep::Sample);
+                tracer.trace_sample(
+                    gen_idx + 1,
+                    &logits,
+                    token,
+                    config.temperature,
+                    config.top_k,
+                );
+
+                token
+            };
+
+            // Check stop tokens
+            if config.stop_tokens.contains(&next_token) {
+                break;
+            }
+
+            // Trace DECODE
+            tracer.start_step(TraceStep::Decode);
+            let decoded = decode_fn
+                .as_ref()
+                .map_or_else(|| format!("<token_{}>", next_token), |f| f(next_token));
+            tracer.trace_decode(gen_idx + 1, next_token, &decoded, vocab_size);
+
+            tokens.push(next_token);
+            last_token = next_token;
+            position += 1;
+        }
+
+        Ok(tokens)
+    }
 }
 
 /// Configuration for quantized generation
