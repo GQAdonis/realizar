@@ -14608,6 +14608,138 @@ impl OwnedQuantizedModel {
         Ok(tokens)
     }
 
+    /// Generate tokens with tracing for debugging (APR-TRACE-001)
+    ///
+    /// Toyota Way: Genchi Genbutsu (Go and See) + Jidoka (Built-in Quality)
+    /// Provides step-by-step visualization of the inference pipeline.
+    ///
+    /// # Arguments
+    /// * `prompt` - Input token IDs
+    /// * `config` - Generation configuration
+    /// * `tracer` - Inference tracer to record events
+    /// * `decode_fn` - Optional function to decode token IDs to text (for DECODE step)
+    ///
+    /// # Returns
+    /// Generated token sequence including prompt
+    ///
+    /// # Errors
+    /// Returns error if forward pass fails
+    pub fn generate_with_cache_traced<F>(
+        &self,
+        prompt: &[u32],
+        config: &QuantizedGenerateConfig,
+        tracer: &mut crate::inference_trace::InferenceTracer,
+        decode_fn: Option<F>,
+    ) -> Result<Vec<u32>>
+    where
+        F: Fn(u32) -> String,
+    {
+        use crate::inference_trace::TraceStep;
+
+        if prompt.is_empty() {
+            return Err(RealizarError::InvalidShape {
+                reason: "Prompt cannot be empty".to_string(),
+            });
+        }
+
+        let max_seq_len = prompt.len() + config.max_tokens;
+        let mut cache = OwnedQuantizedKVCache::from_config(&self.config, max_seq_len);
+        let mut tokens = prompt.to_vec();
+
+        // Trace EMBED step
+        tracer.start_step(TraceStep::Embed);
+        let embed_data: Vec<f32> = prompt
+            .iter()
+            .flat_map(|&t| {
+                let start = t as usize * self.config.hidden_dim;
+                let end = start + self.config.hidden_dim;
+                if end <= self.token_embedding.len() {
+                    self.token_embedding[start..end].to_vec()
+                } else {
+                    vec![0.0; self.config.hidden_dim]
+                }
+            })
+            .collect();
+        tracer.trace_embed(prompt.len(), self.config.hidden_dim, Some(&embed_data));
+
+        // Process prompt tokens (prefill), keeping the logits from the last position
+        let mut logits = Vec::new();
+        for (pos, &token_id) in prompt.iter().enumerate() {
+            tracer.start_step(TraceStep::Transformer);
+            logits = self.forward_single_with_cache(token_id, &mut cache, pos)?;
+
+            // Only trace last layer for prefill to avoid noise
+            if pos == prompt.len() - 1 {
+                tracer.trace_layer(
+                    self.config.num_layers - 1,
+                    0,
+                    None, // Don't capture full hidden state for performance
+                    1,
+                    self.config.hidden_dim,
+                );
+            }
+        }
+
+        // Trace LM_HEAD after prefill
+        tracer.start_step(TraceStep::LmHead);
+        tracer.trace_lm_head(0, &logits, self.config.vocab_size);
+
+        // Generate new tokens
+        for gen_idx in 0..config.max_tokens {
+            // Trace SAMPLE step
+            tracer.start_step(TraceStep::Sample);
+            let next_token = if config.temperature == 0.0 || config.top_k == 1 {
+                Self::argmax(&logits)
+            } else {
+                Self::sample_topk(&logits, config.temperature, config.top_k)
+            };
+            tracer.trace_sample(
+                gen_idx + 1,
+                &logits,
+                next_token,
+                config.temperature,
+                config.top_k,
+            );
+
+            // Check stop condition
+            if config.stop_tokens.contains(&next_token) {
+                break;
+            }
+
+            // Trace DECODE step
+            tracer.start_step(TraceStep::Decode);
+            let decoded = decode_fn
+                .as_ref()
+                .map_or_else(|| format!("<token_{}>", next_token), |f| f(next_token));
+            tracer.trace_decode(gen_idx + 1, next_token, &decoded, self.config.vocab_size);
+
+            tokens.push(next_token);
+
+            // Check max length
+            if tokens.len() >= max_seq_len {
+                break;
+            }
+
+            // Forward pass for next token
+            tracer.start_step(TraceStep::Transformer);
+            let position = prompt.len() + gen_idx;
+            logits = self.forward_single_with_cache(next_token, &mut cache, position)?;
+            tracer.trace_layer(
+                self.config.num_layers - 1,
+                gen_idx + 1,
+                None,
+                1,
+                self.config.hidden_dim,
+            );
+
+            // Trace LM_HEAD
+            tracer.start_step(TraceStep::LmHead);
+            tracer.trace_lm_head(gen_idx + 1, &logits, self.config.vocab_size);
+        }
+
+        Ok(tokens)
+    }
+
     /// Generate tokens with zero-allocation inference (IMP-131)
     ///
     /// This is the highest-performance generation path. Uses pre-allocated
