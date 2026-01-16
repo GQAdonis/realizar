@@ -9818,6 +9818,46 @@ impl OwnedQuantizedModel {
         })
     }
 
+    /// Create a model for testing purposes
+    ///
+    /// This constructor handles the internal CUDA fields automatically,
+    /// allowing external tests to construct models without accessing pub(crate) fields.
+    ///
+    /// # Arguments
+    /// * `config` - Model configuration
+    /// * `token_embedding` - Token embedding weights
+    /// * `layers` - Quantized transformer layers
+    /// * `output_norm_weight` - Output normalization weight
+    /// * `output_norm_bias` - Optional output normalization bias
+    /// * `lm_head_weight` - Language model head weight
+    /// * `lm_head_bias` - Optional language model head bias
+    #[must_use]
+    pub fn new_for_test(
+        config: GGUFConfig,
+        token_embedding: Vec<f32>,
+        layers: Vec<OwnedQuantizedLayer>,
+        output_norm_weight: Vec<f32>,
+        output_norm_bias: Option<Vec<f32>>,
+        lm_head_weight: OwnedQuantizedTensor,
+        lm_head_bias: Option<Vec<f32>>,
+    ) -> Self {
+        Self {
+            config,
+            token_embedding,
+            layers,
+            output_norm_weight,
+            output_norm_bias,
+            lm_head_weight,
+            lm_head_bias,
+            #[cfg(feature = "cuda")]
+            cuda_executor: None,
+            #[cfg(feature = "cuda")]
+            cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
     /// Create model from memory-mapped APR file (SHOWCASE-APR-GPU)
     ///
     /// Converts APR Q4K format to GGUF-compatible model for GPU inference.
