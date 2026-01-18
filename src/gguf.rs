@@ -11354,6 +11354,7 @@ impl OwnedQuantizedModel {
     /// # Arguments
     /// * `token_id` - Token to process
     /// * `cache` - KV cache for incremental decoding
+    ///
     /// Forward pass with adaptive CPU/GPU attention selection (IMP-124)
     ///
     /// This variant of `forward_single_with_cache` uses `adaptive_attention_with_cache`
@@ -17158,12 +17159,10 @@ impl OwnedQuantizedModelCuda {
                 // Greedy sampling - use GPU-side argmax (4 bytes transfer vs 600KB)
                 self.forward_gpu_resident_to_token_id(last_token, &mut cache, position)?
             } else {
-                // Non-greedy sampling - need full logits for top-k
+                // Non-greedy sampling - need full logits for proper temperature + top-k sampling
+                // PAR-063: Fixed bug where GPU path always took top token instead of sampling
                 let logits = self.forward_gpu_resident(last_token, &mut cache, position)?;
-                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                indexed.truncate(config.top_k);
-                indexed[0].0 as u32
+                OwnedQuantizedModel::sample_topk(&logits, config.temperature, config.top_k)
             };
 
             // Check stop tokens
