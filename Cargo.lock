@@ -6357,9 +6357,9 @@ dependencies = [
 
 [[package]]
 name = "trueno-gpu"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12bec2c0192ea1175d43b36174dd6ac7742b030f98e73076c6fbd8f69213cd7f"
+checksum = "12825c4132303afac22ad1e4cfaefdf418c091f862048c77879d4c109dfe52b1"
 dependencies = [
  "libloading",
  "thiserror 2.0.17",
@@ -7556,9 +7556,9 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.14"
+version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8f3f50b848df28f887acb68e41201b5aea6bc8a8dacc00fb40635ff9a72fea"
+checksum = "94f63c051f4fe3c1509da62131a678643c5b6fbdc9273b2b79d4378ebda003d2"
 
 [[package]]
 name = "zstd"

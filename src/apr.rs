@@ -1,14 +1,14 @@
 //! Aprender .apr format support for realizar (APR v2 only)
 //!
 //! This module provides loading and inference for models in Aprender's native
-//! .apr v2 format (Magic: `APR2` = 0x41505232).
+//! .apr v2 format (Magic: `APR\0` = 0x41505232).
 //!
 //! ## Format Structure (APR v2, 64-byte header)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │ Header (64 bytes)                                           │
-//! │   - Magic: "APR2" (4 bytes)                                 │
+//! │   - Magic: "APR\0" (4 bytes)                                 │
 //! │   - Version: major.minor (2 bytes)                          │
 //! │   - Flags (2 bytes)                                         │
 //! │   - Tensor count (4 bytes)                                  │
@@ -41,7 +41,6 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use trueno::brick::BrickProfiler;
 
 use crate::error::{RealizarError, Result};
 
@@ -188,11 +187,11 @@ impl ModelData {
                             ),
                         })
                 }
-            }
+            },
             Self::Heap(_) => {
                 // No-op for heap data - kernel manages via normal VM pressure
                 Ok(())
-            }
+            },
         }
     }
 
@@ -203,15 +202,14 @@ impl ModelData {
     pub fn advise_sequential(&self) -> Result<()> {
         match self {
             Self::Mmap { mmap, path } => {
-                mmap.advise(memmap2::Advice::Sequential).map_err(|e| {
-                    RealizarError::IoError {
+                mmap.advise(memmap2::Advice::Sequential)
+                    .map_err(|e| RealizarError::IoError {
                         message: format!(
                             "madvise(MADV_SEQUENTIAL) failed for '{}': {e}",
                             path.display()
                         ),
-                    }
-                })
-            }
+                    })
+            },
             Self::Heap(_) => Ok(()),
         }
     }
@@ -227,11 +225,8 @@ impl ModelData {
     }
 }
 
-/// Magic number: "APR2" in ASCII (0x41505232)
-pub const MAGIC: [u8; 4] = [0x41, 0x50, 0x52, 0x32];
-
-/// Format version for .apr v2 files
-pub const FORMAT_VERSION: (u8, u8) = (2, 0);
+/// Magic number: "APR\0" - ONE format, no versioning
+pub const MAGIC: [u8; 4] = [0x41, 0x50, 0x52, 0x00];
 
 /// Header size in bytes (64-byte aligned)
 pub const HEADER_SIZE: usize = 64;
@@ -453,7 +448,7 @@ fn dtype_to_ggml_qtype(dtype: &str) -> Option<u32> {
         "Q4_0" | "q4_0" => Some(2),  // GGML_TYPE_Q4_0
         "Q4_1" | "q4_1" => Some(3),  // GGML_TYPE_Q4_1
         "Q5_0" | "q5_0" => Some(6),  // GGML_TYPE_Q5_0
-        _ => None, // F32/F16 are not quantized
+        _ => None,                   // F32/F16 are not quantized
     }
 }
 
@@ -529,7 +524,7 @@ impl AprFlags {
 /// APR v2 file header (64 bytes)
 #[derive(Debug, Clone)]
 pub struct AprHeader {
-    /// Magic number ("APR2")
+    /// Magic number ("APR\0")
     pub magic: [u8; 4],
     /// Format version (major, minor)
     pub version: (u8, u8),
@@ -572,7 +567,7 @@ impl AprHeader {
         if magic != MAGIC {
             return Err(RealizarError::FormatError {
                 reason: format!(
-                    "Invalid .apr magic: expected APR2 {:?}, got {:?}",
+                    "Invalid .apr magic: expected APR {:?}, got {:?}",
                     MAGIC, magic
                 ),
             });
@@ -665,8 +660,8 @@ impl TensorEntry {
             5 => "I32",
             6 => "I64",
             7 => "U8",
-            8 => "Q4_K", // GGUF Q4_K_M quantization (4.5 bits/element)
-            9 => "Q6_K", // GGUF Q6_K quantization (6.5 bits/element)
+            8 => "Q4_K",  // GGUF Q4_K_M quantization (4.5 bits/element)
+            9 => "Q6_K",  // GGUF Q6_K quantization (6.5 bits/element)
             10 => "Q8_0", // GGUF Q8_0 quantization (8 bits/element)
             _ => "F32",
         }
@@ -853,21 +848,12 @@ impl AprV2Model {
         })?;
 
         let mut header_buf = [0u8; HEADER_SIZE];
-        file.read_exact(&mut header_buf).map_err(|e| RealizarError::IoError {
-            message: format!("Failed to read .apr header: {e}"),
-        })?;
+        file.read_exact(&mut header_buf)
+            .map_err(|e| RealizarError::IoError {
+                message: format!("Failed to read .apr header: {e}"),
+            })?;
 
         let header = AprHeader::from_bytes(&header_buf)?;
-
-        // Validate version
-        if header.version.0 > FORMAT_VERSION.0 {
-            return Err(RealizarError::FormatError {
-                reason: format!(
-                    ".apr version {}.{} not supported (max {}.{})",
-                    header.version.0, header.version.1, FORMAT_VERSION.0, FORMAT_VERSION.1
-                ),
-            });
-        }
 
         // Check for unsupported features
         if header.flags.is_encrypted() {
@@ -918,16 +904,6 @@ impl AprV2Model {
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         // Parse header
         let header = AprHeader::from_bytes(&data)?;
-
-        // Validate version
-        if header.version.0 > FORMAT_VERSION.0 {
-            return Err(RealizarError::FormatError {
-                reason: format!(
-                    ".apr version {}.{} not supported (max {}.{})",
-                    header.version.0, header.version.1, FORMAT_VERSION.0, FORMAT_VERSION.1
-                ),
-            });
-        }
 
         // Check for unsupported features
         if header.flags.is_encrypted() {
@@ -1097,19 +1073,11 @@ impl AprV2Model {
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect();
                 Ok(floats)
-            }
-            "F16" | "f16" => {
-                Ok(dequantize_f16(bytes, num_elements))
-            }
-            "Q8_0" | "q8_0" => {
-                Ok(dequantize_q8_0(bytes, num_elements))
-            }
-            "Q4_K" | "q4_k" => {
-                Ok(dequantize_q4_k(bytes, num_elements))
-            }
-            "Q6_K" | "q6_k" => {
-                Ok(dequantize_q6_k(bytes, num_elements))
-            }
+            },
+            "F16" | "f16" => Ok(dequantize_f16(bytes, num_elements)),
+            "Q8_0" | "q8_0" => Ok(dequantize_q8_0(bytes, num_elements)),
+            "Q4_K" | "q4_k" => Ok(dequantize_q4_k(bytes, num_elements)),
+            "Q6_K" | "q6_k" => Ok(dequantize_q6_k(bytes, num_elements)),
             dtype => Err(RealizarError::FormatError {
                 reason: format!("Unsupported tensor dtype: {dtype}"),
             }),
@@ -1453,255 +1421,6 @@ impl AprV2Model {
                 *logit += h * lm_head.get(i * hidden_dim + j).copied().unwrap_or(0.0);
             }
         }
-
-        Ok(logits)
-    }
-
-    /// Forward pass with BrickProfiler instrumentation.
-    ///
-    /// Instruments 11 timing points:
-    /// - apr.Embed: Token embedding lookup
-    /// - apr.RmsNorm: RMS normalization (called 2x per layer + 1 final)
-    /// - apr.QKV: Q, K, V projections
-    /// - apr.Attention: Scaled dot-product attention
-    /// - apr.OProj: Output projection
-    /// - apr.FFN: Gate + Up + Down MLPs
-    /// - apr.Residual: Residual connection adds (2x per layer)
-    /// - apr.FinalNorm: Final layer norm
-    /// - apr.LmHead: LM head projection
-    ///
-    /// # Arguments
-    ///
-    /// * `token_ids` - Input token sequence
-    /// * `profiler` - BrickProfiler instance (must be enabled)
-    ///
-    /// # Returns
-    ///
-    /// Logits vector of size `vocab_size`
-    pub fn forward_profiled(
-        &self,
-        token_ids: &[u32],
-        profiler: &mut BrickProfiler,
-    ) -> Result<Vec<f32>> {
-        if token_ids.is_empty() {
-            return Err(RealizarError::InvalidShape {
-                reason: "Token sequence cannot be empty".to_string(),
-            });
-        }
-
-        if !self.metadata.is_transformer() {
-            return Err(RealizarError::FormatError {
-                reason: "Model is not a transformer (missing config)".to_string(),
-            });
-        }
-
-        let hidden_dim = self.metadata.hidden_size.unwrap_or(0);
-        let num_layers = self.metadata.num_layers.unwrap_or(0);
-        let num_heads = self.metadata.num_heads.unwrap_or(1);
-        let num_kv_heads = self.metadata.num_kv_heads.unwrap_or(num_heads);
-        let vocab_size = self.metadata.vocab_size.unwrap_or(0);
-        let intermediate_dim = self.metadata.intermediate_size.unwrap_or(hidden_dim * 4);
-        let eps = self.metadata.rms_norm_eps.unwrap_or(1e-6);
-        let seq_len = token_ids.len();
-
-        // 1. APR.EMBED: Token embedding lookup
-        let timer = profiler.start("apr.Embed");
-        let embed_name = self.find_tensor_name(&[
-            "model.embed_tokens.weight",
-            "embed_tokens.weight",
-            "transformer.wte.weight",
-            "embeddings.word_embeddings.weight",
-            "tok_embeddings.weight",
-            "token_embd.weight", // GGUF naming
-        ])?;
-        let embeddings = self.get_tensor_f32(&embed_name)?;
-        let mut hidden = Vec::with_capacity(token_ids.len() * hidden_dim);
-        for &token_id in token_ids {
-            let offset = (token_id as usize) * hidden_dim;
-            if offset + hidden_dim <= embeddings.len() {
-                hidden.extend_from_slice(&embeddings[offset..offset + hidden_dim]);
-            } else {
-                hidden.extend(std::iter::repeat_n(0.0, hidden_dim));
-            }
-        }
-        profiler.stop(timer, seq_len as u64);
-
-        // 2. Process through transformer layers
-        for layer_idx in 0..num_layers {
-            // Load tensor names (HuggingFace, SafeTensors, GPT-2, LLaMA, GGUF)
-            let attn_norm_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.input_layernorm.weight"),
-                &format!("layers.{layer_idx}.input_layernorm.weight"),
-                &format!("transformer.h.{layer_idx}.ln_1.weight"),
-                &format!("layers.{layer_idx}.attention_norm.weight"),
-                &format!("blk.{layer_idx}.attn_norm.weight"), // GGUF
-            ])?;
-            let q_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.self_attn.q_proj.weight"),
-                &format!("layers.{layer_idx}.self_attn.q_proj.weight"),
-                &format!("transformer.h.{layer_idx}.attn.q_proj.weight"),
-                &format!("layers.{layer_idx}.attention.wq.weight"),
-                &format!("blk.{layer_idx}.attn_q.weight"), // GGUF
-            ])?;
-            let k_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.self_attn.k_proj.weight"),
-                &format!("layers.{layer_idx}.self_attn.k_proj.weight"),
-                &format!("transformer.h.{layer_idx}.attn.k_proj.weight"),
-                &format!("layers.{layer_idx}.attention.wk.weight"),
-                &format!("blk.{layer_idx}.attn_k.weight"), // GGUF
-            ])?;
-            let v_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.self_attn.v_proj.weight"),
-                &format!("layers.{layer_idx}.self_attn.v_proj.weight"),
-                &format!("transformer.h.{layer_idx}.attn.v_proj.weight"),
-                &format!("layers.{layer_idx}.attention.wv.weight"),
-                &format!("blk.{layer_idx}.attn_v.weight"), // GGUF
-            ])?;
-            let o_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.self_attn.o_proj.weight"),
-                &format!("layers.{layer_idx}.self_attn.o_proj.weight"),
-                &format!("transformer.h.{layer_idx}.attn.out_proj.weight"),
-                &format!("layers.{layer_idx}.attention.wo.weight"),
-                &format!("blk.{layer_idx}.attn_output.weight"), // GGUF
-            ])?;
-
-            let norm_weight = self.get_tensor_f32(&attn_norm_name)?;
-            let q_weight = self.get_tensor_f32(&q_name)?;
-            let k_weight = self.get_tensor_f32(&k_name)?;
-            let v_weight = self.get_tensor_f32(&v_name)?;
-            let o_weight = self.get_tensor_f32(&o_name)?;
-
-            // APR.RMSNORM (input)
-            let timer = profiler.start("apr.RmsNorm");
-            let normed = rms_norm(&hidden, &norm_weight, eps);
-            profiler.stop(timer, seq_len as u64);
-
-            // APR.QKV
-            let timer = profiler.start("apr.QKV");
-            let head_dim = hidden_dim / num_heads;
-            let q = matmul(&normed, &q_weight, seq_len, hidden_dim, hidden_dim);
-            let k = matmul(
-                &normed,
-                &k_weight,
-                seq_len,
-                hidden_dim,
-                num_kv_heads * head_dim,
-            );
-            let v = matmul(
-                &normed,
-                &v_weight,
-                seq_len,
-                hidden_dim,
-                num_kv_heads * head_dim,
-            );
-            profiler.stop(timer, seq_len as u64);
-
-            // APR.ATTENTION
-            let timer = profiler.start("apr.Attention");
-            let attn_out = simple_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim);
-            profiler.stop(timer, seq_len as u64);
-
-            // APR.OPROJ
-            let timer = profiler.start("apr.OProj");
-            let attn_proj = matmul(&attn_out, &o_weight, seq_len, hidden_dim, hidden_dim);
-            profiler.stop(timer, seq_len as u64);
-
-            // APR.RESIDUAL (attention)
-            let timer = profiler.start("apr.Residual");
-            for (h, &a) in hidden.iter_mut().zip(attn_proj.iter()) {
-                *h += a;
-            }
-            profiler.stop(timer, seq_len as u64);
-
-            // FFN path
-            let ffn_norm_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.post_attention_layernorm.weight"),
-                &format!("layers.{layer_idx}.post_attention_layernorm.weight"),
-                &format!("transformer.h.{layer_idx}.ln_2.weight"),
-                &format!("layers.{layer_idx}.ffn_norm.weight"),
-                &format!("blk.{layer_idx}.ffn_norm.weight"), // GGUF
-            ])?;
-            let gate_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.mlp.gate_proj.weight"),
-                &format!("layers.{layer_idx}.mlp.gate_proj.weight"),
-                &format!("transformer.h.{layer_idx}.mlp.gate_proj.weight"),
-                &format!("layers.{layer_idx}.feed_forward.w1.weight"),
-                &format!("blk.{layer_idx}.ffn_gate.weight"), // GGUF
-            ])?;
-            let up_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.mlp.up_proj.weight"),
-                &format!("layers.{layer_idx}.mlp.up_proj.weight"),
-                &format!("transformer.h.{layer_idx}.mlp.up_proj.weight"),
-                &format!("layers.{layer_idx}.feed_forward.w3.weight"),
-                &format!("blk.{layer_idx}.ffn_up.weight"), // GGUF
-            ])?;
-            let down_name = self.find_tensor_name(&[
-                &format!("model.layers.{layer_idx}.mlp.down_proj.weight"),
-                &format!("layers.{layer_idx}.mlp.down_proj.weight"),
-                &format!("transformer.h.{layer_idx}.mlp.down_proj.weight"),
-                &format!("layers.{layer_idx}.feed_forward.w2.weight"),
-                &format!("blk.{layer_idx}.ffn_down.weight"), // GGUF
-            ])?;
-
-            let ffn_norm = self.get_tensor_f32(&ffn_norm_name)?;
-            let gate = self.get_tensor_f32(&gate_name)?;
-            let up = self.get_tensor_f32(&up_name)?;
-            let down = self.get_tensor_f32(&down_name)?;
-
-            // APR.RMSNORM (post-attention)
-            let timer = profiler.start("apr.RmsNorm");
-            let normed = rms_norm(&hidden, &ffn_norm, eps);
-            profiler.stop(timer, seq_len as u64);
-
-            // APR.FFN
-            let timer = profiler.start("apr.FFN");
-            let gate_out = matmul(&normed, &gate, seq_len, hidden_dim, intermediate_dim);
-            let up_out = matmul(&normed, &up, seq_len, hidden_dim, intermediate_dim);
-            let mut ffn_hidden = Vec::with_capacity(seq_len * intermediate_dim);
-            for (g, u) in gate_out.iter().zip(up_out.iter()) {
-                let silu = g * (1.0 / (1.0 + (-g).exp()));
-                ffn_hidden.push(silu * u);
-            }
-            let ffn_out = matmul(&ffn_hidden, &down, seq_len, intermediate_dim, hidden_dim);
-            profiler.stop(timer, seq_len as u64);
-
-            // APR.RESIDUAL (FFN)
-            let timer = profiler.start("apr.Residual");
-            for (h, &f) in hidden.iter_mut().zip(ffn_out.iter()) {
-                *h += f;
-            }
-            profiler.stop(timer, seq_len as u64);
-        }
-
-        // 3. APR.FINALNORM
-        let timer = profiler.start("apr.FinalNorm");
-        let final_norm_name = self.find_tensor_name(&[
-            "model.norm.weight",
-            "norm.weight",
-            "transformer.ln_f.weight",
-            "output_norm.weight", // GGUF naming
-        ])?;
-        let final_norm = self.get_tensor_f32(&final_norm_name)?;
-        let hidden = rms_norm(&hidden, &final_norm, eps);
-        profiler.stop(timer, seq_len as u64);
-
-        // 4. APR.LMHEAD
-        let timer = profiler.start("apr.LmHead");
-        let lm_head_name = self.find_tensor_name(&[
-            "lm_head.weight",
-            "output.weight", // GGUF uses this
-            "model.embed_tokens.weight",
-            "embed_tokens.weight",
-        ])?;
-        let lm_head = self.get_tensor_f32(&lm_head_name)?;
-        let last_hidden = &hidden[hidden.len() - hidden_dim..];
-        let mut logits = vec![0.0; vocab_size];
-        for (i, logit) in logits.iter_mut().enumerate() {
-            for (j, &h) in last_hidden.iter().enumerate() {
-                *logit += h * lm_head.get(i * hidden_dim + j).copied().unwrap_or(0.0);
-            }
-        }
-        profiler.stop(timer, 1); // LM head processes 1 token (last)
 
         Ok(logits)
     }
@@ -2538,7 +2257,7 @@ impl AprV2ModelCuda {
         let num_layers = self.model.metadata.num_layers.unwrap_or(0);
         let num_heads = self.model.metadata.num_heads.unwrap_or(1);
         let num_kv_heads = self.model.metadata.num_kv_heads.unwrap_or(num_heads);
-        let vocab_size = self.model.metadata.vocab_size.unwrap_or(0);
+        let _vocab_size = self.model.metadata.vocab_size.unwrap_or(0);
         let intermediate_dim = self
             .model
             .metadata
@@ -2656,7 +2375,8 @@ impl AprV2ModelCuda {
                 let patterns_ref: Vec<&str> = patterns.iter().map(String::as_str).collect();
                 if let Ok(src_name) = self.model.find_tensor_name(&patterns_ref) {
                     let cache_name = format!("{prefix}.{suffix}");
-                    let bytes = upload_weight(&mut self.executor, &self.model, &src_name, &cache_name);
+                    let bytes =
+                        upload_weight(&mut self.executor, &self.model, &src_name, &cache_name);
                     if bytes > 0 {
                         total_bytes += bytes;
                         quantized_count += 1;
@@ -2706,7 +2426,10 @@ impl AprV2ModelCuda {
         ];
         if let Ok(src_name) = self.model.find_tensor_name(&output_norm_patterns) {
             if let Ok(gamma) = self.model.get_tensor_f32(&src_name) {
-                if let Ok(bytes) = self.executor.cache_rmsnorm_gamma("output_norm.gamma", &gamma) {
+                if let Ok(bytes) = self
+                    .executor
+                    .cache_rmsnorm_gamma("output_norm.gamma", &gamma)
+                {
                     total_bytes += bytes;
                 }
             }
@@ -2723,10 +2446,11 @@ impl AprV2ModelCuda {
                 if let Some(qtype) = dtype_to_ggml_qtype(&entry.dtype) {
                     // Quantized LM head
                     if let Ok(bytes) = self.model.get_tensor_bytes(&src_name) {
-                        if let Ok(size) = self
-                            .executor
-                            .load_quantized_weights_with_type("output.weight", bytes, qtype)
-                        {
+                        if let Ok(size) = self.executor.load_quantized_weights_with_type(
+                            "output.weight",
+                            bytes,
+                            qtype,
+                        ) {
                             total_bytes += size;
                             quantized_count += 1;
                         }
@@ -2743,10 +2467,11 @@ impl AprV2ModelCuda {
                             )
                         };
                         // Use qtype 0 to indicate F32 (handled specially in forward)
-                        if let Ok(size) = self
-                            .executor
-                            .load_quantized_weights_with_type("output.weight", w_bytes, 0)
-                        {
+                        if let Ok(size) = self.executor.load_quantized_weights_with_type(
+                            "output.weight",
+                            w_bytes,
+                            0,
+                        ) {
                             total_bytes += size;
                         }
                     }
@@ -2771,10 +2496,7 @@ impl AprV2ModelCuda {
             }
 
             // Initialize workspace for zero-allocation forward pass
-            if let Err(e) = self.executor.init_workspace(
-                hidden_dim,
-                intermediate_dim,
-            ) {
+            if let Err(e) = self.executor.init_workspace(hidden_dim, intermediate_dim) {
                 eprintln!("[AprV2ModelCuda] Warning: Could not init workspace: {e}");
             }
         }
@@ -2802,10 +2524,7 @@ impl AprV2ModelCuda {
 
         let embeddings = self.model.get_tensor_f32(&embed_name)?;
         let embed_mb = embeddings.len() * 4 / (1024 * 1024);
-        eprintln!(
-            "[AprV2ModelCuda] Cached embedding table: {} MB",
-            embed_mb
-        );
+        eprintln!("[AprV2ModelCuda] Cached embedding table: {} MB", embed_mb);
 
         self.embedding_cache = Some(embeddings);
         Ok(())
@@ -2868,15 +2587,20 @@ impl AprV2ModelCuda {
             let position = self.kv_position;
 
             // Embedding lookup from cache
-            let input: Vec<f32> = self.get_embedding(token_id).ok_or_else(|| {
-                RealizarError::InvalidShape {
+            let input: Vec<f32> = self
+                .get_embedding(token_id)
+                .ok_or_else(|| RealizarError::InvalidShape {
                     reason: format!("Token {} out of embedding range", token_id),
-                }
-            })?.to_vec();
+                })?
+                .to_vec();
 
             let num_layers = self.model.metadata.num_layers.unwrap_or(0);
             let hidden_dim = self.model.metadata.hidden_size.unwrap_or(0);
-            let intermediate_dim = self.model.metadata.intermediate_size.unwrap_or(hidden_dim * 4);
+            let intermediate_dim = self
+                .model
+                .metadata
+                .intermediate_size
+                .unwrap_or(hidden_dim * 4);
             let eps = self.model.metadata.rms_norm_eps.unwrap_or(1e-6);
 
             // First call: capture graph using the full graphed forward path
@@ -2902,7 +2626,8 @@ impl AprV2ModelCuda {
                     })?;
 
                 // CPU argmax for first token (graph now captured)
-                let (top_idx, _) = output.iter()
+                let (top_idx, _) = output
+                    .iter()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                     .ok_or_else(|| RealizarError::InvalidShape {
@@ -2912,11 +2637,7 @@ impl AprV2ModelCuda {
             } else {
                 // Graph captured - use fast replay with GPU argmax
                 self.executor
-                    .forward_graphed_replay_to_token_id(
-                        &input,
-                        position,
-                        vocab_size as u32,
-                    )
+                    .forward_graphed_replay_to_token_id(&input, position, vocab_size as u32)
                     .map_err(|e| RealizarError::UnsupportedOperation {
                         operation: "forward_graphed_replay_to_token_id".to_string(),
                         reason: format!("GPU argmax fast path failed: {e}"),
@@ -2931,7 +2652,8 @@ impl AprV2ModelCuda {
 
         // Fallback: use forward_cuda and do CPU argmax
         let logits = self.forward_cuda(&[token_id])?;
-        let (top_idx, _) = logits.iter()
+        let (top_idx, _) = logits
+            .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .ok_or_else(|| RealizarError::InvalidShape {
@@ -2993,11 +2715,12 @@ impl AprV2ModelCuda {
 
             // Embedding lookup from cache (O(1) - no disk/mmap read)
             // Copy to local vec to release borrow before mutable executor call
-            let input: Vec<f32> = self.get_embedding(token_id).ok_or_else(|| {
-                RealizarError::InvalidShape {
+            let input: Vec<f32> = self
+                .get_embedding(token_id)
+                .ok_or_else(|| RealizarError::InvalidShape {
                     reason: format!("Token {} out of embedding range", token_id),
-                }
-            })?.to_vec();
+                })?
+                .to_vec();
 
             // Use the graphed forward path with CUDA graph capture
             // First call captures the graph, subsequent calls replay it
@@ -3374,6 +3097,7 @@ impl AprV2ModelCuda {
     }
 
     /// GPU GEMM helper: C[m, n] = A[m, k] × B[k, n]
+    #[allow(clippy::many_single_char_names)] // Standard matrix notation
     fn gemm_gpu(&mut self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         let mut c = vec![0.0f32; m * n];
         self.executor
@@ -3389,6 +3113,7 @@ impl AprV2ModelCuda {
     ///
     /// Uses pre-cached weight matrix B to avoid repeated GPU uploads.
     /// This is the optimized path for transformer inference.
+    #[allow(clippy::many_single_char_names)] // Standard matrix notation
     fn gemm_cached_gpu(
         &mut self,
         weight_name: &str,
@@ -3572,19 +3297,10 @@ impl MappedAprModel {
         // Parse header
         let header = AprHeader::from_bytes(data)?;
 
-        // Validate magic and version
+        // Validate magic
         if header.magic != MAGIC {
             return Err(RealizarError::FormatError {
                 reason: "Invalid APR magic bytes".to_string(),
-            });
-        }
-
-        if header.version.0 > FORMAT_VERSION.0 {
-            return Err(RealizarError::FormatError {
-                reason: format!(
-                    "APR version {}.{} not supported (max {}.{})",
-                    header.version.0, header.version.1, FORMAT_VERSION.0, FORMAT_VERSION.1
-                ),
             });
         }
 
@@ -3664,9 +3380,11 @@ impl MappedAprModel {
 
     /// Get raw tensor data by name
     pub fn get_tensor_data(&self, name: &str) -> Result<&[u8]> {
-        let tensor = self.find_tensor(name).ok_or_else(|| RealizarError::FormatError {
-            reason: format!("Tensor not found: {name}"),
-        })?;
+        let tensor = self
+            .find_tensor(name)
+            .ok_or_else(|| RealizarError::FormatError {
+                reason: format!("Tensor not found: {name}"),
+            })?;
 
         let start = self.header.data_offset as usize + tensor.offset as usize;
         let end = start + tensor.size as usize;
@@ -3711,8 +3429,9 @@ mod tests {
 
     #[test]
     fn test_magic_constant() {
-        assert_eq!(MAGIC, [0x41, 0x50, 0x52, 0x32]);
-        assert_eq!(&MAGIC, b"APR2");
+        // ONE format: APR\0
+        assert_eq!(MAGIC, [0x41, 0x50, 0x52, 0x00]);
+        assert_eq!(&MAGIC, b"APR\0");
     }
 
     #[test]
@@ -3999,7 +3718,7 @@ mod tests {
     fn create_test_apr_model() -> Vec<u8> {
         let metadata = r#"{"architecture":"test","vocab_size":100,"hidden_size":64}"#;
         let metadata_bytes = metadata.as_bytes();
-        let metadata_padded_size = ((metadata_bytes.len() + 63) / 64) * 64;
+        let metadata_padded_size = metadata_bytes.len().div_ceil(64) * 64;
 
         // Binary tensor index entry for "test.weight"
         let tensor_entry = create_binary_tensor_entry("test.weight", 0, &[4, 4], 0, 64);
@@ -4033,8 +3752,7 @@ mod tests {
         let data_start = data_offset as usize;
         for i in 0..16 {
             let val = i as f32;
-            data[data_start + i * 4..data_start + i * 4 + 4]
-                .copy_from_slice(&val.to_le_bytes());
+            data[data_start + i * 4..data_start + i * 4 + 4].copy_from_slice(&val.to_le_bytes());
         }
 
         data
@@ -4106,7 +3824,9 @@ mod tests {
         let data = create_test_apr_model();
         let model = AprV2Model::from_bytes(data).expect("should load");
 
-        let bytes = model.get_tensor_bytes("test.weight").expect("should get bytes");
+        let bytes = model
+            .get_tensor_bytes("test.weight")
+            .expect("should get bytes");
         assert_eq!(bytes.len(), 64); // 16 floats * 4 bytes
     }
 
@@ -4169,18 +3889,7 @@ mod tests {
         assert!(!meta.is_transformer());
     }
 
-    #[test]
-    fn test_apr_model_unsupported_version() {
-        let mut data = vec![0u8; HEADER_SIZE + 128];
-        data[0..4].copy_from_slice(&MAGIC);
-        data[4] = 99; // version major = 99 (unsupported)
-        data[5] = 0;
-
-        let result = AprV2Model::from_bytes(data);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not supported"));
-    }
+    // Version test removed - ONE format, no versioning
 
     #[test]
     fn test_apr_model_encrypted_error() {
@@ -4213,7 +3922,7 @@ mod tests {
 
     #[test]
     fn test_is_apr_file() {
-        // is_apr_file reads the file and checks for APR2 magic bytes
+        // is_apr_file reads the file and checks for APR\0 magic bytes
         // Non-existent files return false
         assert!(!is_apr_file("/nonexistent/model.apr"));
         assert!(!is_apr_file("/nonexistent/model.gguf"));
@@ -4269,11 +3978,7 @@ mod tests {
 
     #[test]
     fn test_decode_tokens() {
-        let vocab: Vec<String> = vec![
-            "hello".to_string(),
-            " ".to_string(),
-            "world".to_string(),
-        ];
+        let vocab: Vec<String> = vec!["hello".to_string(), " ".to_string(), "world".to_string()];
 
         let result = AprV2Model::decode_tokens(&vocab, &[0, 1, 2]);
         assert_eq!(result, "hello world");
@@ -4372,7 +4077,9 @@ mod tests {
         let model_data = ModelData::from_vec(vec![1, 2, 3, 4, 5]);
 
         // Should be no-op for heap data
-        model_data.release_cpu_pages().expect("release pages (no-op)");
+        model_data
+            .release_cpu_pages()
+            .expect("release pages (no-op)");
     }
 
     #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -4382,7 +4089,8 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut temp = NamedTempFile::new().expect("create temp file");
-        temp.write_all(b"sequential access test").expect("write data");
+        temp.write_all(b"sequential access test")
+            .expect("write data");
 
         let model_data = ModelData::open_mmap(temp.path()).expect("open mmap");
 
@@ -4396,7 +4104,9 @@ mod tests {
         let model_data = ModelData::from_vec(vec![1, 2, 3]);
 
         // Should be no-op for heap data
-        model_data.advise_sequential().expect("advise sequential (no-op)");
+        model_data
+            .advise_sequential()
+            .expect("advise sequential (no-op)");
     }
 
     #[test]
@@ -4947,7 +4657,7 @@ mod tests {
     #[test]
     fn test_apr_header_from_bytes_valid() {
         let mut data = Vec::new();
-        data.extend_from_slice(&MAGIC); // APR2
+        data.extend_from_slice(&MAGIC); // APR\0
         data.extend_from_slice(&[2, 0]); // version 2.0
         data.extend_from_slice(&[0, 0]); // flags
         data.extend_from_slice(&5u32.to_le_bytes()); // tensor_count = 5
@@ -5640,15 +5350,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_apr_v2_model_from_bytes_unsupported_version() {
-        let mut data = vec![0u8; 100];
-        data[0..4].copy_from_slice(&MAGIC);
-        data[4] = 99; // Future version
-        data[5] = 0;
-        let result = AprV2Model::from_bytes(data);
-        assert!(result.is_err());
-    }
+    // Version test removed - ONE format, no versioning
 
     #[test]
     fn test_apr_v2_model_get_tensor_bytes_existing() {
@@ -5756,7 +5458,7 @@ mod tests {
         let mut bytes = vec![0u8; 34];
         bytes[0] = 0x00; // Scale low byte
         bytes[1] = 0x3C; // Scale high byte (1.0 in f16)
-        // Set first few values to small integers
+                         // Set first few values to small integers
         bytes[2] = 1; // i8 value 1
         bytes[3] = 2; // i8 value 2
         bytes[4] = 255; // i8 value -1
@@ -5920,7 +5622,8 @@ mod tests {
 
     #[test]
     fn test_apr_flags_multiple() {
-        let flags = AprFlags::new(AprFlags::LZ4_COMPRESSED | AprFlags::QUANTIZED | AprFlags::HAS_VOCAB);
+        let flags =
+            AprFlags::new(AprFlags::LZ4_COMPRESSED | AprFlags::QUANTIZED | AprFlags::HAS_VOCAB);
         assert!(flags.is_lz4());
         assert!(flags.is_compressed());
         assert!(flags.is_quantized());
@@ -6377,7 +6080,7 @@ mod tests {
         // Block 1
         bytes[0] = 0x00;
         bytes[1] = 0x3C; // Scale = 1.0
-        // Block 2
+                         // Block 2
         bytes[34] = 0x00;
         bytes[35] = 0x3C; // Scale = 1.0
 
@@ -6648,10 +6351,11 @@ mod tests {
     fn create_test_apr_model_with_dtype(dtype: u8, data_bytes: &[u8]) -> Vec<u8> {
         let metadata = r#"{"architecture":"test"}"#;
         let metadata_bytes = metadata.as_bytes();
-        let metadata_padded_size = ((metadata_bytes.len() + 63) / 64) * 64;
+        let metadata_padded_size = metadata_bytes.len().div_ceil(64) * 64;
 
         // Tensor shape depends on dtype and data
-        let tensor_entry = create_binary_tensor_entry("typed.weight", dtype, &[4], 0, data_bytes.len() as u64);
+        let tensor_entry =
+            create_binary_tensor_entry("typed.weight", dtype, &[4], 0, data_bytes.len() as u64);
 
         let tensor_index_offset = HEADER_SIZE as u64 + metadata_padded_size as u64;
         let data_offset = tensor_index_offset + tensor_entry.len() as u64;
@@ -6717,7 +6421,7 @@ mod tests {
         // Create with shape [32] since Q8_0 block has 32 elements
         let metadata = r#"{"architecture":"test"}"#;
         let metadata_bytes = metadata.as_bytes();
-        let metadata_padded_size = ((metadata_bytes.len() + 63) / 64) * 64;
+        let metadata_padded_size = metadata_bytes.len().div_ceil(64) * 64;
 
         let tensor_entry = create_binary_tensor_entry("typed.weight", 10, &[32], 0, 34);
         let tensor_index_offset = HEADER_SIZE as u64 + metadata_padded_size as u64;
@@ -6800,7 +6504,7 @@ mod tests {
 
     #[test]
     fn test_decode_tokens_empty_string_token() {
-        let vocab = vec!["".to_string(), "a".to_string()];
+        let vocab = vec![String::new(), "a".to_string()];
         let result = AprV2Model::decode_tokens(&vocab, &[0, 1]);
         // Empty token shouldn't cause issues
         assert!(result.contains('a'));
@@ -6904,7 +6608,7 @@ mod tests {
     fn create_linear_model_apr() -> Vec<u8> {
         let metadata = r#"{"architecture":"linear"}"#;
         let metadata_bytes = metadata.as_bytes();
-        let metadata_padded_size = ((metadata_bytes.len() + 63) / 64) * 64;
+        let metadata_padded_size = metadata_bytes.len().div_ceil(64) * 64;
 
         // Weight tensor: 2x3 = 6 elements, 24 bytes
         // Bias tensor: 2 elements, 8 bytes
@@ -6933,7 +6637,8 @@ mod tests {
         // Tensor index
         let idx_start = tensor_index_offset as usize;
         data[idx_start..idx_start + weight_entry.len()].copy_from_slice(&weight_entry);
-        data[idx_start + weight_entry.len()..idx_start + tensor_index_size].copy_from_slice(&bias_entry);
+        data[idx_start + weight_entry.len()..idx_start + tensor_index_size]
+            .copy_from_slice(&bias_entry);
 
         // Tensor data - weight matrix [2,3] (identity-ish pattern)
         let data_start = data_offset as usize;
@@ -6944,7 +6649,8 @@ mod tests {
         // Bias [2]
         let biases: [f32; 2] = [0.5, 0.5];
         for (i, &b) in biases.iter().enumerate() {
-            data[data_start + 24 + i * 4..data_start + 24 + i * 4 + 4].copy_from_slice(&b.to_le_bytes());
+            data[data_start + 24 + i * 4..data_start + 24 + i * 4 + 4]
+                .copy_from_slice(&b.to_le_bytes());
         }
 
         data
@@ -7243,7 +6949,7 @@ mod tests {
         bytes[1] = 0x3C; // d = 1.0
         bytes[2] = 0x00;
         bytes[3] = 0x3C; // dmin = 1.0
-        // Set some scale values
+                         // Set some scale values
         bytes[4] = 0x3F; // scales[0] = 63
         bytes[5] = 0x3F;
 
@@ -7284,7 +6990,7 @@ mod tests {
             "rms_norm_eps": 1e-6
         }"#;
         let metadata_bytes = metadata.as_bytes();
-        let metadata_padded_size = ((metadata_bytes.len() + 63) / 64) * 64;
+        let metadata_padded_size = metadata_bytes.len().div_ceil(64) * 64;
 
         // Tensors needed for forward:
         // - model.embed_tokens.weight [vocab=10, hidden=8] = 80 floats = 320 bytes
@@ -7320,12 +7026,16 @@ mod tests {
 
         for (name, shape, byte_size) in &tensor_defs {
             let shape_vec: Vec<u64> = shape.iter().map(|&s| s as u64).collect();
-            let entry = create_binary_tensor_entry(name, 0, &shape_vec, current_offset, *byte_size as u64);
+            let entry =
+                create_binary_tensor_entry(name, 0, &shape_vec, current_offset, *byte_size as u64);
             tensor_entries.push(entry);
             current_offset += *byte_size as u64;
         }
 
-        let tensor_index: Vec<u8> = tensor_entries.iter().flat_map(|e| e.iter().copied()).collect();
+        let tensor_index: Vec<u8> = tensor_entries
+            .iter()
+            .flat_map(|e| e.iter().copied())
+            .collect();
         let tensor_count = tensor_defs.len() as u32;
         let total_data_size = current_offset as usize;
 
@@ -7391,8 +7101,12 @@ mod tests {
 
         // Check key tensors exist
         assert!(model.get_tensor("model.embed_tokens.weight").is_some());
-        assert!(model.get_tensor("layers.0.input_layernorm.weight").is_some());
-        assert!(model.get_tensor("layers.0.self_attn.q_proj.weight").is_some());
+        assert!(model
+            .get_tensor("layers.0.input_layernorm.weight")
+            .is_some());
+        assert!(model
+            .get_tensor("layers.0.self_attn.q_proj.weight")
+            .is_some());
         assert!(model.get_tensor("norm.weight").is_some());
         assert!(model.get_tensor("lm_head.weight").is_some());
     }
@@ -7430,7 +7144,7 @@ mod tests {
         let mut bytes = vec![0u8; 34];
         bytes[0] = 0x00;
         bytes[1] = 0x3C; // Scale = 1.0
-        // Set negative i8 values (128-255 map to -128 to -1)
+                         // Set negative i8 values (128-255 map to -128 to -1)
         bytes[2] = 255; // -1 as i8
         bytes[3] = 254; // -2 as i8
         bytes[4] = 128; // -128 as i8
@@ -7477,7 +7191,8 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut temp = NamedTempFile::new().expect("create temp file");
-        temp.write_all(&[0x47, 0x47, 0x55, 0x46]).expect("write GGUF magic");
+        temp.write_all(&[0x47, 0x47, 0x55, 0x46])
+            .expect("write GGUF magic");
         temp.write_all(&[0u8; 60]).expect("write padding");
 
         assert_eq!(detect_format(temp.path()), "gguf");
@@ -7536,7 +7251,8 @@ mod tests {
         let k = vec![1.0; seq_len * hidden_dim];
         let v = vec![1.0; seq_len * hidden_dim];
 
-        let result = super::simple_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim);
+        let result =
+            super::simple_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim);
         assert_eq!(result.len(), seq_len * hidden_dim);
     }
 
@@ -7554,7 +7270,8 @@ mod tests {
         let k = vec![1.0, 0.0, 1.0, 0.0]; // Token 1: [1,0], Token 2: [1,0]
         let v = vec![1.0, 2.0, 3.0, 4.0]; // Token 1: [1,2], Token 2: [3,4]
 
-        let result = super::simple_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim);
+        let result =
+            super::simple_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim);
         assert_eq!(result.len(), seq_len * hidden_dim);
         // Output should be valid attention-weighted values
         assert!(!result.iter().any(|v| v.is_nan()));
@@ -7644,5 +7361,4 @@ mod tests {
         assert_eq!(result.len(), 4);
         assert!(result.iter().all(|&v| v.is_finite()));
     }
-
 }

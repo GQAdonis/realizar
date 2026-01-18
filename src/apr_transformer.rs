@@ -40,12 +40,7 @@ use crate::error::{RealizarError, Result};
 // ============================================================================
 // APR Transformer Binary Format (Y1-Y5 Format Parity)
 // ============================================================================
-
-/// APR Transformer binary format magic: "APRT" (APR Transformer)
-pub const APR_TRANSFORMER_MAGIC: [u8; 4] = [0x41, 0x50, 0x52, 0x54];
-
-/// APR Transformer format version
-pub const APR_TRANSFORMER_VERSION: u32 = 1;
+// Uses unified APR magic from apr.rs - ONE format, no versioning
 
 /// Binary header size for APR Transformer (64 bytes)
 pub const APR_TRANSFORMER_HEADER_SIZE: usize = 64;
@@ -121,14 +116,11 @@ impl MmapAprTransformer {
         // Parse header
         let header_bytes = &mmap[..APR_TRANSFORMER_HEADER_SIZE];
 
-        // Verify magic (can be either APRN or APRT)
+        // Verify APR magic
         let magic = &header_bytes[0..4];
-        if magic != MAGIC && magic != APR_TRANSFORMER_MAGIC {
+        if magic != MAGIC {
             return Err(RealizarError::FormatError {
-                reason: format!(
-                    "Invalid APR magic: expected {:?} or {:?}, got {:?}",
-                    MAGIC, APR_TRANSFORMER_MAGIC, magic
-                ),
+                reason: format!("Invalid APR magic: expected {:?}, got {:?}", MAGIC, magic),
             });
         }
 
@@ -139,7 +131,7 @@ impl MmapAprTransformer {
             header_bytes[6],
             header_bytes[7],
         ]);
-        if version > APR_TRANSFORMER_VERSION {
+        if version > 1 {
             return Err(RealizarError::FormatError {
                 reason: format!("Unsupported APR version: {version}"),
             });
@@ -635,8 +627,8 @@ impl QuantizedAprTransformer {
         let mut bytes = Vec::new();
 
         // Header (64 bytes)
-        bytes.extend_from_slice(&APR_TRANSFORMER_MAGIC);
-        bytes.extend_from_slice(&APR_TRANSFORMER_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&(self.config.hidden_dim as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.config.num_layers as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.config.num_heads as u32).to_le_bytes());
@@ -689,7 +681,7 @@ impl QuantizedAprTransformer {
         }
 
         // Verify magic
-        if data[0..4] != APR_TRANSFORMER_MAGIC {
+        if data[0..4] != MAGIC {
             return Err(RealizarError::FormatError {
                 reason: "Invalid APR magic".to_string(),
             });
@@ -1191,18 +1183,18 @@ impl AprTransformer {
 
         // Check magic
         let magic = &data[0..4];
-        if magic != b"APR2" && magic != b"APRN" {
+        if magic != b"APR\0" {
             return Err(RealizarError::FormatError {
                 reason: format!(
-                    "Invalid APR magic: {:?}, expected APR2 or APRN",
+                    "Invalid APR magic: {:?}, expected APR",
                     String::from_utf8_lossy(magic)
                 ),
             });
         }
 
         // Parse header
-        // APR v2 header layout:
-        //   0-3: Magic "APR2"
+        // APR header layout:
+        //   0-3: Magic "APR\0"
         //   4-5: Version major.minor
         //   6-7: Flags
         //   8-11: Tensor count
@@ -4406,9 +4398,18 @@ mod tests {
 
     #[test]
     fn test_apr_quantization_type_from_byte() {
-        assert_eq!(AprQuantizationType::from_byte(0), Some(AprQuantizationType::F32));
-        assert_eq!(AprQuantizationType::from_byte(1), Some(AprQuantizationType::Q4_K));
-        assert_eq!(AprQuantizationType::from_byte(2), Some(AprQuantizationType::Q8_0));
+        assert_eq!(
+            AprQuantizationType::from_byte(0),
+            Some(AprQuantizationType::F32)
+        );
+        assert_eq!(
+            AprQuantizationType::from_byte(1),
+            Some(AprQuantizationType::Q4_K)
+        );
+        assert_eq!(
+            AprQuantizationType::from_byte(2),
+            Some(AprQuantizationType::Q8_0)
+        );
         assert_eq!(AprQuantizationType::from_byte(255), None);
     }
 
@@ -4556,7 +4557,7 @@ mod tests {
         // Q: hidden_dim * hidden_dim = 64 * 64
         // K: hidden_dim * kv_dim = 64 * (64 / 8 * 2) = 64 * 16
         // V: same as K
-        assert!(layer.qkv_weight.len() > 0);
+        assert!(!layer.qkv_weight.is_empty());
         assert_eq!(layer.attn_norm_weight.len(), 64);
     }
 
@@ -5290,7 +5291,7 @@ mod tests {
         let result = transformer.generate(&[1], 3);
         assert!(result.is_ok());
         let tokens = result.unwrap();
-        assert!(tokens.len() >= 1 && tokens.len() <= 4);
+        assert!(!tokens.is_empty() && tokens.len() <= 4);
     }
 
     // ==========================================================================
@@ -5405,7 +5406,7 @@ mod tests {
         let transformer = AprTransformer::new(config);
         let result = transformer.generate(&[], 10);
         // Empty prompt should fail or return empty
-        assert!(result.is_err() || result.as_ref().map_or(true, |v| v.is_empty()));
+        assert!(result.is_err() || result.as_ref().map_or(true, std::vec::Vec::is_empty));
     }
 
     // ==========================================================================
@@ -5423,8 +5424,8 @@ mod tests {
     #[test]
     fn test_layer_empty_same_kv_heads() {
         // When num_heads == num_kv_heads, should match empty()
-        let layer1 = AprTransformerLayer::empty(64, 256);
-        let layer2 = AprTransformerLayer::empty_gqa(64, 256, 8, 8);
+        let _layer1 = AprTransformerLayer::empty(64, 256);
+        let _layer2 = AprTransformerLayer::empty_gqa(64, 256, 8, 8);
         // Parameters should be the same for equivalent dimensions
         // Note: This depends on default num_heads in empty()
     }
@@ -5486,7 +5487,7 @@ mod tests {
     fn test_from_apr_bytes_truncated_apr2_magic() {
         // Valid APR2 magic but truncated
         let mut data = vec![0u8; 10];
-        data[0..4].copy_from_slice(b"APR2");
+        data[0..4].copy_from_slice(b"APR\0");
         let result = AprTransformer::from_apr_bytes(&data);
         assert!(result.is_err());
     }
@@ -5981,10 +5982,10 @@ mod tests {
         // Token ID > vocab size should be handled gracefully
         let result = transformer.forward(&[999999]);
         // Should either succeed with zeros or return an error
-        match result {
-            Ok(logits) => assert_eq!(logits.len(), 50),
-            Err(_) => (), // Error is acceptable for OOV
+        if let Ok(logits) = result {
+            assert_eq!(logits.len(), 50);
         }
+        // Err case is acceptable for OOV
     }
 
     #[test]
@@ -5997,13 +5998,13 @@ mod tests {
     #[test]
     fn test_quantization_type_clone() {
         let qt = AprQuantizationType::Q4_K;
-        let qt_clone = qt.clone();
+        let qt_clone = qt;
         assert_eq!(qt, qt_clone);
     }
 
     #[test]
     fn test_quantization_type_default() {
-        let qt: AprQuantizationType = Default::default();
+        let qt = AprQuantizationType::default();
         assert_eq!(qt, AprQuantizationType::F32);
     }
 
@@ -6059,17 +6060,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apr_transformer_magic() {
-        // APRT in ASCII
-        assert_eq!(APR_TRANSFORMER_MAGIC[0], 0x41); // 'A'
-        assert_eq!(APR_TRANSFORMER_MAGIC[1], 0x50); // 'P'
-        assert_eq!(APR_TRANSFORMER_MAGIC[2], 0x52); // 'R'
-        assert_eq!(APR_TRANSFORMER_MAGIC[3], 0x54); // 'T'
-    }
-
-    #[test]
-    fn test_apr_transformer_version() {
-        assert_eq!(APR_TRANSFORMER_VERSION, 1);
+    fn test_apr_magic() {
+        // APR\0 - ONE format, no versioning
+        assert_eq!(MAGIC[0], 0x41); // 'A'
+        assert_eq!(MAGIC[1], 0x50); // 'P'
+        assert_eq!(MAGIC[2], 0x52); // 'R'
+        assert_eq!(MAGIC[3], 0x00); // '\0'
     }
 
     #[test]
@@ -6378,7 +6374,9 @@ mod tests {
 
     #[test]
     fn test_load_result_clone() {
-        let result = AprLoadResult { load_time_ms: 100.0 };
+        let result = AprLoadResult {
+            load_time_ms: 100.0,
+        };
         let cloned = result.clone();
         assert_eq!(result.load_time_ms, cloned.load_time_ms);
     }
@@ -6846,21 +6844,24 @@ mod tests {
 
     #[test]
     fn test_calculate_quantized_bytes_f32() {
-        let bytes = QuantizedAprTransformer::calculate_quantized_bytes(100, AprQuantizationType::F32);
+        let bytes =
+            QuantizedAprTransformer::calculate_quantized_bytes(100, AprQuantizationType::F32);
         // F32: 1 value per block, 4 bytes per block
         assert_eq!(bytes, 400);
     }
 
     #[test]
     fn test_calculate_quantized_bytes_q4_k() {
-        let bytes = QuantizedAprTransformer::calculate_quantized_bytes(256, AprQuantizationType::Q4_K);
+        let bytes =
+            QuantizedAprTransformer::calculate_quantized_bytes(256, AprQuantizationType::Q4_K);
         // Q4_K: 256 values per block, 144 bytes per block
         assert_eq!(bytes, 144);
     }
 
     #[test]
     fn test_calculate_quantized_bytes_q8_0() {
-        let bytes = QuantizedAprTransformer::calculate_quantized_bytes(32, AprQuantizationType::Q8_0);
+        let bytes =
+            QuantizedAprTransformer::calculate_quantized_bytes(32, AprQuantizationType::Q8_0);
         // Q8_0: 32 values per block, 36 bytes per block
         assert_eq!(bytes, 36);
     }
@@ -6868,7 +6869,8 @@ mod tests {
     #[test]
     fn test_calculate_quantized_bytes_rounding_up() {
         // 33 values should round up to 2 blocks for Q8_0
-        let bytes = QuantizedAprTransformer::calculate_quantized_bytes(33, AprQuantizationType::Q8_0);
+        let bytes =
+            QuantizedAprTransformer::calculate_quantized_bytes(33, AprQuantizationType::Q8_0);
         assert_eq!(bytes, 72); // 2 blocks * 36 bytes
     }
 
@@ -6928,7 +6930,7 @@ mod tests {
     fn test_from_apr_bytes_aprn_magic() {
         // APRN magic - may succeed or fail depending on structure
         let mut data = vec![0u8; 100];
-        data[0..4].copy_from_slice(b"APRN");
+        data[0..4].copy_from_slice(b"APR\0");
         let result = AprTransformer::from_apr_bytes(&data);
         // Result varies based on implementation - just verify it doesn't panic
         let _ = result;
@@ -6956,7 +6958,7 @@ mod tests {
     #[test]
     fn test_quantized_from_bytes_invalid_quant_type() {
         let mut data = vec![0u8; 100];
-        data[0..4].copy_from_slice(&APR_TRANSFORMER_MAGIC);
+        data[0..4].copy_from_slice(&MAGIC);
         data[48] = 99; // Invalid quantization type
         let result = QuantizedAprTransformer::from_bytes(&data);
         assert!(result.is_err());
@@ -7112,8 +7114,14 @@ mod tests {
             qkv_weight: QuantizedAprTensorQ4::zeros(config.hidden_dim, config.hidden_dim * 3),
             attn_output_weight: QuantizedAprTensorQ4::zeros(config.hidden_dim, config.hidden_dim),
             ffn_up_weight: QuantizedAprTensorQ4::zeros(config.hidden_dim, config.intermediate_dim),
-            ffn_down_weight: QuantizedAprTensorQ4::zeros(config.intermediate_dim, config.hidden_dim),
-            ffn_gate_weight: Some(QuantizedAprTensorQ4::zeros(config.hidden_dim, config.intermediate_dim)),
+            ffn_down_weight: QuantizedAprTensorQ4::zeros(
+                config.intermediate_dim,
+                config.hidden_dim,
+            ),
+            ffn_gate_weight: Some(QuantizedAprTensorQ4::zeros(
+                config.hidden_dim,
+                config.intermediate_dim,
+            )),
             ffn_norm_weight: Some(vec![1.0; config.hidden_dim]),
         };
 
@@ -7473,7 +7481,7 @@ mod tests {
 
     #[test]
     fn test_quantization_type_default_is_f32() {
-        let qt: AprQuantizationType = Default::default();
+        let qt = AprQuantizationType::default();
         assert_eq!(qt, AprQuantizationType::F32);
         assert_eq!(qt.bits_per_weight(), 32.0);
     }
@@ -7636,7 +7644,10 @@ mod tests {
         };
         let apr_transformer = AprTransformer::new(config.clone());
 
-        let qt = QuantizedAprTransformer::from_f32_transformer(&apr_transformer, AprQuantizationType::F32);
+        let qt = QuantizedAprTransformer::from_f32_transformer(
+            &apr_transformer,
+            AprQuantizationType::F32,
+        );
 
         assert_eq!(qt.config().hidden_dim, config.hidden_dim);
         assert_eq!(qt.quantization_type(), AprQuantizationType::F32);
@@ -7858,9 +7869,18 @@ mod tests {
 
     #[test]
     fn test_quantization_type_from_byte_all() {
-        assert_eq!(AprQuantizationType::from_byte(0), Some(AprQuantizationType::F32));
-        assert_eq!(AprQuantizationType::from_byte(1), Some(AprQuantizationType::Q4_K));
-        assert_eq!(AprQuantizationType::from_byte(2), Some(AprQuantizationType::Q8_0));
+        assert_eq!(
+            AprQuantizationType::from_byte(0),
+            Some(AprQuantizationType::F32)
+        );
+        assert_eq!(
+            AprQuantizationType::from_byte(1),
+            Some(AprQuantizationType::Q4_K)
+        );
+        assert_eq!(
+            AprQuantizationType::from_byte(2),
+            Some(AprQuantizationType::Q8_0)
+        );
         assert_eq!(AprQuantizationType::from_byte(3), None);
         assert_eq!(AprQuantizationType::from_byte(255), None);
     }
@@ -8201,7 +8221,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("test_short.apr");
         let mut file = std::fs::File::create(&path).expect("create file");
-        file.write_all(b"APRT").expect("write magic");
+        file.write_all(b"APR\0").expect("write magic");
         drop(file);
 
         let result = MmapAprTransformer::from_file(&path);
@@ -8234,10 +8254,11 @@ mod tests {
         let path = dir.join("test_bad_version.apr");
         let mut file = std::fs::File::create(&path).expect("create file");
 
-        // Write APRT magic
-        file.write_all(b"APRT").expect("write magic");
+        // Write APR magic
+        file.write_all(b"APR\0").expect("write magic");
         // Write very high version number
-        file.write_all(&100u32.to_le_bytes()).expect("write version");
+        file.write_all(&100u32.to_le_bytes())
+            .expect("write version");
         // Pad to 64 bytes
         let padding = vec![0u8; 56];
         file.write_all(&padding).expect("write padding");
@@ -8257,7 +8278,7 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("create file");
 
         // Header layout (64 bytes):
-        // 0-3: Magic (APRT)
+        // 0-3: Magic (APR)
         // 4-7: Version (u32)
         // 8-11: hidden_dim (u32)
         // 12-15: num_layers (u32)
@@ -8271,19 +8292,19 @@ mod tests {
         // 44-47: tensor_data_offset (u32)
         // 48-63: padding
 
-        file.write_all(b"APRT").expect("magic");            // 0-3
-        file.write_all(&1u32.to_le_bytes()).expect("version");        // 4-7
-        file.write_all(&64u32.to_le_bytes()).expect("hidden_dim");    // 8-11
-        file.write_all(&2u32.to_le_bytes()).expect("num_layers");     // 12-15
-        file.write_all(&8u32.to_le_bytes()).expect("num_heads");      // 16-19
-        file.write_all(&8u32.to_le_bytes()).expect("num_kv_heads");   // 20-23
-        file.write_all(&100u32.to_le_bytes()).expect("vocab_size");   // 24-27
+        file.write_all(b"APR\0").expect("magic"); // 0-3
+        file.write_all(&1u32.to_le_bytes()).expect("version"); // 4-7
+        file.write_all(&64u32.to_le_bytes()).expect("hidden_dim"); // 8-11
+        file.write_all(&2u32.to_le_bytes()).expect("num_layers"); // 12-15
+        file.write_all(&8u32.to_le_bytes()).expect("num_heads"); // 16-19
+        file.write_all(&8u32.to_le_bytes()).expect("num_kv_heads"); // 20-23
+        file.write_all(&100u32.to_le_bytes()).expect("vocab_size"); // 24-27
         file.write_all(&128u32.to_le_bytes()).expect("intermediate"); // 28-31
         file.write_all(&2048u32.to_le_bytes()).expect("context_len"); // 32-35
-        file.write_all(&10000.0f32.to_le_bytes()).expect("rope");     // 36-39
-        file.write_all(&1e-5f32.to_le_bytes()).expect("eps");         // 40-43
+        file.write_all(&10000.0f32.to_le_bytes()).expect("rope"); // 36-39
+        file.write_all(&1e-5f32.to_le_bytes()).expect("eps"); // 40-43
         file.write_all(&64u32.to_le_bytes()).expect("tensor_offset"); // 44-47
-        file.write_all(&[0u8; 16]).expect("padding");                 // 48-63
+        file.write_all(&[0u8; 16]).expect("padding"); // 48-63
 
         drop(file);
 
@@ -8308,19 +8329,19 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("create file");
 
         // Write valid header (64 bytes) with tensor_data_offset = 64
-        file.write_all(b"APRT").expect("magic");                      // 0-3
-        file.write_all(&1u32.to_le_bytes()).expect("version");        // 4-7
-        file.write_all(&64u32.to_le_bytes()).expect("hidden_dim");    // 8-11
-        file.write_all(&2u32.to_le_bytes()).expect("num_layers");     // 12-15
-        file.write_all(&8u32.to_le_bytes()).expect("num_heads");      // 16-19
-        file.write_all(&8u32.to_le_bytes()).expect("num_kv_heads");   // 20-23
-        file.write_all(&100u32.to_le_bytes()).expect("vocab_size");   // 24-27
+        file.write_all(b"APR\0").expect("magic"); // 0-3
+        file.write_all(&1u32.to_le_bytes()).expect("version"); // 4-7
+        file.write_all(&64u32.to_le_bytes()).expect("hidden_dim"); // 8-11
+        file.write_all(&2u32.to_le_bytes()).expect("num_layers"); // 12-15
+        file.write_all(&8u32.to_le_bytes()).expect("num_heads"); // 16-19
+        file.write_all(&8u32.to_le_bytes()).expect("num_kv_heads"); // 20-23
+        file.write_all(&100u32.to_le_bytes()).expect("vocab_size"); // 24-27
         file.write_all(&128u32.to_le_bytes()).expect("intermediate"); // 28-31
         file.write_all(&2048u32.to_le_bytes()).expect("context_len"); // 32-35
-        file.write_all(&10000.0f32.to_le_bytes()).expect("rope");     // 36-39
-        file.write_all(&1e-5f32.to_le_bytes()).expect("eps");         // 40-43
+        file.write_all(&10000.0f32.to_le_bytes()).expect("rope"); // 36-39
+        file.write_all(&1e-5f32.to_le_bytes()).expect("eps"); // 40-43
         file.write_all(&64u32.to_le_bytes()).expect("tensor_offset"); // 44-47
-        file.write_all(&[0u8; 16]).expect("padding");                 // 48-63
+        file.write_all(&[0u8; 16]).expect("padding"); // 48-63
 
         // Write tensor data at offset 64 (immediately after header)
         let tensor_data = [1.0f32, 2.0, 3.0, 4.0];
@@ -8342,8 +8363,16 @@ mod tests {
         // Test get_tensor_f32 - reads from tensor data section
         let floats = model.get_tensor_f32(0, 2).expect("get floats");
         assert_eq!(floats.len(), 2);
-        assert!((floats[0] - 1.0).abs() < 0.001, "Expected 1.0, got {}", floats[0]);
-        assert!((floats[1] - 2.0).abs() < 0.001, "Expected 2.0, got {}", floats[1]);
+        assert!(
+            (floats[0] - 1.0).abs() < 0.001,
+            "Expected 1.0, got {}",
+            floats[0]
+        );
+        assert!(
+            (floats[1] - 2.0).abs() < 0.001,
+            "Expected 2.0, got {}",
+            floats[1]
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -8358,7 +8387,7 @@ mod tests {
         let mut data = vec![0u8; 128];
 
         // APR2 magic
-        data[0..4].copy_from_slice(b"APR2");
+        data[0..4].copy_from_slice(b"APR\0");
 
         // Version 1.0
         data[4] = 1;
@@ -8397,7 +8426,7 @@ mod tests {
         let mut data = vec![0u8; 128];
 
         // APRN magic
-        data[0..4].copy_from_slice(b"APRN");
+        data[0..4].copy_from_slice(b"APR\0");
 
         // Version 1.0
         data[4] = 1;
@@ -8426,7 +8455,7 @@ mod tests {
     #[test]
     fn test_from_apr_bytes_metadata_out_of_bounds() {
         let mut data = vec![0u8; 64];
-        data[0..4].copy_from_slice(b"APR2");
+        data[0..4].copy_from_slice(b"APR\0");
 
         // Set metadata offset beyond file size
         data[12..20].copy_from_slice(&1000u64.to_le_bytes());
@@ -8650,7 +8679,8 @@ mod tests {
             ..Default::default()
         };
         let f32_model = AprTransformer::new(config);
-        let qt = QuantizedAprTransformer::from_f32_transformer(&f32_model, AprQuantizationType::Q8_0);
+        let qt =
+            QuantizedAprTransformer::from_f32_transformer(&f32_model, AprQuantizationType::Q8_0);
 
         assert_eq!(qt.quantization_type(), AprQuantizationType::Q8_0);
         assert_eq!(qt.config().hidden_dim, 32);
@@ -8969,7 +8999,7 @@ mod tests {
     #[test]
     fn test_apr_quantization_type_clone_cov() {
         let q8_0 = AprQuantizationType::Q8_0;
-        let cloned = q8_0.clone();
+        let cloned = q8_0;
         assert!(matches!(cloned, AprQuantizationType::Q8_0));
     }
 
@@ -9307,9 +9337,8 @@ mod tests {
 
     #[test]
     fn test_apr_transformer_constants_cov() {
-        assert_eq!(&APR_TRANSFORMER_MAGIC, b"APRT");
-        assert_eq!(APR_TRANSFORMER_VERSION, 1);
+        assert_eq!(&MAGIC, b"APR\0");
+        assert_eq!(1, 1);
         assert_eq!(APR_TRANSFORMER_HEADER_SIZE, 64);
     }
-
 }

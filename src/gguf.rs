@@ -34,10 +34,6 @@ use rand::Rng;
 use memmap2::Mmap;
 use trueno::{Matrix as TruenoMatrix, Vector as TruenoVector};
 
-// GPU backend for accelerated attention computation (PARITY-002)
-#[cfg(feature = "gpu")]
-use trueno::backends::gpu::GpuBackend;
-
 // CUDA PTX generation for NVIDIA GPUs (IMP-311)
 #[cfg(feature = "cuda")]
 use trueno_gpu::kernels::{AttentionKernel, Kernel, QuantizeKernel};
@@ -116,6 +112,59 @@ pub type AttentionBuffer = smallvec::SmallVec<[f32; ATTENTION_BUFFER_INLINE_CAP]
 /// Hidden state buffer with inline storage (IMP-117)
 /// Uses SmallVec for stack allocation when size <= HIDDEN_BUFFER_INLINE_CAP
 pub type HiddenBuffer = smallvec::SmallVec<[f32; HIDDEN_BUFFER_INLINE_CAP]>;
+
+/// Convert GPT-2 style byte-level BPE unicode character back to raw byte.
+///
+/// GPT-2's byte-level BPE uses a mapping where:
+/// - Printable ASCII (0x21-0x7E) and Latin-1 (0xA1-0xAC, 0xAE-0xFF) map to themselves
+/// - Other bytes (0x00-0x20, 0x7F-0xA0, 0xAD) map to U+0100-U+0143
+///
+/// This function returns the original byte value for a GPT-2 BPE token character.
+#[inline]
+fn gpt2_unicode_to_byte(c: char) -> Option<u8> {
+    let cp = c as u32;
+
+    // Special encoded bytes: U+0100 to U+0143 map back to non-printable/special bytes
+    // The mapping fills in the "gaps" in the printable range
+    if (0x0100..=0x0143).contains(&cp) {
+        // Build the inverse mapping for these special chars
+        // Gaps: 0x00-0x20 (33 bytes), 0x7F (1 byte), 0x80-0xA0 (33 bytes), 0xAD (1 byte) = 68 total
+        // But GPT-2 only maps 33+1+33 = 67 chars, plus special handling
+        let offset = (cp - 0x0100) as u8;
+        // The special bytes in order: 0x00-0x20 (0-32), then 0x7F (33), then 0x80-0xA0 (34-66), then 0xAD (67)
+        let byte = if offset <= 32 {
+            offset // 0x00-0x20
+        } else if offset == 33 {
+            0x7F // DEL
+        } else if offset <= 66 {
+            0x80 + (offset - 34) // 0x80-0xA0
+        } else if offset == 67 {
+            0xAD // Soft hyphen
+        } else {
+            return None; // Invalid
+        };
+        return Some(byte);
+    }
+
+    // Printable ASCII range: 0x21-0x7E maps to itself
+    if (0x21..=0x7E).contains(&cp) {
+        return Some(cp as u8);
+    }
+
+    // Latin-1 supplement ranges that map to themselves:
+    // 0xA1-0xAC and 0xAE-0xFF
+    if (0xA1..=0xAC).contains(&cp) || (0xAE..=0xFF).contains(&cp) {
+        return Some(cp as u8);
+    }
+
+    // Fallback: try direct conversion for any other character
+    // This handles edge cases and allows partial decoding
+    if cp < 256 {
+        Some(cp as u8)
+    } else {
+        None // Character doesn't map to a byte
+    }
+}
 
 /// GGUF metadata value types
 #[derive(Debug, Clone, PartialEq)]
@@ -1310,19 +1359,28 @@ impl GGUFModel {
                     }
                 }
 
-                // Regular token - convert to bytes
-                bytes.extend_from_slice(token.as_bytes());
+                // For GPT-2 style tokenizers, decode byte-level BPE properly
+                // Each unicode character in the token represents a raw byte
+                if is_gpt2_style {
+                    for c in token.chars() {
+                        if let Some(byte) = gpt2_unicode_to_byte(c) {
+                            bytes.push(byte);
+                        }
+                    }
+                } else {
+                    // SentencePiece style - tokens are regular strings
+                    bytes.extend_from_slice(token.as_bytes());
+                }
             }
 
             // Decode bytes as UTF-8 (lossy for invalid sequences)
             let raw = String::from_utf8_lossy(&bytes).into_owned();
 
-            // Post-process BPE markers
-            if is_gpt2_style {
-                raw.replace('\u{0120}', " ")  // Ġ → space
-                   .replace('\u{010A}', "\n") // Ċ → newline
-            } else {
+            // Post-process BPE markers (only for SentencePiece, GPT-2 already handled)
+            if !is_gpt2_style {
                 raw.replace('▁', " ") // SentencePiece word boundary
+            } else {
+                raw
             }
         } else {
             // Fallback to ASCII if no vocabulary
@@ -1807,342 +1865,6 @@ impl GGUFTransformer {
         })
     }
 
-    /// Look up token embeddings
-    ///
-    /// # Arguments
-    ///
-    /// * `token_ids` - Token IDs to look up
-    ///
-    /// # Returns
-    ///
-    /// Embedding matrix [seq_len, hidden_dim]
-    pub fn embed(&self, token_ids: &[u32]) -> Vec<f32> {
-        let hidden_dim = self.config.hidden_dim;
-        let mut embeddings = Vec::with_capacity(token_ids.len() * hidden_dim);
-
-        for &token_id in token_ids {
-            let start = (token_id as usize) * hidden_dim;
-            let end = start + hidden_dim;
-            if end <= self.token_embedding.len() {
-                embeddings.extend_from_slice(&self.token_embedding[start..end]);
-            } else {
-                // Pad with zeros for out-of-bounds tokens
-                embeddings.extend(std::iter::repeat_n(0.0, hidden_dim));
-            }
-        }
-
-        embeddings
-    }
-
-    /// Apply layer normalization using trueno SIMD (IMP-304e)
-    /// Achieves 20-26x speedup over scalar implementation
-    fn layer_norm(
-        &self,
-        input: &[f32],
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        eps: f32,
-    ) -> Vec<f32> {
-        let hidden_dim = weight.len();
-        let seq_len = input.len() / hidden_dim;
-        let mut output = Vec::with_capacity(input.len());
-
-        // Pre-create trueno vectors for weight and bias (reused across positions)
-        let weight_vec = TruenoVector::from_slice(weight);
-        let bias_vec = bias.map(TruenoVector::from_slice);
-        let zero_bias = TruenoVector::from_slice(&vec![0.0f32; hidden_dim]);
-
-        for i in 0..seq_len {
-            let start = i * hidden_dim;
-            let end = start + hidden_dim;
-            let x = &input[start..end];
-
-            // Use trueno SIMD layer_norm (20-26x faster than scalar)
-            let input_vec = TruenoVector::from_slice(x);
-            let normed = input_vec
-                .layer_norm(&weight_vec, bias_vec.as_ref().unwrap_or(&zero_bias), eps)
-                .expect("trueno layer_norm failed");
-
-            output.extend_from_slice(normed.as_slice());
-        }
-
-        output
-    }
-
-    /// Matrix-vector multiplication using trueno SIMD (IMP-302e)
-    /// Achieves significant speedup over scalar triple-nested loop
-    /// Falls back to scalar if dimensions don't match (different model architectures)
-    fn matmul(&self, input: &[f32], weight: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
-        let seq_len = input.len() / in_dim;
-        let expected_weight_len = out_dim * in_dim;
-
-        // Validate dimensions - fall back to scalar for mismatched architectures
-        if weight.len() != expected_weight_len {
-            return self.matmul_scalar(input, weight, in_dim, out_dim);
-        }
-
-        let mut output = Vec::with_capacity(seq_len * out_dim);
-
-        // Create trueno matrix from weights (row-major: out_dim rows × in_dim cols)
-        // Weight layout: W[o,i] at index o * in_dim + i
-        let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weight.to_vec()) {
-            Ok(m) => m,
-            Err(_) => return self.matmul_scalar(input, weight, in_dim, out_dim),
-        };
-
-        for s in 0..seq_len {
-            let x_start = s * in_dim;
-            let x_end = x_start + in_dim;
-            let x_slice = &input[x_start..x_end];
-
-            // Use trueno SIMD matvec: W × x
-            let x_vec = TruenoVector::from_slice(x_slice);
-            let result = match weight_matrix.matvec(&x_vec) {
-                Ok(r) => r,
-                Err(_) => return self.matmul_scalar(input, weight, in_dim, out_dim),
-            };
-
-            output.extend_from_slice(result.as_slice());
-        }
-
-        output
-    }
-
-    /// Scalar fallback for matmul when dimensions don't match trueno expectations
-    fn matmul_scalar(
-        &self,
-        input: &[f32],
-        weight: &[f32],
-        in_dim: usize,
-        out_dim: usize,
-    ) -> Vec<f32> {
-        let seq_len = input.len() / in_dim;
-        let mut output = Vec::with_capacity(seq_len * out_dim);
-
-        for s in 0..seq_len {
-            for o in 0..out_dim {
-                let mut sum = 0.0f32;
-                for i in 0..in_dim {
-                    let x_idx = s * in_dim + i;
-                    let w_idx = o * in_dim + i;
-                    if x_idx < input.len() && w_idx < weight.len() {
-                        sum += input[x_idx] * weight[w_idx];
-                    }
-                }
-                output.push(sum);
-            }
-        }
-
-        output
-    }
-
-    /// Add bias to output
-    fn add_bias(&self, output: &mut [f32], bias: &[f32]) {
-        let out_dim = bias.len();
-        let seq_len = output.len() / out_dim;
-        for s in 0..seq_len {
-            for o in 0..out_dim {
-                output[s * out_dim + o] += bias[o];
-            }
-        }
-    }
-
-    /// Apply GELU activation using trueno SIMD (IMP-303e)
-    fn gelu(&self, input: &mut [f32]) {
-        // Use trueno SIMD GELU for vectorized activation
-        let input_vec = TruenoVector::from_slice(input);
-        let activated = input_vec.gelu().expect("trueno gelu failed");
-        input.copy_from_slice(activated.as_slice());
-    }
-
-    /// Simple forward pass for next-token prediction
-    ///
-    /// This is a simplified forward pass without KV caching or RoPE,
-    /// suitable for testing and simple use cases.
-    ///
-    /// # Arguments
-    ///
-    /// * `token_ids` - Input token IDs
-    ///
-    /// # Returns
-    ///
-    /// Logits for next token prediction [vocab_size]
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if tensor operations fail during the forward pass.
-    pub fn forward(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let hidden_dim = self.config.hidden_dim;
-        let intermediate_dim = self.config.intermediate_dim;
-
-        // 1. Token embedding lookup
-        let mut hidden = self.embed(token_ids);
-
-        // 2. Process through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // 2a. Attention layer norm
-            let normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // 2b. QKV projection
-            // For phi-2: qkv_weight is [hidden_dim, 3*hidden_dim]
-            let qkv_dim = 3 * hidden_dim;
-            let mut qkv = self.matmul(&normed, &layer.qkv_weight, hidden_dim, qkv_dim);
-            if let Some(ref bias) = layer.qkv_bias {
-                self.add_bias(&mut qkv, bias);
-            }
-
-            // 2c. For simplicity, skip actual attention and just use averaged QKV
-            // (Real attention would need RoPE, causal masking, and proper attention)
-            // Here we do a very simplified version for testing
-            let seq_len = token_ids.len();
-            let mut attn_out = Vec::with_capacity(seq_len * hidden_dim);
-
-            // Average Q, K, V and project through attention output
-            for s in 0..seq_len {
-                let qkv_start = s * qkv_dim;
-                // Extract Q for this position (simplified)
-                for h in 0..hidden_dim {
-                    attn_out.push(qkv[qkv_start + h]); // Just use Q for now
-                }
-            }
-
-            // 2d. Attention output projection
-            let mut attn_output =
-                self.matmul(&attn_out, &layer.attn_output_weight, hidden_dim, hidden_dim);
-            if let Some(ref bias) = layer.attn_output_bias {
-                self.add_bias(&mut attn_output, bias);
-            }
-
-            // 2e. Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += attn_output[i];
-            }
-
-            // 2f. FFN (for phi-2, no separate ffn_norm, uses same norm)
-            // FFN up projection
-            let mut ffn_hidden =
-                self.matmul(&hidden, &layer.ffn_up_weight, hidden_dim, intermediate_dim);
-            if let Some(ref bias) = layer.ffn_up_bias {
-                self.add_bias(&mut ffn_hidden, bias);
-            }
-
-            // GELU activation
-            self.gelu(&mut ffn_hidden);
-
-            // FFN down projection
-            let mut ffn_output = self.matmul(
-                &ffn_hidden,
-                &layer.ffn_down_weight,
-                intermediate_dim,
-                hidden_dim,
-            );
-            if let Some(ref bias) = layer.ffn_down_bias {
-                self.add_bias(&mut ffn_output, bias);
-            }
-
-            // Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_output[i];
-            }
-
-            if layer_idx == 0 {
-                // Print first layer stats for debugging
-                let min = hidden.iter().copied().fold(f32::INFINITY, f32::min);
-                let max = hidden.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mean: f32 = hidden.iter().sum::<f32>() / hidden.len() as f32;
-                eprintln!(
-                    "Layer 0 output: min={:.4}, max={:.4}, mean={:.4}",
-                    min, max, mean
-                );
-            }
-        }
-
-        // 3. Final layer norm
-        let normed = self.layer_norm(
-            &hidden,
-            &self.output_norm_weight,
-            self.output_norm_bias.as_deref(),
-            self.config.eps,
-        );
-
-        // 4. LM head projection (only for last token)
-        let seq_len = token_ids.len();
-        let last_hidden_start = (seq_len - 1) * hidden_dim;
-        let last_hidden = &normed[last_hidden_start..last_hidden_start + hidden_dim];
-
-        // LM head projection using trueno SIMD (IMP-702: major bottleneck optimization)
-        // For vocab_size=51200, this was the biggest scalar bottleneck
-        let lm_head_size = self.lm_head_weight.len();
-        let expected_size = hidden_dim * self.config.vocab_size;
-        let use_transposed = lm_head_size == expected_size;
-
-        // Use trueno SIMD matmul for LM head projection
-        let logits = if use_transposed {
-            // Transposed layout: [vocab_size, hidden_dim] - standard matmul
-            // Result: [vocab_size] = lm_head_weight × last_hidden
-            self.matmul(
-                last_hidden,
-                &self.lm_head_weight,
-                hidden_dim,
-                self.config.vocab_size,
-            )
-        } else {
-            // Standard layout: [hidden_dim, vocab_size] - need column extraction
-            // Fall back to SIMD dot products per output
-            let mut logits = Vec::with_capacity(self.config.vocab_size);
-            let hidden_vec = TruenoVector::from_slice(last_hidden);
-
-            for o in 0..self.config.vocab_size {
-                // Extract column o from [hidden_dim, vocab_size] layout
-                let col: Vec<f32> = (0..hidden_dim)
-                    .map(|i| {
-                        let idx = i * self.config.vocab_size + o;
-                        if idx < lm_head_size {
-                            self.lm_head_weight[idx]
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect();
-                let col_vec = TruenoVector::from_slice(&col);
-                let sum = hidden_vec.dot(&col_vec).unwrap_or(0.0);
-                logits.push(sum);
-            }
-            logits
-        };
-
-        // Add bias if present
-        let mut logits = logits;
-        if let Some(ref bias) = self.lm_head_bias {
-            for (o, logit) in logits.iter_mut().enumerate() {
-                *logit += bias[o];
-            }
-        }
-
-        Ok(logits)
-    }
-
-    /// Get the most likely next token
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the forward pass fails.
-    pub fn predict_next(&self, token_ids: &[u32]) -> Result<u32> {
-        let logits = self.forward(token_ids)?;
-        let (max_idx, _) = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| RealizarError::InvalidShape {
-                reason: "Empty logits".to_string(),
-            })?;
-        Ok(max_idx as u32)
-    }
 }
 
 // ============================================================================
@@ -2580,1861 +2302,6 @@ impl<'a> QuantizedGGUFTransformer<'a> {
         })
     }
 
-    /// Get tensor data slice from memory-mapped file
-    #[inline]
-    fn tensor_data(&self, tensor_ref: &QuantizedTensorRef) -> &[u8] {
-        &self.data[tensor_ref.offset..tensor_ref.offset + tensor_ref.byte_size]
-    }
-
-    /// Fused quantized matrix-vector multiply with parallel processing (Phase 2+3)
-    ///
-    /// Performs dequantization inline with dot product - NO intermediate buffer.
-    /// Uses rayon parallel iterators per Blumofe & Leiserson [6] for multi-core acceleration.
-    ///
-    /// Supports Q4_K, Q5_K, Q6_K with fused operations, and Q4_0/Q4_1/Q5_0/Q8_0 via dequantization.
-    fn fused_matmul(
-        &self,
-        input: &[f32],
-        weight_ref: &QuantizedTensorRef,
-        in_dim: usize,
-        out_dim: usize,
-    ) -> Result<Vec<f32>> {
-        use crate::quantize::{
-            dequantize_q4_1, dequantize_q5_0, fused_q4_0_q8_0_parallel_matvec,
-            fused_q4k_parallel_matvec, fused_q5k_parallel_matvec, fused_q6k_parallel_matvec,
-            fused_q8_0_q8_0_parallel_matvec,
-        };
-
-        let seq_len = input.len() / in_dim;
-        let weight_data = self.tensor_data(weight_ref);
-
-        // For Q4_0, use fused Q8_0 integer SIMD matmul (llama.cpp parity)
-        if weight_ref.qtype == GGUF_TYPE_Q4_0 {
-            if seq_len == 1 {
-                return fused_q4_0_q8_0_parallel_matvec(weight_data, input, in_dim, out_dim);
-            }
-            let mut output = Vec::with_capacity(seq_len * out_dim);
-            for s in 0..seq_len {
-                let x = &input[s * in_dim..(s + 1) * in_dim];
-                let row_output = fused_q4_0_q8_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
-                output.extend_from_slice(&row_output);
-            }
-            return Ok(output);
-        }
-
-        // For Q8_0, use fused Q8_0 × Q8_0 integer SIMD matmul
-        // This avoids the massive dequantization allocation (544MB for Qwen2.5 LM head)
-        if weight_ref.qtype == GGUF_TYPE_Q8_0 {
-            if seq_len == 1 {
-                return fused_q8_0_q8_0_parallel_matvec(weight_data, input, in_dim, out_dim);
-            }
-            let mut output = Vec::with_capacity(seq_len * out_dim);
-            for s in 0..seq_len {
-                let x = &input[s * in_dim..(s + 1) * in_dim];
-                let row_output = fused_q8_0_q8_0_parallel_matvec(weight_data, x, in_dim, out_dim)?;
-                output.extend_from_slice(&row_output);
-            }
-            return Ok(output);
-        }
-
-        // For Q4_1, use dequantize + SIMD matmul fallback
-        if weight_ref.qtype == GGUF_TYPE_Q4_1 {
-            let weights_f32 = dequantize_q4_1(weight_data)?;
-
-            // Use trueno SIMD for matmul
-            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
-                Ok(m) => m,
-                Err(_) => {
-                    return Err(RealizarError::InvalidShape {
-                        reason: "Failed to create weight matrix for Q4_1".to_string(),
-                    });
-                },
-            };
-
-            let mut output = Vec::with_capacity(seq_len * out_dim);
-            for s in 0..seq_len {
-                let x = &input[s * in_dim..(s + 1) * in_dim];
-                let x_vec = TruenoVector::from_slice(x);
-                match weight_matrix.matvec(&x_vec) {
-                    Ok(r) => output.extend_from_slice(r.as_slice()),
-                    Err(_) => {
-                        return Err(RealizarError::InvalidShape {
-                            reason: "SIMD matvec failed for Q4_1".to_string(),
-                        });
-                    },
-                }
-            }
-            return Ok(output);
-        }
-
-        // For Q5_0, use dequantize + SIMD matmul fallback
-        if weight_ref.qtype == GGUF_TYPE_Q5_0 {
-            let weights_f32 = dequantize_q5_0(weight_data)?;
-
-            // Use trueno SIMD for matmul
-            let weight_matrix = match TruenoMatrix::from_vec(out_dim, in_dim, weights_f32) {
-                Ok(m) => m,
-                Err(_) => {
-                    return Err(RealizarError::InvalidShape {
-                        reason: "Failed to create weight matrix for Q5_0".to_string(),
-                    });
-                },
-            };
-
-            let mut output = Vec::with_capacity(seq_len * out_dim);
-            for s in 0..seq_len {
-                let x = &input[s * in_dim..(s + 1) * in_dim];
-                let x_vec = TruenoVector::from_slice(x);
-                match weight_matrix.matvec(&x_vec) {
-                    Ok(r) => output.extend_from_slice(r.as_slice()),
-                    Err(_) => {
-                        return Err(RealizarError::InvalidShape {
-                            reason: "SIMD matvec failed for Q5_0".to_string(),
-                        });
-                    },
-                }
-            }
-            return Ok(output);
-        }
-
-        // For sequence length > 1, process each position
-        if seq_len > 1 {
-            let mut output = Vec::with_capacity(seq_len * out_dim);
-            for s in 0..seq_len {
-                let x = &input[s * in_dim..(s + 1) * in_dim];
-                let row_output = match weight_ref.qtype {
-                    GGUF_TYPE_Q4_K => fused_q4k_parallel_matvec(weight_data, x, in_dim, out_dim)?,
-                    GGUF_TYPE_Q5_K => fused_q5k_parallel_matvec(weight_data, x, in_dim, out_dim)?,
-                    // Q6_K: All weights are row-major in TinyLlama
-                    GGUF_TYPE_Q6_K => fused_q6k_parallel_matvec(weight_data, x, in_dim, out_dim)?,
-                    _ => {
-                        return Err(RealizarError::UnsupportedOperation {
-                            operation: "fused_matmul".to_string(),
-                            reason: format!(
-                                "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
-                                weight_ref.qtype
-                            ),
-                        });
-                    },
-                };
-                output.extend_from_slice(&row_output);
-            }
-            Ok(output)
-        } else {
-            // Single position - use parallel matvec directly
-            match weight_ref.qtype {
-                GGUF_TYPE_Q4_K => fused_q4k_parallel_matvec(weight_data, input, in_dim, out_dim),
-                GGUF_TYPE_Q5_K => fused_q5k_parallel_matvec(weight_data, input, in_dim, out_dim),
-                // Q6_K: All weights are row-major in TinyLlama
-                GGUF_TYPE_Q6_K => fused_q6k_parallel_matvec(weight_data, input, in_dim, out_dim),
-                _ => Err(RealizarError::UnsupportedOperation {
-                    operation: "fused_matmul".to_string(),
-                    reason: format!(
-                        "Fused matmul only supports Q4_0/Q8_0/Q4_K/Q5_K/Q6_K, got type {}",
-                        weight_ref.qtype
-                    ),
-                }),
-            }
-        }
-    }
-
-    /// QKV projection supporting both fused (phi-2) and separate (llama) formats
-    ///
-    /// Five Whys Root Cause Fix: This method handles both tensor layouts
-    /// transparently, allowing TinyLlama and other LLaMA-style models to work.
-    fn qkv_matmul(&self, input: &[f32], qkv: &QKVWeights, hidden_dim: usize) -> Result<Vec<f32>> {
-        match qkv {
-            QKVWeights::Fused(ref weight) => {
-                let qkv_dim = 3 * hidden_dim;
-                self.fused_matmul(input, weight, hidden_dim, qkv_dim)
-            },
-            QKVWeights::Separate {
-                ref q,
-                ref k,
-                ref v,
-            } => {
-                // Compute Q, K, V separately then concatenate
-                let seq_len = input.len() / hidden_dim;
-
-                // Q projection: [seq_len, hidden_dim] @ [hidden_dim, q_dim]
-                let q_dim = q.num_elements / hidden_dim;
-                let q_out = self.fused_matmul(input, q, hidden_dim, q_dim)?;
-
-                // K projection: [seq_len, hidden_dim] @ [hidden_dim, k_dim]
-                let k_dim = k.num_elements / hidden_dim;
-                let k_out = self.fused_matmul(input, k, hidden_dim, k_dim)?;
-
-                // V projection: [seq_len, hidden_dim] @ [hidden_dim, v_dim]
-                let v_dim = v.num_elements / hidden_dim;
-                let v_out = self.fused_matmul(input, v, hidden_dim, v_dim)?;
-
-                // Interleave Q, K, V for each position: [q0, k0, v0, q1, k1, v1, ...]
-                let qkv_dim = q_dim + k_dim + v_dim;
-                let mut output = Vec::with_capacity(seq_len * qkv_dim);
-                for s in 0..seq_len {
-                    output.extend_from_slice(&q_out[s * q_dim..(s + 1) * q_dim]);
-                    output.extend_from_slice(&k_out[s * k_dim..(s + 1) * k_dim]);
-                    output.extend_from_slice(&v_out[s * v_dim..(s + 1) * v_dim]);
-                }
-                Ok(output)
-            },
-        }
-    }
-
-    /// Look up token embeddings
-    pub fn embed(&self, token_ids: &[u32]) -> Vec<f32> {
-        let hidden_dim = self.config.hidden_dim;
-        let mut embeddings = Vec::with_capacity(token_ids.len() * hidden_dim);
-
-        for &token_id in token_ids {
-            let start = (token_id as usize) * hidden_dim;
-            let end = start + hidden_dim;
-            if end <= self.token_embedding.len() {
-                embeddings.extend_from_slice(&self.token_embedding[start..end]);
-            } else {
-                embeddings.extend(std::iter::repeat_n(0.0, hidden_dim));
-            }
-        }
-
-        embeddings
-    }
-
-    /// Apply layer normalization
-    #[allow(clippy::unused_self)]
-    fn layer_norm(
-        &self,
-        input: &[f32],
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        eps: f32,
-    ) -> Vec<f32> {
-        let hidden_dim = weight.len();
-        let seq_len = input.len() / hidden_dim;
-        let mut output = Vec::with_capacity(input.len());
-
-        for i in 0..seq_len {
-            let start = i * hidden_dim;
-            let end = start + hidden_dim;
-            let x = &input[start..end];
-
-            let mean: f32 = x.iter().sum::<f32>() / hidden_dim as f32;
-            let var: f32 = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / hidden_dim as f32;
-            let inv_std = (var + eps).sqrt().recip();
-
-            for j in 0..hidden_dim {
-                let normalized = (x[j] - mean) * inv_std;
-                let mut val = normalized * weight[j];
-                if let Some(b) = bias {
-                    val += b[j];
-                }
-                output.push(val);
-            }
-        }
-
-        output
-    }
-
-    /// Add bias to output
-    #[allow(clippy::unused_self)]
-    fn add_bias(&self, output: &mut [f32], bias: &[f32]) {
-        let out_dim = bias.len();
-        let seq_len = output.len() / out_dim;
-        for s in 0..seq_len {
-            for o in 0..out_dim {
-                output[s * out_dim + o] += bias[o];
-            }
-        }
-    }
-
-    /// Apply GELU activation
-    #[allow(clippy::unused_self)]
-    fn gelu(&self, input: &mut [f32]) {
-        for x in input.iter_mut() {
-            let sqrt_2_over_pi = 0.797_884_6_f32;
-            let c = 0.044_715_f32;
-            let inner = sqrt_2_over_pi * (*x + c * *x * *x * *x);
-            *x = 0.5 * *x * (1.0 + inner.tanh());
-        }
-    }
-
-    /// Forward pass with fused quantized operations
-    ///
-    /// This is the optimized forward pass that keeps weights in quantized form
-    /// and uses fused dequant+dot operations to minimize memory bandwidth.
-    ///
-    /// # Arguments
-    ///
-    /// * `token_ids` - Input token IDs
-    ///
-    /// # Returns
-    ///
-    /// Logits for next token prediction [vocab_size]
-    ///
-    /// # Errors
-    ///
-    /// Returns error if tensor operations fail
-    pub fn forward(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let hidden_dim = self.config.hidden_dim;
-        let intermediate_dim = self.config.intermediate_dim;
-
-        // 1. Token embedding lookup (f32, fast)
-        let mut hidden = self.embed(token_ids);
-
-        // 2. Process through transformer layers with fused ops
-        for layer in &self.layers {
-            // 2a. Attention layer norm
-            let normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // 2b. QKV projection with FUSED dequant+dot
-            // Note: qkv_dim may differ from 3*hidden_dim for GQA models
-            let qkv_dim = layer.qkv_weight.out_dim(hidden_dim);
-            let q_dim = layer.qkv_weight.q_dim(hidden_dim);
-            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight, hidden_dim)?;
-            if let Some(ref bias) = layer.qkv_bias {
-                self.add_bias(&mut qkv, bias);
-            }
-
-            // 2c. Simplified attention (real impl would have RoPE, causal mask, etc.)
-            // For now, extract just Q as attention output (simplified placeholder)
-            // In full implementation, this would compute attention scores and weighted V
-            let seq_len = token_ids.len();
-            let mut attn_out = Vec::with_capacity(seq_len * q_dim);
-            for s in 0..seq_len {
-                let qkv_start = s * qkv_dim;
-                // Extract Q portion (first q_dim elements of each position's QKV)
-                for h in 0..q_dim {
-                    attn_out.push(qkv[qkv_start + h]);
-                }
-            }
-
-            // 2d. Attention output projection with FUSED dequant+dot
-            // Input is q_dim (attention output), projects back to hidden_dim
-            let mut attn_output =
-                self.fused_matmul(&attn_out, &layer.attn_output_weight, q_dim, hidden_dim)?;
-            if let Some(ref bias) = layer.attn_output_bias {
-                self.add_bias(&mut attn_output, bias);
-            }
-
-            // 2e. Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += attn_output[i];
-            }
-
-            // 2f. FFN up projection with FUSED dequant+dot
-            let mut ffn_hidden =
-                self.fused_matmul(&hidden, &layer.ffn_up_weight, hidden_dim, intermediate_dim)?;
-            if let Some(ref bias) = layer.ffn_up_bias {
-                self.add_bias(&mut ffn_hidden, bias);
-            }
-
-            // GELU activation
-            self.gelu(&mut ffn_hidden);
-
-            // 2g. FFN down projection with FUSED dequant+dot
-            let mut ffn_output = self.fused_matmul(
-                &ffn_hidden,
-                &layer.ffn_down_weight,
-                intermediate_dim,
-                hidden_dim,
-            )?;
-            if let Some(ref bias) = layer.ffn_down_bias {
-                self.add_bias(&mut ffn_output, bias);
-            }
-
-            // Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_output[i];
-            }
-        }
-
-        // 3. Final layer norm
-        let normed = self.layer_norm(
-            &hidden,
-            &self.output_norm_weight,
-            self.output_norm_bias.as_deref(),
-            self.config.eps,
-        );
-
-        // 4. LM head projection with FUSED dequant+dot (only last token)
-        let seq_len = token_ids.len();
-        let last_hidden_start = (seq_len - 1) * hidden_dim;
-        let last_hidden = &normed[last_hidden_start..last_hidden_start + hidden_dim];
-
-        // Compute logits using fused op
-        let mut logits = self.fused_matmul(
-            last_hidden,
-            &self.lm_head_weight,
-            hidden_dim,
-            self.config.vocab_size,
-        )?;
-
-        if let Some(ref bias) = self.lm_head_bias {
-            self.add_bias(&mut logits, bias);
-        }
-
-        Ok(logits)
-    }
-
-    /// Get the most likely next token
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the forward pass fails.
-    pub fn predict_next(&self, token_ids: &[u32]) -> Result<u32> {
-        let logits = self.forward(token_ids)?;
-        let (max_idx, _) = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| RealizarError::InvalidShape {
-                reason: "Empty logits".to_string(),
-            })?;
-        Ok(max_idx as u32)
-    }
-
-    /// Generate a sequence of tokens
-    ///
-    /// This is the end-to-end generation loop that uses fused Q4_K operations.
-    /// Per benchmark-model-runners-spec.md "What's Remaining" item 1.
-    ///
-    /// # Arguments
-    ///
-    /// * `prompt` - Initial token IDs
-    /// * `config` - Generation configuration
-    ///
-    /// # Returns
-    ///
-    /// Generated token sequence including prompt
-    ///
-    /// # Errors
-    ///
-    /// Returns error if forward pass fails
-    pub fn generate(&self, prompt: &[u32], config: &QuantizedGenerateConfig) -> Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Err(RealizarError::InvalidShape {
-                reason: "Prompt cannot be empty".to_string(),
-            });
-        }
-
-        let mut tokens = prompt.to_vec();
-        let max_len = prompt.len() + config.max_tokens;
-
-        for _ in 0..config.max_tokens {
-            // Forward pass with fused Q4_K ops
-            let logits = self.forward(&tokens)?;
-
-            // Sample next token
-            let next_token = if config.temperature == 0.0 || config.top_k == 1 {
-                // Greedy decoding
-                Self::argmax(&logits)
-            } else {
-                // Temperature + top-k sampling
-                Self::sample_topk(&logits, config.temperature, config.top_k)
-            };
-
-            // Check stop condition
-            if config.stop_tokens.contains(&next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-
-            // Check max length
-            if tokens.len() >= max_len {
-                break;
-            }
-        }
-
-        Ok(tokens)
-    }
-
-    /// Greedy argmax over logits
-    fn argmax(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map_or(0, |(idx, _)| idx as u32)
-    }
-
-    /// Top-k sampling with temperature
-    pub fn sample_topk(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
-        // Apply temperature
-        let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
-
-        // Get top-k indices
-        let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
-        indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        indexed.truncate(top_k);
-
-        // Softmax over top-k
-        let max_val = indexed.first().map_or(0.0, |(_, v)| *v);
-        let exp_sum: f32 = indexed.iter().map(|(_, v)| (v - max_val).exp()).sum();
-        let probs: Vec<(usize, f32)> = indexed
-            .iter()
-            .map(|(i, v)| (*i, (v - max_val).exp() / exp_sum))
-            .collect();
-
-        // Sample from probability distribution with proper randomness
-        let mut rng = rand::thread_rng();
-        let r: f32 = rng.gen();
-        let mut cumsum = 0.0;
-        for (idx, prob) in &probs {
-            cumsum += prob;
-            if cumsum >= r {
-                return *idx as u32;
-            }
-        }
-        probs.last().map_or(0, |(idx, _)| *idx as u32)
-    }
-
-    // =========================================================================
-    // Zero-copy cached inference support (IMP-130: <500ms startup optimization)
-    // =========================================================================
-
-    /// SIMD-optimized dot product for f32 slices
-    #[inline]
-    fn simd_dot_f32(a: &[f32], b: &[f32]) -> f32 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                // SAFETY: We've verified AVX2+FMA support
-                unsafe { Self::simd_dot_f32_avx2(a, b) }
-            } else {
-                Self::simd_dot_f32_scalar(a, b)
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            Self::simd_dot_f32_scalar(a, b)
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2", enable = "fma")]
-    #[inline]
-    unsafe fn simd_dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-        // SAFETY: Memory safety ensured by bounds checking and alignment
-        unsafe {
-            use std::arch::x86_64::{
-                _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-                _mm256_setzero_ps, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps,
-                _mm_movehl_ps,
-            };
-
-            let len = a.len().min(b.len());
-            let mut acc = _mm256_setzero_ps();
-            let mut i = 0;
-
-            // Process 16 floats at a time (2x unrolled for better ILP)
-            while i + 16 <= len {
-                let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
-                let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
-                let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
-                let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
-                acc = _mm256_fmadd_ps(va0, vb0, acc);
-                acc = _mm256_fmadd_ps(va1, vb1, acc);
-                i += 16;
-            }
-            // Handle remaining 8-float chunk
-            if i + 8 <= len {
-                let va = _mm256_loadu_ps(a.as_ptr().add(i));
-                let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-                acc = _mm256_fmadd_ps(va, vb, acc);
-                i += 8;
-            }
-
-            // Horizontal sum
-            let hi = _mm256_extractf128_ps(acc, 1);
-            let lo = _mm256_castps256_ps128(acc);
-            let sum128 = _mm_add_ps(lo, hi);
-            let shuf = _mm_movehdup_ps(sum128);
-            let sums = _mm_add_ps(sum128, shuf);
-            let shuf2 = _mm_movehl_ps(sums, sums);
-            let result = _mm_add_ss(sums, shuf2);
-            let mut sum = _mm_cvtss_f32(result);
-
-            // Handle remaining elements
-            while i < len {
-                sum += a[i] * b[i];
-                i += 1;
-            }
-
-            sum
-        }
-    }
-
-    #[inline]
-    fn simd_dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-    }
-
-    /// SIMD-optimized scaled accumulation: out[i] += weight * val[i]
-    #[inline]
-    fn simd_axpy_f32(out: &mut [f32], weight: f32, val: &[f32]) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                // SAFETY: We've verified AVX2 support
-                unsafe { Self::simd_axpy_f32_avx2(out, weight, val) }
-            } else {
-                Self::simd_axpy_f32_scalar(out, weight, val);
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            Self::simd_axpy_f32_scalar(out, weight, val);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2", enable = "fma")]
-    #[inline]
-    unsafe fn simd_axpy_f32_avx2(out: &mut [f32], weight: f32, val: &[f32]) {
-        use std::arch::x86_64::{
-            _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps,
-        };
-
-        let len = out.len().min(val.len());
-        let w = _mm256_set1_ps(weight);
-        let mut i = 0;
-
-        // Process 8 floats at a time
-        while i + 8 <= len {
-            // SAFETY: bounds checked above, pointers valid
-            let v_out = unsafe { _mm256_loadu_ps(out.as_ptr().add(i)) };
-            // SAFETY: Memory safety ensured by bounds checking and alignment
-            let v_val = unsafe { _mm256_loadu_ps(val.as_ptr().add(i)) };
-            let result = _mm256_fmadd_ps(w, v_val, v_out);
-            // SAFETY: Memory safety ensured by bounds checking and alignment
-            unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), result) };
-            i += 8;
-        }
-
-        // Handle remaining elements
-        while i < len {
-            out[i] += weight * val[i];
-            i += 1;
-        }
-    }
-
-    #[inline]
-    fn simd_axpy_f32_scalar(out: &mut [f32], weight: f32, val: &[f32]) {
-        for (o, v) in out.iter_mut().zip(val.iter()) {
-            *o += weight * *v;
-        }
-    }
-
-    /// Apply SiLU (Sigmoid Linear Unit) activation for SwiGLU FFN
-    /// SiLU(x) = x * sigmoid(x)
-    fn silu(&self, input: &mut [f32]) {
-        for x in input.iter_mut() {
-            *x = *x * (1.0 / (1.0 + (-*x).exp()));
-        }
-    }
-
-    /// Apply RMSNorm (Root Mean Square Layer Normalization) using trueno SIMD
-    /// LLaMA, TinyLlama, Mistral, etc. use RMSNorm instead of LayerNorm
-    /// Formula: x / sqrt(mean(x^2) + eps) * weight
-    fn rms_norm(&self, input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
-        let hidden_dim = weight.len();
-        let seq_len = input.len() / hidden_dim;
-        let mut output = Vec::with_capacity(input.len());
-
-        // Pre-create weight vector for SIMD multiply (reused across sequence)
-        let weight_vec = TruenoVector::from_slice(weight);
-
-        for i in 0..seq_len {
-            let start = i * hidden_dim;
-            let end = start + hidden_dim;
-            let x = &input[start..end];
-
-            // Create SIMD vector from input slice
-            let x_vec = TruenoVector::from_slice(x);
-
-            // SIMD: sum of squares
-            let sum_sq = x_vec
-                .sum_of_squares()
-                .unwrap_or_else(|_| x.iter().map(|v| v * v).sum::<f32>());
-
-            // RMSNorm: x * weight / sqrt(mean(x^2) + eps)
-            let mean_sq = sum_sq / hidden_dim as f32;
-            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-
-            // SIMD: scale by inv_rms, then multiply by weight
-            match x_vec
-                .scale(inv_rms)
-                .and_then(|scaled| scaled.mul(&weight_vec))
-            {
-                Ok(result) => {
-                    output.extend_from_slice(result.as_slice());
-                },
-                Err(_) => {
-                    for j in 0..hidden_dim {
-                        output.push(x[j] * inv_rms * weight[j]);
-                    }
-                },
-            }
-        }
-
-        output
-    }
-
-    /// Apply RoPE (Rotary Position Embeddings) to Q or K vectors
-    ///
-    /// Optimized version using stack-based arrays to avoid heap allocations.
-    ///
-    /// # Arguments
-    /// * `x` - Vector to apply RoPE to [num_heads_in_x * head_dim]
-    /// * `position` - Position index for frequency calculation
-    /// * `num_heads_in_x` - Number of heads in x (num_heads for Q, num_kv_heads for K)
-    fn apply_rope(&self, x: &mut [f32], position: usize, num_heads_in_x: usize) {
-        let head_dim = self.config.hidden_dim / self.config.num_heads;
-        let half_dim = head_dim / 2;
-        let theta = self.config.rope_theta;
-        let rope_type = self.config.rope_type;
-
-        // Stack-based buffers (max 128 = 256 head_dim, covers all common models)
-        let mut cos_vals: [f32; 128] = [0.0; 128];
-        let mut sin_vals: [f32; 128] = [0.0; 128];
-
-        // Pre-compute cos/sin for this position
-        let pos_f32 = position as f32;
-        let head_dim_f32 = head_dim as f32;
-        for i in 0..half_dim.min(128) {
-            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim_f32);
-            let angle = pos_f32 * freq;
-            let (sin_v, cos_v) = angle.sin_cos();
-            cos_vals[i] = cos_v;
-            sin_vals[i] = sin_v;
-        }
-
-        // Apply rotation to each head
-        for h in 0..num_heads_in_x {
-            let head_start = h * head_dim;
-
-            if head_start + head_dim > x.len() {
-                continue;
-            }
-
-            if rope_type == 2 {
-                // NEOX style: split halves (x[0..half], x[half..])
-                // Used by GPT-NeoX and some newer models
-                let (first_half, second_half) =
-                    x[head_start..head_start + head_dim].split_at_mut(half_dim);
-                crate::quantize::apply_rope_rotation_simd(
-                    first_half,
-                    second_half,
-                    &cos_vals[..half_dim],
-                    &sin_vals[..half_dim],
-                );
-            } else {
-                // NORM style (type 0): adjacent pairs (x[0], x[1]), (x[2], x[3]), ...
-                // This is the default for LLaMA-family models
-                let head_slice = &mut x[head_start..head_start + head_dim];
-                for i in 0..half_dim {
-                    let x0 = head_slice[2 * i];
-                    let x1 = head_slice[2 * i + 1];
-                    let cos_v = cos_vals[i];
-                    let sin_v = sin_vals[i];
-                    head_slice[2 * i] = x0 * cos_v - x1 * sin_v;
-                    head_slice[2 * i + 1] = x0 * sin_v + x1 * cos_v;
-                }
-            }
-        }
-    }
-
-    /// Compute attention with Grouped Query Attention (GQA) support using KV cache
-    ///
-    /// # Arguments
-    /// * `q` - Query vector for current position [hidden_dim]
-    /// * `k_cache` - Cached keys [cache_len, kv_dim]
-    /// * `v_cache` - Cached values [cache_len, kv_dim]
-    /// * `current_k` - Key for current position [kv_dim]
-    /// * `current_v` - Value for current position [kv_dim]
-    pub fn attention_with_cache_gqa(
-        &self,
-        q: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
-        current_k: &[f32],
-        current_v: &[f32],
-    ) -> Vec<f32> {
-        let hidden_dim = self.config.hidden_dim;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = hidden_dim / num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let q_per_kv = num_heads / num_kv_heads;
-        let cache_len = if kv_dim > 0 {
-            k_cache.len() / kv_dim
-        } else {
-            0
-        };
-        let total_len = cache_len + 1;
-
-        let mut output = vec![0.0f32; hidden_dim];
-
-        for q_head in 0..num_heads {
-            let q_head_offset = q_head * head_dim;
-            let q_head_data = &q[q_head_offset..q_head_offset + head_dim];
-
-            let kv_head = q_head / q_per_kv;
-            let kv_head_offset = kv_head * head_dim;
-
-            let mut scores = Vec::with_capacity(total_len);
-
-            // Scores against cached positions
-            for pos in 0..cache_len {
-                let k_start = pos * kv_dim + kv_head_offset;
-                let cached_key = &k_cache[k_start..k_start + head_dim];
-                let score = Self::simd_dot_f32(q_head_data, cached_key);
-                scores.push(score * scale);
-            }
-
-            // Score against current position
-            let curr_key = &current_k[kv_head_offset..kv_head_offset + head_dim];
-            let current_score = Self::simd_dot_f32(q_head_data, curr_key);
-            scores.push(current_score * scale);
-
-            // Softmax (SIMD-optimized)
-            crate::quantize::softmax_simd(&mut scores);
-
-            // Weighted sum of values
-            let out_head = &mut output[q_head_offset..q_head_offset + head_dim];
-
-            for (pos, &weight) in scores.iter().enumerate().take(cache_len) {
-                let v_start = pos * kv_dim + kv_head_offset;
-                let cached_val = &v_cache[v_start..v_start + head_dim];
-                Self::simd_axpy_f32(out_head, weight, cached_val);
-            }
-
-            let curr_val = &current_v[kv_head_offset..kv_head_offset + head_dim];
-            let current_weight = scores[cache_len];
-            Self::simd_axpy_f32(out_head, current_weight, curr_val);
-        }
-
-        output
-    }
-
-    /// PAR-097: Batched attention with cache for speculative decode verification
-    ///
-    /// Computes attention for k query positions against cache + k new K/V entries.
-    /// Each query position i attends to [0..cache_len + i + 1] (causal mask).
-    ///
-    /// # Arguments
-    /// * `q_all` - Query vectors for k positions [k × hidden_dim]
-    /// * `k_cache` - Cached keys [cache_len × kv_dim]
-    /// * `v_cache` - Cached values [cache_len × kv_dim]
-    /// * `new_k` - Keys for k new positions [k × kv_dim]
-    /// * `new_v` - Values for k new positions [k × kv_dim]
-    /// * `batch_size` - Number of positions (k)
-    ///
-    /// # Returns
-    /// Attention outputs [k × hidden_dim]
-    pub fn batched_attention_with_cache_gqa(
-        &self,
-        q_all: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
-        new_k: &[f32],
-        new_v: &[f32],
-        batch_size: usize,
-    ) -> Vec<f32> {
-        let hidden_dim = self.config.hidden_dim;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = hidden_dim / num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let q_per_kv = num_heads / num_kv_heads;
-        let cache_len = if kv_dim > 0 {
-            k_cache.len() / kv_dim
-        } else {
-            0
-        };
-
-        let mut output = vec![0.0f32; batch_size * hidden_dim];
-
-        // Process each query position
-        for pos_idx in 0..batch_size {
-            let q_offset = pos_idx * hidden_dim;
-            let out_offset = pos_idx * hidden_dim;
-
-            // This query attends to [0..cache_len + pos_idx + 1]
-            let attend_len = cache_len + pos_idx + 1;
-
-            for q_head in 0..num_heads {
-                let q_head_offset = q_head * head_dim;
-                let q_head_data =
-                    &q_all[q_offset + q_head_offset..q_offset + q_head_offset + head_dim];
-
-                let kv_head = q_head / q_per_kv;
-                let kv_head_offset = kv_head * head_dim;
-
-                let mut scores = Vec::with_capacity(attend_len);
-
-                // Scores against cached positions [0..cache_len]
-                for cache_pos in 0..cache_len {
-                    let k_start = cache_pos * kv_dim + kv_head_offset;
-                    let cached_key = &k_cache[k_start..k_start + head_dim];
-                    let score = Self::simd_dot_f32(q_head_data, cached_key);
-                    scores.push(score * scale);
-                }
-
-                // Scores against new positions [0..pos_idx + 1]
-                for new_pos in 0..=pos_idx {
-                    let k_start = new_pos * kv_dim + kv_head_offset;
-                    let new_key = &new_k[k_start..k_start + head_dim];
-                    let score = Self::simd_dot_f32(q_head_data, new_key);
-                    scores.push(score * scale);
-                }
-
-                // Softmax (SIMD-optimized)
-                crate::quantize::softmax_simd(&mut scores);
-
-                // Weighted sum of values
-                let out_head =
-                    &mut output[out_offset + q_head_offset..out_offset + q_head_offset + head_dim];
-
-                // Contribution from cached values
-                for (cache_pos, &weight) in scores.iter().enumerate().take(cache_len) {
-                    let v_start = cache_pos * kv_dim + kv_head_offset;
-                    let cached_val = &v_cache[v_start..v_start + head_dim];
-                    Self::simd_axpy_f32(out_head, weight, cached_val);
-                }
-
-                // Contribution from new values
-                for (new_pos, &weight) in scores.iter().skip(cache_len).enumerate() {
-                    let v_start = new_pos * kv_dim + kv_head_offset;
-                    let new_val = &new_v[v_start..v_start + head_dim];
-                    Self::simd_axpy_f32(out_head, weight, new_val);
-                }
-            }
-        }
-
-        output
-    }
-
-    /// Single-token forward pass with KV cache for O(n) per-token inference
-    ///
-    /// This is the zero-copy version that works directly with memory-mapped data.
-    /// Eliminates the 1.2s startup time from copying 637MB of model weights.
-    ///
-    /// # Arguments
-    /// * `token_id` - Token to process
-    /// * `cache` - Mutable KV cache for attention
-    /// * `position` - Position in sequence for RoPE
-    ///
-    /// # Returns
-    /// Logits for next token prediction [vocab_size]
-    pub fn forward_cached(
-        &self,
-        token_id: u32,
-        cache: &mut OwnedQuantizedKVCache,
-        position: usize,
-    ) -> Result<Vec<f32>> {
-        let hidden_dim = self.config.hidden_dim;
-
-        // Detect architecture: LLaMA uses RMSNorm and SwiGLU
-        let use_rmsnorm = self
-            .layers
-            .first()
-            .is_some_and(|l| l.ffn_gate_weight.is_some() && l.attn_norm_bias.is_none());
-
-        // 1. Token embedding lookup
-        let mut hidden = self.embed(&[token_id]);
-
-        // PAR-051: Layer-by-layer diagnostic
-        let debug_forward = std::env::var("REALIZAR_DEBUG_FORWARD").is_ok();
-        if debug_forward && position == 0 {
-            eprintln!(
-                "[PAR-051-L0] Embed token {} sum: {:.6}",
-                token_id,
-                hidden.iter().sum::<f32>()
-            );
-            eprintln!(
-                "[PAR-051-L0] Embed[0..8]: {:?}",
-                &hidden[..8.min(hidden.len())]
-            );
-        }
-
-        // 2. Process through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Track hidden state across layers
-            if debug_forward
-                && position == 1
-                && (layer_idx == 0 || layer_idx == 12 || layer_idx == 23)
-            {
-                let hidden_sum: f32 = hidden.iter().sum();
-                let hidden_norm: f32 = hidden.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!(
-                    "[PAR-062-L{}] hidden sum={:.4}, norm={:.4}, first4={:?}",
-                    layer_idx,
-                    hidden_sum,
-                    hidden_norm,
-                    &hidden[..4]
-                );
-            }
-            // Print RoPE config on first layer
-            if debug_forward && position == 0 && layer_idx == 0 {
-                eprintln!(
-                    "[PAR-063] RoPE: theta={}, type={}",
-                    self.config.rope_theta, self.config.rope_type
-                );
-            }
-
-            // 2a. Attention layer norm
-            let normed = if use_rmsnorm {
-                self.rms_norm(&hidden, &layer.attn_norm_weight, self.config.eps)
-            } else {
-                self.layer_norm(
-                    &hidden,
-                    &layer.attn_norm_weight,
-                    layer.attn_norm_bias.as_deref(),
-                    self.config.eps,
-                )
-            };
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                eprintln!(
-                    "[PAR-051-L0] RMSNorm sum: {:.6}",
-                    normed.iter().sum::<f32>()
-                );
-                eprintln!(
-                    "[PAR-051-L0] RMSNorm[0..8]: {:?}",
-                    &normed[..8.min(normed.len())]
-                );
-            }
-
-            // 2b. QKV projection
-            let q_dim = layer.qkv_weight.q_dim(hidden_dim);
-            let k_dim = match &layer.qkv_weight {
-                QKVWeights::Fused(_) => q_dim,
-                QKVWeights::Separate { k, .. } => k.num_elements / hidden_dim,
-            };
-            let v_dim = match &layer.qkv_weight {
-                QKVWeights::Fused(_) => q_dim,
-                QKVWeights::Separate { v, .. } => v.num_elements / hidden_dim,
-            };
-
-            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight, hidden_dim)?;
-            if let Some(ref bias) = layer.qkv_bias {
-                self.add_bias(&mut qkv, bias);
-            }
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                // Print attn_norm weights to verify loading
-                eprintln!(
-                    "[PAR-051-L0] attn_norm[0..8]: {:?}",
-                    &layer.attn_norm_weight[..8.min(layer.attn_norm_weight.len())]
-                );
-                eprintln!(
-                    "[PAR-051-L0] QKV dims: q_dim={}, k_dim={}, v_dim={}, total={}",
-                    q_dim,
-                    k_dim,
-                    v_dim,
-                    qkv.len()
-                );
-                eprintln!("[PAR-051-L0] QKV sum: {:.6}", qkv.iter().sum::<f32>());
-                eprintln!("[PAR-051-L0] Q[0..8]: {:?}", &qkv[..8.min(qkv.len())]);
-                // Print K and V starts too
-                eprintln!(
-                    "[PAR-051-L0] K[0..4]: {:?}",
-                    &qkv[q_dim..q_dim + 4.min(k_dim)]
-                );
-                eprintln!(
-                    "[PAR-051-L0] V[0..4]: {:?}",
-                    &qkv[q_dim + k_dim..q_dim + k_dim + 4.min(v_dim)]
-                );
-            }
-
-            // 2c. Extract Q, K, V and apply RoPE
-            let mut q = qkv[0..q_dim].to_vec();
-            let mut k = qkv[q_dim..q_dim + k_dim].to_vec();
-            let v = qkv[q_dim + k_dim..q_dim + k_dim + v_dim].to_vec();
-
-            self.apply_rope(&mut q, position, self.config.num_heads);
-            self.apply_rope(&mut k, position, self.config.num_kv_heads);
-
-            // 2d. Compute attention using cached K/V
-            let k_cache = cache.get_k(layer_idx);
-            let v_cache = cache.get_v(layer_idx);
-
-            let attn_out = if k_cache.is_empty() {
-                // First token - expand V if GQA
-                if self.config.num_kv_heads < self.config.num_heads {
-                    let head_dim = hidden_dim / self.config.num_heads;
-                    let group_size = self.config.num_heads / self.config.num_kv_heads;
-                    (0..self.config.num_heads)
-                        .flat_map(|h| {
-                            let kv_head = h / group_size;
-                            let start = kv_head * head_dim;
-                            v[start..start + head_dim].iter().copied()
-                        })
-                        .collect()
-                } else {
-                    v.clone()
-                }
-            } else {
-                self.attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v)
-            };
-
-            // 2e. Store K and V in cache
-            cache.append(layer_idx, &k, &v);
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                eprintln!(
-                    "[PAR-051-L0] attn_out sum: {:.6}",
-                    attn_out.iter().sum::<f32>()
-                );
-                eprintln!(
-                    "[PAR-051-L0] attn_out[0..8]: {:?}",
-                    &attn_out[..8.min(attn_out.len())]
-                );
-            }
-
-            // 2f. Attention output projection
-            let mut attn_output =
-                self.fused_matmul(&attn_out, &layer.attn_output_weight, hidden_dim, hidden_dim)?;
-            if let Some(ref bias) = layer.attn_output_bias {
-                self.add_bias(&mut attn_output, bias);
-            }
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                eprintln!(
-                    "[PAR-051-L0] attn_output (after proj) sum: {:.6}",
-                    attn_output.iter().sum::<f32>()
-                );
-                eprintln!(
-                    "[PAR-051-L0] attn_output[0..8]: {:?}",
-                    &attn_output[..8.min(attn_output.len())]
-                );
-                eprintln!(
-                    "[PAR-051-L0] hidden (before 1st residual) sum: {:.6}",
-                    hidden.iter().sum::<f32>()
-                );
-            }
-
-            // 2g. Residual connection
-            for i in 0..hidden_dim {
-                hidden[i] += attn_output[i];
-            }
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                eprintln!(
-                    "[PAR-051-L0] hidden (after 1st residual) sum: {:.6}",
-                    hidden.iter().sum::<f32>()
-                );
-            }
-
-            // 2h. Pre-FFN layer norm
-            let ffn_input = if let Some(ref ffn_norm) = layer.ffn_norm_weight {
-                if use_rmsnorm {
-                    self.rms_norm(&hidden, ffn_norm, self.config.eps)
-                } else {
-                    self.layer_norm(
-                        &hidden,
-                        ffn_norm,
-                        layer.ffn_norm_bias.as_deref(),
-                        self.config.eps,
-                    )
-                }
-            } else {
-                hidden.clone()
-            };
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                eprintln!(
-                    "[PAR-051-L0] ffn_input sum: {:.6}",
-                    ffn_input.iter().sum::<f32>()
-                );
-            }
-
-            // 2i. FFN with SwiGLU or GELU
-            let ffn_output = if let Some(ref gate_weight) = layer.ffn_gate_weight {
-                // SwiGLU path (LLaMA)
-                let mut ffn_up = self.fused_matmul(
-                    &ffn_input,
-                    &layer.ffn_up_weight,
-                    hidden_dim,
-                    self.config.intermediate_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_up_bias {
-                    self.add_bias(&mut ffn_up, bias);
-                }
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!("[PAR-051-L0] ffn_up sum: {:.6}", ffn_up.iter().sum::<f32>());
-                    eprintln!(
-                        "[PAR-051-L0] ffn_up[0..8]: {:?}",
-                        &ffn_up[..8.min(ffn_up.len())]
-                    );
-                }
-
-                let mut ffn_gate = self.fused_matmul(
-                    &ffn_input,
-                    gate_weight,
-                    hidden_dim,
-                    self.config.intermediate_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_gate_bias {
-                    self.add_bias(&mut ffn_gate, bias);
-                }
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_gate (pre-silu) sum: {:.6}",
-                        ffn_gate.iter().sum::<f32>()
-                    );
-                }
-
-                // SiLU on gate, then multiply with up
-                self.silu(&mut ffn_gate);
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_gate (post-silu) sum: {:.6}",
-                        ffn_gate.iter().sum::<f32>()
-                    );
-                }
-
-                for i in 0..ffn_gate.len() {
-                    ffn_gate[i] *= ffn_up[i];
-                }
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_gate*up sum: {:.6}",
-                        ffn_gate.iter().sum::<f32>()
-                    );
-                }
-
-                let mut output = self.fused_matmul(
-                    &ffn_gate,
-                    &layer.ffn_down_weight,
-                    self.config.intermediate_dim,
-                    hidden_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut output, bias);
-                }
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_down (SwiGLU) sum: {:.6}",
-                        output.iter().sum::<f32>()
-                    );
-                    eprintln!(
-                        "[PAR-051-L0] ffn_down[0..8]: {:?}",
-                        &output[..8.min(output.len())]
-                    );
-                }
-
-                output
-            } else {
-                // GELU path (phi-2)
-                let mut ffn_hidden = self.fused_matmul(
-                    &ffn_input,
-                    &layer.ffn_up_weight,
-                    hidden_dim,
-                    self.config.intermediate_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_up_bias {
-                    self.add_bias(&mut ffn_hidden, bias);
-                }
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_hidden (pre-gelu) sum: {:.6}",
-                        ffn_hidden.iter().sum::<f32>()
-                    );
-                }
-
-                self.gelu(&mut ffn_hidden);
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_hidden (post-gelu) sum: {:.6}",
-                        ffn_hidden.iter().sum::<f32>()
-                    );
-                }
-
-                let mut output = self.fused_matmul(
-                    &ffn_hidden,
-                    &layer.ffn_down_weight,
-                    self.config.intermediate_dim,
-                    hidden_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut output, bias);
-                }
-
-                if debug_forward && layer_idx == 0 && position == 0 {
-                    eprintln!(
-                        "[PAR-051-L0] ffn_down (GELU) sum: {:.6}",
-                        output.iter().sum::<f32>()
-                    );
-                    eprintln!(
-                        "[PAR-051-L0] ffn_down[0..8]: {:?}",
-                        &output[..8.min(output.len())]
-                    );
-                }
-
-                output
-            };
-
-            // 2j. Residual connection
-            for i in 0..hidden_dim {
-                hidden[i] += ffn_output[i];
-            }
-
-            if debug_forward && layer_idx == 0 && position == 0 {
-                eprintln!(
-                    "[PAR-051-L0] hidden (after 2nd residual) sum: {:.6}",
-                    hidden.iter().sum::<f32>()
-                );
-                eprintln!(
-                    "[PAR-051-L0] hidden[0..8]: {:?}",
-                    &hidden[..8.min(hidden.len())]
-                );
-            }
-        }
-
-        // Advance cache position
-        cache.advance();
-
-        // 3. Final layer norm
-        let normed = if use_rmsnorm {
-            self.rms_norm(&hidden, &self.output_norm_weight, self.config.eps)
-        } else {
-            self.layer_norm(
-                &hidden,
-                &self.output_norm_weight,
-                self.output_norm_bias.as_deref(),
-                self.config.eps,
-            )
-        };
-
-        // PAR-060-DEBUG: Removed unconditional print from hot path (was causing 100x slowdown)
-
-        if debug_forward && (position == 0 || position == 5) {
-            eprintln!(
-                "[PAR-051-P{}] Final hidden sum: {:.6}",
-                position,
-                hidden.iter().sum::<f32>()
-            );
-            eprintln!(
-                "[PAR-051-P{}] Final hidden[0..8]: {:?}",
-                position,
-                &hidden[..8.min(hidden.len())]
-            );
-            eprintln!(
-                "[PAR-051-P{}] After output_norm sum: {:.6}",
-                position,
-                normed.iter().sum::<f32>()
-            );
-            eprintln!(
-                "[PAR-051-P{}] normed[0..8]: {:?}",
-                position,
-                &normed[..8.min(normed.len())]
-            );
-            if position == 0 {
-                eprintln!(
-                    "[PAR-051] output_norm_weight[0..4]: {:?}",
-                    &self.output_norm_weight[..4.min(self.output_norm_weight.len())]
-                );
-            }
-        }
-
-        // 4. LM head projection
-        let mut logits = self.fused_matmul(
-            &normed,
-            &self.lm_head_weight,
-            hidden_dim,
-            self.config.vocab_size,
-        )?;
-        if let Some(ref bias) = self.lm_head_bias {
-            self.add_bias(&mut logits, bias);
-        }
-
-        // PAR-060-DEBUG: Removed print from hot path (was causing slowdown)
-        if false {
-            eprintln!(
-                "[PAR-060-CPU] Digit logits: 0={:.2}, 1={:.2}, 2={:.2}, 3={:.2}, 4={:.2}, 5={:.2}",
-                logits[15], logits[16], logits[17], logits[18], logits[19], logits[20]
-            );
-        }
-
-        // PAR-061-DEBUG: Print first few logits and find argmax
-        if debug_forward && (position == 0 || position == 1) {
-            eprintln!(
-                "[PAR-061-P{}] First 10 logits: {:?}",
-                position,
-                &logits[..10.min(logits.len())]
-            );
-            let (argmax_idx, argmax_val) = logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or((0, &0.0));
-            eprintln!(
-                "[PAR-061-P{}] Argmax: token {} with logit {:.4}",
-                position, argmax_idx, argmax_val
-            );
-            // Print logits around argmax
-            let start = argmax_idx.saturating_sub(3);
-            let end = (argmax_idx + 4).min(logits.len());
-            eprintln!(
-                "[PAR-061-P{}] Logits around argmax: {:?}",
-                position,
-                &logits[start..end]
-            );
-            // Print lm_head weight info
-            eprintln!(
-                "[PAR-061-P{}] lm_head qtype: {:?}, len: {}",
-                position, self.lm_head_weight.qtype, self.lm_head_weight.byte_size
-            );
-            // Print logit for common tokens: "4" is likely around token 19 in many vocabs
-            eprintln!(
-                "[PAR-061-P{}] Logits[15..25]: {:?}",
-                position,
-                &logits[15..25.min(logits.len())]
-            );
-            // Verify with manual computation for token 0
-            let lm_head_data = self.tensor_data(&self.lm_head_weight);
-            // Dequantize first row (token 0's projection weights) manually
-            let bytes_per_row = (hidden_dim / 32) * 34;
-            let first_row_data = &lm_head_data[0..bytes_per_row];
-            // Dequantize Q8_0 manually for verification
-            let mut first_row_f32 = vec![0.0f32; hidden_dim];
-            for block_idx in 0..(hidden_dim / 32) {
-                let block_start = block_idx * 34;
-                let scale = half::f16::from_le_bytes([
-                    first_row_data[block_start],
-                    first_row_data[block_start + 1],
-                ])
-                .to_f32();
-                for j in 0..32 {
-                    let quant = first_row_data[block_start + 2 + j] as i8;
-                    first_row_f32[block_idx * 32 + j] = scale * (quant as f32);
-                }
-            }
-            // Manual dot product
-            let manual_logit_0: f32 = normed
-                .iter()
-                .zip(first_row_f32.iter())
-                .map(|(a, b)| a * b)
-                .sum();
-            eprintln!(
-                "[PAR-061-P0] Manual logit[0] = {:.4}, computed = {:.4}",
-                manual_logit_0, logits[0]
-            );
-            eprintln!(
-                "[PAR-061-P0] First row weights[0..8]: {:?}",
-                &first_row_f32[..8]
-            );
-        }
-
-        Ok(logits)
-    }
-
-    /// Get model configuration
-    #[must_use]
-    pub fn config(&self) -> &GGUFConfig {
-        &self.config
-    }
-
-    /// Single-token forward pass with pre-allocated scratch buffers
-    ///
-    /// IMP-131: Arena allocator for inference buffers.
-    /// Uses InferenceScratchBuffer to eliminate per-token allocations.
-    pub fn forward_cached_with_scratch(
-        &self,
-        token_id: u32,
-        cache: &mut OwnedQuantizedKVCache,
-        position: usize,
-        scratch: &mut InferenceScratchBuffer,
-    ) -> Result<Vec<f32>> {
-        let hidden_dim = self.config.hidden_dim;
-
-        // Detect architecture: LLaMA uses RMSNorm and SwiGLU
-        let use_rmsnorm = self
-            .layers
-            .first()
-            .is_some_and(|l| l.ffn_gate_weight.is_some() && l.attn_norm_bias.is_none());
-
-        // 1. Token embedding lookup (reuse hidden buffer)
-        self.embed_into(token_id, &mut scratch.hidden);
-
-        // 2. Process through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // 2a. Attention layer norm (reuse normed buffer)
-            if use_rmsnorm {
-                self.rms_norm_into(
-                    &scratch.hidden,
-                    &layer.attn_norm_weight,
-                    self.config.eps,
-                    &mut scratch.normed,
-                );
-            } else {
-                self.layer_norm_into(
-                    &scratch.hidden,
-                    &layer.attn_norm_weight,
-                    layer.attn_norm_bias.as_deref(),
-                    self.config.eps,
-                    &mut scratch.normed,
-                );
-            }
-
-            // 2b. QKV projection
-            let q_dim = layer.qkv_weight.q_dim(hidden_dim);
-            let k_dim = match &layer.qkv_weight {
-                QKVWeights::Fused(_) => q_dim,
-                QKVWeights::Separate { k, .. } => k.num_elements / hidden_dim,
-            };
-            let v_dim = match &layer.qkv_weight {
-                QKVWeights::Fused(_) => q_dim,
-                QKVWeights::Separate { v, .. } => v.num_elements / hidden_dim,
-            };
-
-            let qkv = self.qkv_matmul(&scratch.normed, &layer.qkv_weight, hidden_dim)?;
-            let mut qkv = qkv;
-            if let Some(ref bias) = layer.qkv_bias {
-                self.add_bias(&mut qkv, bias);
-            }
-
-            // 2c. Extract Q, K, V and apply RoPE (reuse q, k, v scratch)
-            scratch.q.clear();
-            scratch.q.extend_from_slice(&qkv[0..q_dim]);
-            scratch.k.clear();
-            scratch.k.extend_from_slice(&qkv[q_dim..q_dim + k_dim]);
-            scratch.v.clear();
-            scratch
-                .v
-                .extend_from_slice(&qkv[q_dim + k_dim..q_dim + k_dim + v_dim]);
-
-            self.apply_rope(&mut scratch.q, position, self.config.num_heads);
-            self.apply_rope(&mut scratch.k, position, self.config.num_kv_heads);
-
-            // 2d. Compute attention using cached K/V (reuse attn_out buffer)
-            let k_cache = cache.get_k(layer_idx);
-            let v_cache = cache.get_v(layer_idx);
-
-            if k_cache.is_empty() {
-                // First token - expand V if GQA
-                scratch.attn_out.clear();
-                if self.config.num_kv_heads < self.config.num_heads {
-                    let head_dim = hidden_dim / self.config.num_heads;
-                    let group_size = self.config.num_heads / self.config.num_kv_heads;
-                    for h in 0..self.config.num_heads {
-                        let kv_head = h / group_size;
-                        let start = kv_head * head_dim;
-                        scratch
-                            .attn_out
-                            .extend_from_slice(&scratch.v[start..start + head_dim]);
-                    }
-                } else {
-                    scratch.attn_out.extend_from_slice(&scratch.v);
-                }
-            } else {
-                self.attention_with_cache_gqa_into(
-                    &scratch.q,
-                    k_cache,
-                    v_cache,
-                    &scratch.k,
-                    &scratch.v,
-                    &mut scratch.attn_out,
-                );
-            }
-
-            // 2e. Store K and V in cache
-            cache.append(layer_idx, &scratch.k, &scratch.v);
-
-            // 2f. Attention output projection (reuse ffn_input as temp)
-            let attn_output = self.fused_matmul(
-                &scratch.attn_out,
-                &layer.attn_output_weight,
-                hidden_dim,
-                hidden_dim,
-            )?;
-            let mut attn_output = attn_output;
-            if let Some(ref bias) = layer.attn_output_bias {
-                self.add_bias(&mut attn_output, bias);
-            }
-
-            // 2g. Residual connection
-            for i in 0..hidden_dim {
-                scratch.hidden[i] += attn_output[i];
-            }
-
-            // 2h. Pre-FFN layer norm
-            if let Some(ref ffn_norm) = layer.ffn_norm_weight {
-                if use_rmsnorm {
-                    self.rms_norm_into(
-                        &scratch.hidden,
-                        ffn_norm,
-                        self.config.eps,
-                        &mut scratch.normed,
-                    );
-                } else {
-                    self.layer_norm_into(
-                        &scratch.hidden,
-                        ffn_norm,
-                        layer.ffn_norm_bias.as_deref(),
-                        self.config.eps,
-                        &mut scratch.normed,
-                    );
-                }
-            } else {
-                scratch.normed.clear();
-                scratch.normed.extend_from_slice(&scratch.hidden);
-            }
-
-            // 2i. FFN with SwiGLU or GELU
-            let ffn_output = if let Some(ref gate_weight) = layer.ffn_gate_weight {
-                // SwiGLU path (LLaMA)
-                let mut ffn_up = self.fused_matmul(
-                    &scratch.normed,
-                    &layer.ffn_up_weight,
-                    hidden_dim,
-                    self.config.intermediate_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_up_bias {
-                    self.add_bias(&mut ffn_up, bias);
-                }
-
-                let mut ffn_gate = self.fused_matmul(
-                    &scratch.normed,
-                    gate_weight,
-                    hidden_dim,
-                    self.config.intermediate_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_gate_bias {
-                    self.add_bias(&mut ffn_gate, bias);
-                }
-
-                self.silu(&mut ffn_gate);
-                for i in 0..ffn_gate.len() {
-                    ffn_gate[i] *= ffn_up[i];
-                }
-
-                let mut output = self.fused_matmul(
-                    &ffn_gate,
-                    &layer.ffn_down_weight,
-                    self.config.intermediate_dim,
-                    hidden_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut output, bias);
-                }
-                output
-            } else {
-                // GELU path (phi-2)
-                let mut ffn_hidden = self.fused_matmul(
-                    &scratch.normed,
-                    &layer.ffn_up_weight,
-                    hidden_dim,
-                    self.config.intermediate_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_up_bias {
-                    self.add_bias(&mut ffn_hidden, bias);
-                }
-                self.gelu(&mut ffn_hidden);
-
-                let mut output = self.fused_matmul(
-                    &ffn_hidden,
-                    &layer.ffn_down_weight,
-                    self.config.intermediate_dim,
-                    hidden_dim,
-                )?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut output, bias);
-                }
-                output
-            };
-
-            // 2j. Residual connection
-            for i in 0..hidden_dim {
-                scratch.hidden[i] += ffn_output[i];
-            }
-        }
-
-        // Advance cache position
-        cache.advance();
-
-        // 3. Final layer norm
-        if use_rmsnorm {
-            self.rms_norm_into(
-                &scratch.hidden,
-                &self.output_norm_weight,
-                self.config.eps,
-                &mut scratch.normed,
-            );
-        } else {
-            self.layer_norm_into(
-                &scratch.hidden,
-                &self.output_norm_weight,
-                self.output_norm_bias.as_deref(),
-                self.config.eps,
-                &mut scratch.normed,
-            );
-        }
-
-        // 4. LM head projection
-        let mut logits = self.fused_matmul(
-            &scratch.normed,
-            &self.lm_head_weight,
-            hidden_dim,
-            self.config.vocab_size,
-        )?;
-        if let Some(ref bias) = self.lm_head_bias {
-            self.add_bias(&mut logits, bias);
-        }
-
-        Ok(logits)
-    }
-
-    /// Embed token into pre-allocated buffer
-    fn embed_into(&self, token_id: u32, output: &mut Vec<f32>) {
-        let hidden_dim = self.config.hidden_dim;
-        output.clear();
-        if (token_id as usize) < self.config.vocab_size {
-            let start = token_id as usize * hidden_dim;
-            let end = start + hidden_dim;
-            if end <= self.token_embedding.len() {
-                output.extend_from_slice(&self.token_embedding[start..end]);
-                return;
-            }
-        }
-        output.resize(hidden_dim, 0.0);
-    }
-
-    /// RMSNorm into pre-allocated buffer
-    fn rms_norm_into(&self, input: &[f32], weight: &[f32], eps: f32, output: &mut Vec<f32>) {
-        let hidden_dim = weight.len();
-        output.clear();
-
-        let x_vec = TruenoVector::from_slice(input);
-        let weight_vec = TruenoVector::from_slice(weight);
-
-        let sum_sq = x_vec
-            .sum_of_squares()
-            .unwrap_or_else(|_| input.iter().map(|v| v * v).sum::<f32>());
-
-        let mean_sq = sum_sq / hidden_dim as f32;
-        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-
-        match x_vec
-            .scale(inv_rms)
-            .and_then(|scaled| scaled.mul(&weight_vec))
-        {
-            Ok(result) => output.extend_from_slice(result.as_slice()),
-            Err(_) => {
-                for j in 0..hidden_dim {
-                    output.push(input[j] * inv_rms * weight[j]);
-                }
-            },
-        }
-    }
-
-    /// LayerNorm into pre-allocated buffer
-    fn layer_norm_into(
-        &self,
-        input: &[f32],
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        eps: f32,
-        output: &mut Vec<f32>,
-    ) {
-        let hidden_dim = weight.len();
-        output.clear();
-
-        // Mean and variance
-        let mean: f32 = input.iter().sum::<f32>() / hidden_dim as f32;
-        let var: f32 = input.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / hidden_dim as f32;
-        let std_inv = 1.0 / (var + eps).sqrt();
-
-        // Normalize and scale
-        for i in 0..hidden_dim {
-            let normalized = (input[i] - mean) * std_inv;
-            let scaled = normalized * weight[i] + bias.map_or(0.0, |b| b[i]);
-            output.push(scaled);
-        }
-    }
-
-    /// Attention with cache into pre-allocated buffer
-    fn attention_with_cache_gqa_into(
-        &self,
-        q: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
-        current_k: &[f32],
-        current_v: &[f32],
-        output: &mut Vec<f32>,
-    ) {
-        let hidden_dim = self.config.hidden_dim;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = hidden_dim / num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let q_per_kv = num_heads / num_kv_heads;
-        let cache_len = if kv_dim > 0 {
-            k_cache.len() / kv_dim
-        } else {
-            0
-        };
-        let total_len = cache_len + 1;
-
-        output.clear();
-        output.resize(hidden_dim, 0.0);
-
-        for q_head in 0..num_heads {
-            let q_head_offset = q_head * head_dim;
-            let q_head_data = &q[q_head_offset..q_head_offset + head_dim];
-
-            let kv_head = q_head / q_per_kv;
-            let kv_head_offset = kv_head * head_dim;
-
-            let mut scores = Vec::with_capacity(total_len);
-
-            for pos in 0..cache_len {
-                let k_start = pos * kv_dim + kv_head_offset;
-                let cached_key = &k_cache[k_start..k_start + head_dim];
-                let score = Self::simd_dot_f32(q_head_data, cached_key);
-                scores.push(score * scale);
-            }
-
-            let curr_key = &current_k[kv_head_offset..kv_head_offset + head_dim];
-            let current_score = Self::simd_dot_f32(q_head_data, curr_key);
-            scores.push(current_score * scale);
-
-            // Softmax (SIMD-optimized)
-            crate::quantize::softmax_simd(&mut scores);
-
-            let out_head = &mut output[q_head_offset..q_head_offset + head_dim];
-
-            for (pos, &weight) in scores.iter().enumerate().take(cache_len) {
-                let v_start = pos * kv_dim + kv_head_offset;
-                let cached_val = &v_cache[v_start..v_start + head_dim];
-                Self::simd_axpy_f32(out_head, weight, cached_val);
-            }
-
-            let curr_val = &current_v[kv_head_offset..kv_head_offset + head_dim];
-            let current_weight = scores[cache_len];
-            Self::simd_axpy_f32(out_head, current_weight, curr_val);
-        }
-    }
 }
 
 /// Pre-allocated scratch buffers for inference (IMP-131)
@@ -8992,15 +6859,6 @@ impl AsyncCommandQueue {
         }
     }
 
-    /// Check if a slot is ready for new commands
-    pub fn is_slot_ready(&self, slot_idx: usize) -> bool {
-        let slot = self.slots[slot_idx].lock().expect("mutex poisoned");
-        matches!(
-            slot.state,
-            CommandSlotState::Empty | CommandSlotState::Complete
-        )
-    }
-
     /// Get queue statistics
     pub fn stats(&self) -> AsyncQueueStats {
         let submitted = self
@@ -9818,6 +7676,46 @@ impl OwnedQuantizedModel {
         })
     }
 
+    /// Create a model for testing purposes
+    ///
+    /// This constructor handles the internal CUDA fields automatically,
+    /// allowing external tests to construct models without accessing pub(crate) fields.
+    ///
+    /// # Arguments
+    /// * `config` - Model configuration
+    /// * `token_embedding` - Token embedding weights
+    /// * `layers` - Quantized transformer layers
+    /// * `output_norm_weight` - Output normalization weight
+    /// * `output_norm_bias` - Optional output normalization bias
+    /// * `lm_head_weight` - Language model head weight
+    /// * `lm_head_bias` - Optional language model head bias
+    #[must_use]
+    pub fn new_for_test(
+        config: GGUFConfig,
+        token_embedding: Vec<f32>,
+        layers: Vec<OwnedQuantizedLayer>,
+        output_norm_weight: Vec<f32>,
+        output_norm_bias: Option<Vec<f32>>,
+        lm_head_weight: OwnedQuantizedTensor,
+        lm_head_bias: Option<Vec<f32>>,
+    ) -> Self {
+        Self {
+            config,
+            token_embedding,
+            layers,
+            output_norm_weight,
+            output_norm_bias,
+            lm_head_weight,
+            lm_head_bias,
+            #[cfg(feature = "cuda")]
+            cuda_executor: None,
+            #[cfg(feature = "cuda")]
+            cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
     /// Create model from memory-mapped APR file (SHOWCASE-APR-GPU)
     ///
     /// Converts APR Q4K format to GGUF-compatible model for GPU inference.
@@ -9848,15 +7746,24 @@ impl OwnedQuantizedModel {
             Some(v) if v > 0 => v,
             _ => {
                 // Try to infer from embedding tensor shape
-                apr.tensors.iter()
-                    .find(|t| t.name.contains("embed_tokens") || t.name.contains("tok_embeddings") || t.name.contains("token_embd"))
+                apr.tensors
+                    .iter()
+                    .find(|t| {
+                        t.name.contains("embed_tokens")
+                            || t.name.contains("tok_embeddings")
+                            || t.name.contains("token_embd")
+                    })
                     .and_then(|t| t.shape.first().copied())
                     .unwrap_or(151936)
-            }
+            },
         };
 
         let config = GGUFConfig {
-            architecture: apr.metadata.architecture.clone().unwrap_or_else(|| "qwen2".to_string()),
+            architecture: apr
+                .metadata
+                .architecture
+                .clone()
+                .unwrap_or_else(|| "qwen2".to_string()),
             vocab_size,
             hidden_dim,
             num_layers,
@@ -9871,9 +7778,11 @@ impl OwnedQuantizedModel {
 
         // Helper to get tensor data
         let get_tensor = |name: &str| -> Result<&[u8]> {
-            let tensor = apr.find_tensor(name).ok_or_else(|| RealizarError::FormatError {
-                reason: format!("APR: tensor not found: {name}"),
-            })?;
+            let tensor = apr
+                .find_tensor(name)
+                .ok_or_else(|| RealizarError::FormatError {
+                    reason: format!("APR: tensor not found: {name}"),
+                })?;
             let start = data_offset + tensor.offset as usize;
             let end = start + tensor.size as usize;
             if end > data.len() {
@@ -9887,25 +7796,31 @@ impl OwnedQuantizedModel {
         // Helper to get tensor qtype
         let get_qtype = |name: &str| -> u32 {
             apr.find_tensor(name)
-                .map(|t| MappedAprModel::dtype_to_qtype(&t.dtype))
-                .unwrap_or(0)
+                .map_or(0, |t| MappedAprModel::dtype_to_qtype(&t.dtype))
         };
 
         // Helper to make OwnedQuantizedTensor
-        let make_tensor = |name: &str, in_dim: usize, out_dim: usize| -> Result<OwnedQuantizedTensor> {
-            let tensor_data = get_tensor(name)?;
-            let qtype = get_qtype(name);
-            Ok(OwnedQuantizedTensor {
-                data: tensor_data.to_vec(),
-                in_dim,
-                out_dim,
-                qtype,
-            })
-        };
+        let make_tensor =
+            |name: &str, in_dim: usize, out_dim: usize| -> Result<OwnedQuantizedTensor> {
+                let tensor_data = get_tensor(name)?;
+                let qtype = get_qtype(name);
+                Ok(OwnedQuantizedTensor {
+                    data: tensor_data.to_vec(),
+                    in_dim,
+                    out_dim,
+                    qtype,
+                })
+            };
 
         // Load token embeddings (F32)
-        let embed_name = apr.tensors.iter()
-            .find(|t| t.name.contains("embed_tokens") || t.name.contains("tok_embeddings") || t.name.contains("token_embd"))
+        let embed_name = apr
+            .tensors
+            .iter()
+            .find(|t| {
+                t.name.contains("embed_tokens")
+                    || t.name.contains("tok_embeddings")
+                    || t.name.contains("token_embd")
+            })
             .map(|t| t.name.as_str())
             .ok_or_else(|| RealizarError::FormatError {
                 reason: "APR: embedding tensor not found".to_string(),
@@ -9914,25 +7829,24 @@ impl OwnedQuantizedModel {
         let embed_data = get_tensor(embed_name)?;
         let embed_dtype = apr.find_tensor(embed_name).map(|t| t.dtype.as_str());
         let token_embedding: Vec<f32> = match embed_dtype {
-            Some("F32") => {
-                embed_data.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect()
-            }
+            Some("F32") => embed_data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
             Some("Q4_K") => {
                 // Dequantize Q4_K embeddings
                 crate::quantize::dequantize_q4_k(embed_data)?
-            }
+            },
             Some(dtype) => {
                 return Err(RealizarError::FormatError {
                     reason: format!("APR: unsupported embedding dtype: {dtype}"),
                 });
-            }
+            },
             None => {
                 return Err(RealizarError::FormatError {
                     reason: "APR: embedding tensor dtype not found".to_string(),
                 });
-            }
+            },
         };
 
         // Build layers
@@ -9977,10 +7891,12 @@ impl OwnedQuantizedModel {
             let attn_norm_data = get_tensor(&attn_norm_name)?;
             let ffn_norm_data = get_tensor(&ffn_norm_name)?;
 
-            let attn_norm_weight: Vec<f32> = attn_norm_data.chunks_exact(4)
+            let attn_norm_weight: Vec<f32> = attn_norm_data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let ffn_norm_weight: Vec<f32> = ffn_norm_data.chunks_exact(4)
+            let ffn_norm_weight: Vec<f32> = ffn_norm_data
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
 
@@ -10003,24 +7919,30 @@ impl OwnedQuantizedModel {
         }
 
         // Output norm
-        let output_norm_name = apr.tensors.iter()
+        let output_norm_name = apr
+            .tensors
+            .iter()
             .find(|t| t.name.contains("output_norm") || t.name.contains("norm.weight"))
-            .map(|t| t.name.as_str())
-            .unwrap_or("output_norm.weight");
+            .map_or("output_norm.weight", |t| t.name.as_str());
 
         let output_norm_data = get_tensor(output_norm_name)?;
-        let output_norm_weight: Vec<f32> = output_norm_data.chunks_exact(4)
+        let output_norm_weight: Vec<f32> = output_norm_data
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
         // LM head - prioritize exact match, then contains (excluding layer tensors)
-        let lm_head_name = apr.tensors.iter()
+        let lm_head_name = apr
+            .tensors
+            .iter()
             .find(|t| t.name == "output.weight" || t.name == "lm_head.weight")
-            .or_else(|| apr.tensors.iter().find(|t|
-                !t.name.starts_with("blk.") &&
-                (t.name.contains("output.weight") || t.name.contains("lm_head"))))
-            .map(|t| t.name.as_str())
-            .unwrap_or("output.weight");
+            .or_else(|| {
+                apr.tensors.iter().find(|t| {
+                    !t.name.starts_with("blk.")
+                        && (t.name.contains("output.weight") || t.name.contains("lm_head"))
+                })
+            })
+            .map_or("output.weight", |t| t.name.as_str());
 
         let lm_head_weight = make_tensor(lm_head_name, hidden_dim, vocab_size)?;
 
@@ -10039,36 +7961,6 @@ impl OwnedQuantizedModel {
             #[cfg(feature = "cuda")]
             cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
-    }
-
-    /// Create a new model for testing/benchmarking without loading from file
-    ///
-    /// This constructor handles the CUDA feature conditional fields automatically.
-    #[must_use]
-    pub fn new_for_benchmark(
-        config: GGUFConfig,
-        token_embedding: Vec<f32>,
-        layers: Vec<OwnedQuantizedLayer>,
-        output_norm_weight: Vec<f32>,
-        output_norm_bias: Option<Vec<f32>>,
-        lm_head_weight: OwnedQuantizedTensor,
-        lm_head_bias: Option<Vec<f32>>,
-    ) -> Self {
-        Self {
-            config,
-            token_embedding,
-            layers,
-            output_norm_weight,
-            output_norm_bias,
-            lm_head_weight,
-            lm_head_bias,
-            #[cfg(feature = "cuda")]
-            cuda_executor: None,
-            #[cfg(feature = "cuda")]
-            cuda_kernel_count: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(feature = "cuda")]
-            cached_weight_names: std::sync::Mutex::new(std::collections::HashSet::new()),
-        }
     }
 
     /// Serialize model to APR format with quantized weights preserved
@@ -10133,7 +8025,13 @@ impl OwnedQuantizedModel {
         }
 
         // Helper to write tensor entry to binary format
-        fn write_tensor_entry(name: &str, dtype: &str, shape: &[usize], offset: u64, size: u64) -> Vec<u8> {
+        fn write_tensor_entry(
+            name: &str,
+            dtype: &str,
+            shape: &[usize],
+            offset: u64,
+            size: u64,
+        ) -> Vec<u8> {
             let mut entry = Vec::new();
 
             // Name: 2-byte length + bytes
@@ -10168,7 +8066,9 @@ impl OwnedQuantizedModel {
         let mut tensors: Vec<TensorInfo> = Vec::new();
 
         // Token embedding (F32)
-        let embed_bytes: Vec<u8> = self.token_embedding.iter()
+        let embed_bytes: Vec<u8> = self
+            .token_embedding
+            .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
         tensors.push(TensorInfo {
@@ -10184,7 +8084,9 @@ impl OwnedQuantizedModel {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention norm (F32)
-            let norm_bytes: Vec<u8> = layer.attn_norm_weight.iter()
+            let norm_bytes: Vec<u8> = layer
+                .attn_norm_weight
+                .iter()
                 .flat_map(|f| f.to_le_bytes())
                 .collect();
             tensors.push(TensorInfo {
@@ -10215,7 +8117,7 @@ impl OwnedQuantizedModel {
                         shape: vec![kv_dim, self.config.hidden_dim],
                         data: v.data.clone(),
                     });
-                }
+                },
                 OwnedQKVWeights::Fused(t) => {
                     // Store as fused QKV tensor
                     tensors.push(TensorInfo {
@@ -10224,7 +8126,7 @@ impl OwnedQuantizedModel {
                         shape: vec![t.out_dim, t.in_dim],
                         data: t.data.clone(),
                     });
-                }
+                },
             }
 
             // Output projection (quantized)
@@ -10237,9 +8139,7 @@ impl OwnedQuantizedModel {
 
             // FFN norm (F32)
             if let Some(ref ffn_norm) = layer.ffn_norm_weight {
-                let norm_bytes: Vec<u8> = ffn_norm.iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
+                let norm_bytes: Vec<u8> = ffn_norm.iter().flat_map(|f| f.to_le_bytes()).collect();
                 tensors.push(TensorInfo {
                     name: format!("blk.{layer_idx}.ffn_norm.weight"),
                     dtype: "F32".to_string(),
@@ -10274,7 +8174,9 @@ impl OwnedQuantizedModel {
         }
 
         // Output norm (F32)
-        let output_norm_bytes: Vec<u8> = self.output_norm_weight.iter()
+        let output_norm_bytes: Vec<u8> = self
+            .output_norm_weight
+            .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
         tensors.push(TensorInfo {
@@ -10306,9 +8208,10 @@ impl OwnedQuantizedModel {
             "rope_theta": self.config.rope_theta,
             "context_length": self.config.context_length,
         });
-        let metadata_bytes = serde_json::to_vec(&metadata).map_err(|e| RealizarError::FormatError {
-            reason: format!("Failed to serialize metadata: {e}"),
-        })?;
+        let metadata_bytes =
+            serde_json::to_vec(&metadata).map_err(|e| RealizarError::FormatError {
+                reason: format!("Failed to serialize metadata: {e}"),
+            })?;
         let metadata_padded_len = metadata_bytes.len().div_ceil(ALIGNMENT) * ALIGNMENT;
 
         // Build tensor index and data
@@ -10353,7 +8256,8 @@ impl OwnedQuantizedModel {
         // checksum at 40-43 (leave as 0 for now)
 
         // Combine all parts
-        let total_size = HEADER_SIZE + metadata_padded_len + tensor_index_bytes.len() + tensor_data_bytes.len();
+        let total_size =
+            HEADER_SIZE + metadata_padded_len + tensor_index_bytes.len() + tensor_data_bytes.len();
         let mut result = Vec::with_capacity(total_size);
         result.extend_from_slice(&header);
         result.extend_from_slice(&metadata_bytes);
@@ -10985,19 +8889,28 @@ impl OwnedQuantizedModel {
 
                 // DIVERGENCE-DEBUG: Trace Q projection inputs
                 if std::env::var("QKV_DEBUG").is_ok() {
-                    eprintln!("[QKV_DEBUG] Q weight: in_dim={}, out_dim={}, qtype={}, data_len={}",
-                        q.in_dim, q.out_dim, q.qtype, q.data.len());
+                    eprintln!(
+                        "[QKV_DEBUG] Q weight: in_dim={}, out_dim={}, qtype={}, data_len={}",
+                        q.in_dim,
+                        q.out_dim,
+                        q.qtype,
+                        q.data.len()
+                    );
                     eprintln!("[QKV_DEBUG] Q weight first 16 bytes: {:?}", &q.data[..16]);
-                    eprintln!("[QKV_DEBUG] Input first 5: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                        input[0], input[1], input[2], input[3], input[4]);
+                    eprintln!(
+                        "[QKV_DEBUG] Input first 5: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
+                        input[0], input[1], input[2], input[3], input[4]
+                    );
                 }
 
                 let q_out = self.fused_matmul(input, q)?;
 
                 // DIVERGENCE-DEBUG: Trace Q projection output
                 if std::env::var("QKV_DEBUG").is_ok() {
-                    eprintln!("[QKV_DEBUG] Q output first 5: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
-                        q_out[0], q_out[1], q_out[2], q_out[3], q_out[4]);
+                    eprintln!(
+                        "[QKV_DEBUG] Q output first 5: [{:.6}, {:.6}, {:.6}, {:.6}, {:.6}]",
+                        q_out[0], q_out[1], q_out[2], q_out[3], q_out[4]
+                    );
                 }
                 let k_out = self.fused_matmul(input, k)?;
                 let v_out = self.fused_matmul(input, v)?;
@@ -11430,38 +9343,6 @@ impl OwnedQuantizedModel {
         }
     }
 
-    /// Convert f16 bytes to f32 (IEEE 754 half-precision)
-    #[cfg(feature = "cuda")]
-    #[inline]
-    fn f16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
-        let bits = u16::from_le_bytes(bytes);
-        let sign = ((bits >> 15) & 1) as u32;
-        let exp = ((bits >> 10) & 0x1F) as u32;
-        let mant = (bits & 0x3FF) as u32;
-
-        if exp == 0 {
-            // Subnormal or zero
-            if mant == 0 {
-                return if sign == 1 { -0.0 } else { 0.0 };
-            }
-            // Subnormal f16 -> denormalized f32
-            let f32_mant = mant << 13;
-            let f32_bits = (sign << 31) | f32_mant;
-            f32::from_bits(f32_bits) * (2.0f32).powi(-14)
-        } else if exp == 31 {
-            // Inf or NaN
-            let f32_exp = 0xFF;
-            let f32_mant = mant << 13;
-            let f32_bits = (sign << 31) | (f32_exp << 23) | f32_mant;
-            f32::from_bits(f32_bits)
-        } else {
-            // Normal number
-            let f32_exp = exp + 127 - 15;
-            let f32_mant = mant << 13;
-            let f32_bits = (sign << 31) | (f32_exp << 23) | f32_mant;
-            f32::from_bits(f32_bits)
-        }
-    }
 
     /// Look up token embeddings (public for debugging PAR-001)
     pub fn embed(&self, token_ids: &[u32]) -> Vec<f32> {
@@ -11868,8 +9749,10 @@ impl OwnedQuantizedModel {
 
             // CORRECTNESS-011: CPU intermediate debug at L0
             if cpu_debug_layers && layer_idx < 2 {
-                eprintln!("[CPU-L{}] RMSNorm: first 3 = [{:.4}, {:.4}, {:.4}]",
-                    layer_idx, normed[0], normed[1], normed[2]);
+                eprintln!(
+                    "[CPU-L{}] RMSNorm: first 3 = [{:.4}, {:.4}, {:.4}]",
+                    layer_idx, normed[0], normed[1], normed[2]
+                );
             }
 
             // 2b. QKV projection with FUSED dequant+dot (1.37x faster)
@@ -11892,15 +9775,31 @@ impl OwnedQuantizedModel {
 
             // CORRECTNESS-011: Q, K, V before RoPE (after bias)
             if cpu_debug_layers && (layer_idx < 2 || layer_idx == 4 || layer_idx == 5) {
-                eprintln!("[CPU-L{}] Q (before RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                    layer_idx, qkv[0], qkv[1], qkv[2], qkv[3], qkv[4]);
+                eprintln!(
+                    "[CPU-L{}] Q (before RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                    layer_idx, qkv[0], qkv[1], qkv[2], qkv[3], qkv[4]
+                );
                 // K starts at q_dim offset
-                eprintln!("[CPU-L{}] K (before RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                    layer_idx, qkv[q_dim], qkv[q_dim+1], qkv[q_dim+2], qkv[q_dim+3], qkv[q_dim+4]);
+                eprintln!(
+                    "[CPU-L{}] K (before RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                    layer_idx,
+                    qkv[q_dim],
+                    qkv[q_dim + 1],
+                    qkv[q_dim + 2],
+                    qkv[q_dim + 3],
+                    qkv[q_dim + 4]
+                );
                 // V starts at q_dim + k_dim offset
                 let v_offset = q_dim + k_dim;
-                eprintln!("[CPU-L{}] V (before RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                    layer_idx, qkv[v_offset], qkv[v_offset+1], qkv[v_offset+2], qkv[v_offset+3], qkv[v_offset+4]);
+                eprintln!(
+                    "[CPU-L{}] V (before RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                    layer_idx,
+                    qkv[v_offset],
+                    qkv[v_offset + 1],
+                    qkv[v_offset + 2],
+                    qkv[v_offset + 3],
+                    qkv[v_offset + 4]
+                );
             }
 
             // 2c. Proper attention with RoPE and causal mask (IMP-101)
@@ -11926,12 +9825,18 @@ impl OwnedQuantizedModel {
 
                 // CORRECTNESS-011: Q after RoPE at position 0
                 if cpu_debug_layers && layer_idx < 2 && s == 0 {
-                    eprintln!("[CPU-L{}] Q (after RoPE): first 3 = [{:.4}, {:.4}, {:.4}]",
-                        layer_idx, q[0], q[1], q[2]);
-                    eprintln!("[CPU-L{}] K (after RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                        layer_idx, k[0], k[1], k[2], k[3], k[4]);
-                    eprintln!("[CPU-L{}] V: first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                        layer_idx, v[0], v[1], v[2], v[3], v[4]);
+                    eprintln!(
+                        "[CPU-L{}] Q (after RoPE): first 3 = [{:.4}, {:.4}, {:.4}]",
+                        layer_idx, q[0], q[1], q[2]
+                    );
+                    eprintln!(
+                        "[CPU-L{}] K (after RoPE): first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                        layer_idx, k[0], k[1], k[2], k[3], k[4]
+                    );
+                    eprintln!(
+                        "[CPU-L{}] V: first 5 = [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                        layer_idx, v[0], v[1], v[2], v[3], v[4]
+                    );
                 }
 
                 q_all.extend_from_slice(&q);
@@ -11944,8 +9849,10 @@ impl OwnedQuantizedModel {
 
             // CORRECTNESS-011: Attention output
             if cpu_debug_layers && layer_idx < 2 {
-                eprintln!("[CPU-L{}] Attn output: first 3 = [{:.4}, {:.4}, {:.4}]",
-                    layer_idx, attn_out[0], attn_out[1], attn_out[2]);
+                eprintln!(
+                    "[CPU-L{}] Attn output: first 3 = [{:.4}, {:.4}, {:.4}]",
+                    layer_idx, attn_out[0], attn_out[1], attn_out[2]
+                );
             }
 
             // 2d. Attention output projection with FUSED ops
@@ -12050,7 +9957,10 @@ impl OwnedQuantizedModel {
             let rms = (sq_sum / last_hidden_raw.len() as f32).sqrt();
 
             eprintln!("[CORRECTNESS-011] CPU Hidden before output_norm:");
-            eprintln!("  first 5 = {:?}", &last_hidden_raw[..5.min(last_hidden_raw.len())]);
+            eprintln!(
+                "  first 5 = {:?}",
+                &last_hidden_raw[..5.min(last_hidden_raw.len())]
+            );
             eprintln!("  sum = {:.4}, rms = {:.4}", sum, rms);
             eprintln!("  (GPU shows: sum=466.2486, rms=39.4793)");
         }
@@ -12720,208 +10630,6 @@ impl OwnedQuantizedModel {
         output
     }
 
-    /// Batch FlashAttention: Process multiple queries with tiled attention (PARITY-026)
-    ///
-    /// GPU-optimized batch FlashAttention that processes multiple independent queries
-    /// against their respective KV caches. Each query has its own position and cache.
-    ///
-    /// # Key Properties
-    /// - Memory: O(batch * N) instead of O(batch * N²)
-    /// - Enables GPU parallelism across batch dimension
-    /// - Uses online softmax for numerical stability
-    ///
-    /// # Arguments
-    /// * `queries` - Batch of query vectors, each [hidden_dim]
-    /// * `kv_caches` - Per-query KV cache tuples: (k_cache, v_cache, current_k, current_v)
-    /// * `block_size` - Tile size for tiled computation
-    ///
-    /// # Returns
-    /// Batch of attention outputs, each [hidden_dim]
-    #[cfg(feature = "gpu")]
-    #[allow(clippy::type_complexity)]
-    pub fn batch_flash_attention_gpu(
-        &self,
-        queries: &[Vec<f32>],
-        kv_caches: &[(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)],
-        block_size: usize,
-    ) -> Vec<Vec<f32>> {
-        // Process each query with FlashAttention
-        // Note: This can be parallelized on GPU by processing all heads across all queries
-        queries
-            .iter()
-            .zip(kv_caches.iter())
-            .map(|(q, (k_cache, v_cache, curr_k, curr_v))| {
-                self.flash_attention_tiled(q, k_cache, v_cache, curr_k, curr_v, block_size)
-            })
-            .collect()
-    }
-
-    /// GPU-accelerated FlashAttention using wgpu matmul kernel (PARITY-030)
-    ///
-    /// This version uses trueno's GPU backend for the Q×K^T attention score
-    /// computation, which is the most compute-intensive part of attention.
-    ///
-    /// # Key Properties
-    /// - Uses GPU GEMM for Q×K^T (batch_size × seq_len attention scores)
-    /// - O(N) memory via online softmax (processed in tiles)
-    /// - Falls back to CPU for small sequences (< threshold)
-    ///
-    /// # GPU Dispatch Criteria (from IMP-600)
-    /// - GPU is 10x faster for GEMM when M*N*K >= batch_threshold³
-    /// - batch_threshold = 32 (from empirical benchmarks)
-    ///
-    /// # Arguments
-    /// * `scheduler` - HybridScheduler for GPU dispatch
-    /// * `queries` - Batch of query vectors [batch_size, hidden_dim]
-    /// * `keys` - Batch of key vectors [batch_size, seq_len, hidden_dim]
-    /// * `values` - Batch of value vectors [batch_size, seq_len, hidden_dim]
-    ///
-    /// # Returns
-    /// Batch of attention outputs [batch_size, hidden_dim]
-    #[cfg(feature = "gpu")]
-    pub fn flash_attention_wgpu_kernel(
-        &self,
-        scheduler: &mut crate::gpu::HybridScheduler,
-        queries: &[f32],
-        keys: &[f32],
-        values: &[f32],
-        batch_size: usize,
-        seq_len: usize,
-    ) -> Result<Vec<f32>> {
-        let hidden_dim = self.config.hidden_dim;
-        let num_heads = self.config.num_heads;
-        let head_dim = hidden_dim / num_heads;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        // GPU dispatch threshold: use GPU if workload is large enough
-        const GPU_BATCH_THRESHOLD: usize = 32;
-        let use_gpu = batch_size * seq_len >= GPU_BATCH_THRESHOLD;
-
-        let mut output = vec![0.0f32; batch_size * hidden_dim];
-
-        if use_gpu && seq_len > 1 {
-            // GPU path: Use batched matmul for Q×K^T
-            // Q: [batch_size, hidden_dim] -> reshape to [batch_size * num_heads, head_dim]
-            // K: [batch_size, seq_len, hidden_dim] -> reshape for matmul
-
-            for head in 0..num_heads {
-                let head_offset = head * head_dim;
-
-                for b in 0..batch_size {
-                    // Extract Q for this batch and head
-                    let q_start = b * hidden_dim + head_offset;
-                    let q_head: Vec<f32> = queries[q_start..q_start + head_dim].to_vec();
-
-                    // Extract K for this batch and head [seq_len, head_dim]
-                    let mut k_head = Vec::with_capacity(seq_len * head_dim);
-                    for s in 0..seq_len {
-                        let k_start = b * seq_len * hidden_dim + s * hidden_dim + head_offset;
-                        k_head.extend_from_slice(&keys[k_start..k_start + head_dim]);
-                    }
-
-                    // Q×K^T using GPU matmul: [1, head_dim] × [head_dim, seq_len] = [1, seq_len]
-                    // Transpose K: reshape to [head_dim, seq_len] for matmul
-                    let mut k_transposed = vec![0.0f32; head_dim * seq_len];
-                    for s in 0..seq_len {
-                        for d in 0..head_dim {
-                            k_transposed[d * seq_len + s] = k_head[s * head_dim + d];
-                        }
-                    }
-
-                    // GPU matmul: Q × K^T
-                    let scores = scheduler
-                        .matmul(&q_head, &k_transposed, 1, head_dim, seq_len)
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "flash_attention_wgpu Q×K^T".to_string(),
-                            reason: e.to_string(),
-                        })?;
-
-                    // Apply scale and causal mask
-                    let mut masked_scores = Vec::with_capacity(seq_len);
-                    for (s, &score) in scores.iter().enumerate() {
-                        // Causal: only attend to positions <= current
-                        if s < seq_len {
-                            masked_scores.push(score * scale);
-                        } else {
-                            masked_scores.push(f32::NEG_INFINITY);
-                        }
-                    }
-
-                    // Softmax (CPU for stability - small vector)
-                    let max_score = masked_scores
-                        .iter()
-                        .cloned()
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let mut exp_scores: Vec<f32> = masked_scores
-                        .iter()
-                        .map(|&s| (s - max_score).exp())
-                        .collect();
-                    let sum: f32 = exp_scores.iter().sum();
-                    if sum > 0.0 {
-                        for s in &mut exp_scores {
-                            *s /= sum;
-                        }
-                    }
-
-                    // Extract V for this batch and head [seq_len, head_dim]
-                    let mut v_head = Vec::with_capacity(seq_len * head_dim);
-                    for s in 0..seq_len {
-                        let v_start = b * seq_len * hidden_dim + s * hidden_dim + head_offset;
-                        v_head.extend_from_slice(&values[v_start..v_start + head_dim]);
-                    }
-
-                    // Attn × V using GPU matmul: [1, seq_len] × [seq_len, head_dim] = [1, head_dim]
-                    let attn_out = scheduler
-                        .matmul(&exp_scores, &v_head, 1, seq_len, head_dim)
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "flash_attention_wgpu Attn×V".to_string(),
-                            reason: e.to_string(),
-                        })?;
-
-                    // Write to output
-                    let out_start = b * hidden_dim + head_offset;
-                    output[out_start..out_start + head_dim].copy_from_slice(&attn_out);
-                }
-            }
-        } else {
-            // CPU fallback for small workloads
-            for head in 0..num_heads {
-                let head_offset = head * head_dim;
-
-                for b in 0..batch_size {
-                    let q_start = b * hidden_dim + head_offset;
-                    let q_head = &queries[q_start..q_start + head_dim];
-
-                    // Compute attention scores
-                    let mut scores = Vec::with_capacity(seq_len);
-                    for s in 0..seq_len {
-                        let k_start = b * seq_len * hidden_dim + s * hidden_dim + head_offset;
-                        let k_head = &keys[k_start..k_start + head_dim];
-
-                        let mut score = 0.0f32;
-                        for d in 0..head_dim {
-                            score += q_head[d] * k_head[d];
-                        }
-                        scores.push(score * scale);
-                    }
-
-                    // Softmax (SIMD-optimized, in-place)
-                    crate::quantize::softmax_simd(&mut scores);
-
-                    // Weighted sum of values
-                    let out_start = b * hidden_dim + head_offset;
-                    for (s, &weight) in scores.iter().enumerate() {
-                        let v_start = b * seq_len * hidden_dim + s * hidden_dim + head_offset;
-                        for d in 0..head_dim {
-                            output[out_start + d] += weight * values[v_start + d];
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(output)
-    }
 
     /// SIMD-optimized dot product for f32 slices
     #[inline]
@@ -13149,105 +10857,6 @@ impl OwnedQuantizedModel {
         output
     }
 
-    /// PAR-097: Batched attention with cache for speculative decode verification
-    ///
-    /// Computes attention for k query positions against cache + k new K/V entries.
-    /// Each query position i attends to [0..cache_len + i + 1] (causal mask).
-    ///
-    /// # Arguments
-    /// * `q_all` - Query vectors for k positions [k × hidden_dim]
-    /// * `k_cache` - Cached keys [cache_len × kv_dim]
-    /// * `v_cache` - Cached values [cache_len × kv_dim]
-    /// * `new_k` - Keys for k new positions [k × kv_dim]
-    /// * `new_v` - Values for k new positions [k × kv_dim]
-    /// * `batch_size` - Number of positions (k)
-    ///
-    /// # Returns
-    /// Attention outputs [k × hidden_dim]
-    pub fn batched_attention_with_cache_gqa(
-        &self,
-        q_all: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
-        new_k: &[f32],
-        new_v: &[f32],
-        batch_size: usize,
-    ) -> Vec<f32> {
-        let hidden_dim = self.config.hidden_dim;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = hidden_dim / num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let q_per_kv = num_heads / num_kv_heads;
-        let cache_len = if kv_dim > 0 {
-            k_cache.len() / kv_dim
-        } else {
-            0
-        };
-
-        let mut output = vec![0.0f32; batch_size * hidden_dim];
-
-        // Process each query position
-        for pos_idx in 0..batch_size {
-            let q_offset = pos_idx * hidden_dim;
-            let out_offset = pos_idx * hidden_dim;
-
-            // This query attends to [0..cache_len + pos_idx + 1]
-            let attend_len = cache_len + pos_idx + 1;
-
-            for q_head in 0..num_heads {
-                let q_head_offset = q_head * head_dim;
-                let q_head_data =
-                    &q_all[q_offset + q_head_offset..q_offset + q_head_offset + head_dim];
-
-                let kv_head = q_head / q_per_kv;
-                let kv_head_offset = kv_head * head_dim;
-
-                let mut scores = Vec::with_capacity(attend_len);
-
-                // Scores against cached positions [0..cache_len]
-                for cache_pos in 0..cache_len {
-                    let k_start = cache_pos * kv_dim + kv_head_offset;
-                    let cached_key = &k_cache[k_start..k_start + head_dim];
-                    let score = Self::simd_dot_f32(q_head_data, cached_key);
-                    scores.push(score * scale);
-                }
-
-                // Scores against new positions [0..pos_idx + 1]
-                for new_pos in 0..=pos_idx {
-                    let k_start = new_pos * kv_dim + kv_head_offset;
-                    let new_key = &new_k[k_start..k_start + head_dim];
-                    let score = Self::simd_dot_f32(q_head_data, new_key);
-                    scores.push(score * scale);
-                }
-
-                // Softmax (SIMD-optimized)
-                crate::quantize::softmax_simd(&mut scores);
-
-                // Weighted sum of values
-                let out_head =
-                    &mut output[out_offset + q_head_offset..out_offset + q_head_offset + head_dim];
-
-                // Contribution from cached values
-                for (cache_pos, &weight) in scores.iter().enumerate().take(cache_len) {
-                    let v_start = cache_pos * kv_dim + kv_head_offset;
-                    let cached_val = &v_cache[v_start..v_start + head_dim];
-                    Self::simd_axpy_f32(out_head, weight, cached_val);
-                }
-
-                // Contribution from new values
-                for (new_pos, &weight) in scores.iter().skip(cache_len).enumerate() {
-                    let v_start = new_pos * kv_dim + kv_head_offset;
-                    let new_val = &new_v[v_start..v_start + head_dim];
-                    Self::simd_axpy_f32(out_head, weight, new_val);
-                }
-            }
-        }
-
-        output
-    }
 
     /// Attention with cache - writes to pre-allocated buffer (IMP-131)
     pub fn attention_with_cache_gqa_into(
@@ -13807,279 +11416,7 @@ impl OwnedQuantizedModel {
     /// # Arguments
     /// * `token_id` - Token to process
     /// * `cache` - KV cache for incremental decoding
-    /// * `position` - Position in sequence
-    /// * `scratch` - Pre-allocated scratch buffers
     ///
-    /// # Returns
-    /// Logits slice from the scratch buffer
-    pub fn forward_single_with_cache_scratch<'a>(
-        &self,
-        token_id: u32,
-        cache: &mut OwnedQuantizedKVCache,
-        position: usize,
-        scratch: &'a mut OwnedInferenceScratchBuffer,
-    ) -> Result<&'a [f32]> {
-        let hidden_dim = self.config.hidden_dim;
-
-        // 1. Token embedding lookup
-        let hidden = self.embed(&[token_id]);
-
-        // Detect if model uses RMSNorm (LLaMA-style) or LayerNorm (phi-2 style)
-        let use_rmsnorm = self
-            .layers
-            .first()
-            .is_some_and(|l| l.ffn_gate_weight.is_some() && l.attn_norm_bias.is_none());
-
-        // Working hidden state (can't avoid this allocation easily)
-        let mut working_hidden = hidden;
-
-        // 2. Process through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // 2a+2b. Fused attention layer norm + QKV projection
-            let mut qkv = if use_rmsnorm {
-                self.fused_rmsnorm_qkv_matmul(
-                    &working_hidden,
-                    &layer.attn_norm_weight,
-                    self.config.eps,
-                    &layer.qkv_weight,
-                )?
-            } else {
-                let normed = self.layer_norm(
-                    &working_hidden,
-                    &layer.attn_norm_weight,
-                    layer.attn_norm_bias.as_deref(),
-                    self.config.eps,
-                );
-                self.qkv_matmul(&normed, &layer.qkv_weight)?
-            };
-            if let Some(ref bias) = layer.qkv_bias {
-                self.add_bias(&mut qkv, bias);
-            }
-
-            // 2c. Extract Q, K, V with GQA-aware sizes and apply RoPE
-            let num_kv_heads = self.config.num_kv_heads;
-            let head_dim = hidden_dim / self.config.num_heads;
-            let kv_dim = num_kv_heads * head_dim;
-
-            // Apply RoPE in-place to Q and K within QKV buffer
-            self.apply_rope(&mut qkv[0..hidden_dim], position, self.config.num_heads);
-            self.apply_rope(
-                &mut qkv[hidden_dim..hidden_dim + kv_dim],
-                position,
-                num_kv_heads,
-            );
-
-            // Use slices to avoid copies
-            let q = &qkv[0..hidden_dim];
-            let k = &qkv[hidden_dim..hidden_dim + kv_dim];
-            let v = &qkv[hidden_dim + kv_dim..hidden_dim + 2 * kv_dim];
-
-            // 2d. Get cached K/V and compute attention
-            let k_cache = cache.get_k(layer_idx);
-            let v_cache = cache.get_v(layer_idx);
-
-            // Reuse scratch.attn_out for attention output
-            scratch.attn_out.clear();
-            scratch.attn_out.resize(hidden_dim, 0.0);
-
-            if k_cache.is_empty() {
-                // First token - expand V if GQA
-                let q_per_kv = self.config.num_heads / num_kv_heads;
-                for q_head in 0..self.config.num_heads {
-                    let kv_head = q_head / q_per_kv;
-                    let v_start = kv_head * head_dim;
-                    let out_start = q_head * head_dim;
-                    scratch.attn_out[out_start..out_start + head_dim]
-                        .copy_from_slice(&v[v_start..v_start + head_dim]);
-                }
-            } else {
-                // Use cached K/V for attention with GQA
-                // Use pre-allocated buffer to avoid 704 Vec allocations per token
-                self.attention_with_cache_gqa_into(
-                    q,
-                    k_cache,
-                    v_cache,
-                    k,
-                    v,
-                    &mut scratch.attn_out,
-                );
-            }
-
-            // 2e. Store K and V in cache
-            cache.append(layer_idx, k, v);
-
-            // 2f. Attention output projection
-            let mut attn_output =
-                self.fused_matmul(&scratch.attn_out, &layer.attn_output_weight)?;
-            if let Some(ref bias) = layer.attn_output_bias {
-                self.add_bias(&mut attn_output, bias);
-            }
-
-            // 2g. Residual connection
-            for i in 0..hidden_dim {
-                working_hidden[i] += attn_output[i];
-            }
-
-            // 2h+2i. FFN with SwiGLU/GELU
-            // For RMSNorm+SwiGLU: use zero-allocation path with scratch buffers
-            // For other paths: use allocating path
-            let ffn_output = if use_rmsnorm
-                && layer.ffn_norm_weight.is_some()
-                && layer.ffn_gate_weight.is_some()
-            {
-                // SAFETY: is_some() checked above in the if condition
-                let ffn_norm = layer
-                    .ffn_norm_weight
-                    .as_ref()
-                    .expect("ffn_norm_weight checked above");
-                let gate_weight = layer
-                    .ffn_gate_weight
-                    .as_ref()
-                    .expect("ffn_gate_weight checked above");
-
-                // Get FFN dimensions for this layer
-                let ffn_out_dim = layer.ffn_up_weight.out_dim;
-
-                // Resize scratch buffers to match layer dimensions
-                scratch.ffn_up.resize(ffn_out_dim, 0.0);
-                scratch.ffn_gate.resize(ffn_out_dim, 0.0);
-
-                // Zero-allocation FFN using scratch buffers
-                crate::quantize::fused_rmsnorm_ffn_up_gate_into(
-                    &working_hidden,
-                    ffn_norm,
-                    self.config.eps,
-                    &layer.ffn_up_weight.data,
-                    &gate_weight.data,
-                    hidden_dim,
-                    ffn_out_dim,
-                    &mut scratch.ffn_up,
-                    &mut scratch.ffn_gate,
-                    &mut scratch.q8_scales,
-                    &mut scratch.q8_quants,
-                )?;
-
-                if let Some(ref bias) = layer.ffn_up_bias {
-                    self.add_bias(&mut scratch.ffn_up, bias);
-                }
-                if let Some(ref bias) = layer.ffn_gate_bias {
-                    self.add_bias(&mut scratch.ffn_gate, bias);
-                }
-
-                // SwiGLU: silu(gate) * up, result in ffn_gate
-                self.silu(&mut scratch.ffn_gate);
-                for i in 0..scratch.ffn_gate.len() {
-                    scratch.ffn_gate[i] *= scratch.ffn_up[i];
-                }
-
-                // FFN down projection using scratch buffer directly
-                let mut result = self.fused_matmul(&scratch.ffn_gate, &layer.ffn_down_weight)?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut result, bias);
-                }
-                result
-            } else {
-                // Non-optimized paths
-                let ffn_activated = match (&layer.ffn_norm_weight, &layer.ffn_gate_weight) {
-                    // Non-fused SwiGLU
-                    (ffn_norm_opt, Some(ref gate_weight)) => {
-                        let ffn_input = if let Some(ref ffn_norm) = ffn_norm_opt {
-                            self.layer_norm(
-                                &working_hidden,
-                                ffn_norm,
-                                layer.ffn_norm_bias.as_deref(),
-                                self.config.eps,
-                            )
-                        } else {
-                            working_hidden.clone()
-                        };
-
-                        let mut ffn_up = self.fused_matmul(&ffn_input, &layer.ffn_up_weight)?;
-                        if let Some(ref bias) = layer.ffn_up_bias {
-                            self.add_bias(&mut ffn_up, bias);
-                        }
-
-                        let mut ffn_gate = self.fused_matmul(&ffn_input, gate_weight)?;
-                        if let Some(ref bias) = layer.ffn_gate_bias {
-                            self.add_bias(&mut ffn_gate, bias);
-                        }
-
-                        // SwiGLU: silu(gate) * up
-                        self.silu(&mut ffn_gate);
-                        for i in 0..ffn_gate.len() {
-                            ffn_gate[i] *= ffn_up[i];
-                        }
-                        ffn_gate
-                    },
-
-                    // GELU path
-                    (ffn_norm_opt, None) => {
-                        let ffn_input = if let Some(ref ffn_norm) = ffn_norm_opt {
-                            if use_rmsnorm {
-                                self.rms_norm(&working_hidden, ffn_norm, self.config.eps)
-                            } else {
-                                self.layer_norm(
-                                    &working_hidden,
-                                    ffn_norm,
-                                    layer.ffn_norm_bias.as_deref(),
-                                    self.config.eps,
-                                )
-                            }
-                        } else {
-                            working_hidden.clone()
-                        };
-
-                        let mut ffn_hidden = self.fused_matmul(&ffn_input, &layer.ffn_up_weight)?;
-                        if let Some(ref bias) = layer.ffn_up_bias {
-                            self.add_bias(&mut ffn_hidden, bias);
-                        }
-                        self.gelu(&mut ffn_hidden);
-                        ffn_hidden
-                    },
-                };
-
-                // FFN down projection
-                let mut result = self.fused_matmul(&ffn_activated, &layer.ffn_down_weight)?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut result, bias);
-                }
-                result
-            };
-
-            // Residual
-            for i in 0..hidden_dim {
-                working_hidden[i] += ffn_output[i];
-            }
-        }
-
-        // Advance cache position
-        cache.advance();
-
-        // 3+4. Fused final layer norm + LM head projection
-        // Reuse scratch.logits for output
-        let logits_vec = if use_rmsnorm {
-            self.fused_rmsnorm_lm_head(&working_hidden)?
-        } else {
-            let normed = self.layer_norm(
-                &working_hidden,
-                &self.output_norm_weight,
-                self.output_norm_bias.as_deref(),
-                self.config.eps,
-            );
-            self.fused_matmul(&normed, &self.lm_head_weight)?
-        };
-
-        // Copy to scratch buffer (this is the output)
-        scratch.logits.clear();
-        scratch.logits.extend_from_slice(&logits_vec);
-
-        if let Some(ref bias) = self.lm_head_bias {
-            self.add_bias(&mut scratch.logits, bias);
-        }
-
-        Ok(&scratch.logits)
-    }
-
     /// Forward pass with adaptive CPU/GPU attention selection (IMP-124)
     ///
     /// This variant of `forward_single_with_cache` uses `adaptive_attention_with_cache`
@@ -14533,7 +11870,6 @@ impl OwnedQuantizedModel {
 
         Ok(tokens)
     }
-
     /// Generate tokens with zero-allocation inference (IMP-131)
     ///
     /// This is the highest-performance generation path. Uses pre-allocated
@@ -14668,7 +12004,6 @@ impl OwnedQuantizedModel {
             // like 0.5B (hidden=896), fall back to f32 path.
             let use_q8k_path = hidden_dim.is_multiple_of(256);
 
-
             if use_q8k_path {
                 use crate::quantize::quantize_activations_q8k_into;
                 let hidden_sb = hidden_dim / 256;
@@ -14753,11 +12088,12 @@ impl OwnedQuantizedModel {
             // 2d. Attention output projection → scratch.attn_proj
             // PAR-128: Use Q8K-accelerated path for attention output projection
             // attn_out is hidden_dim sized, reuse hidden Q8K buffers
-            let use_q8k_attn_out = use_q8k_path
-                && layer.attn_output_weight.qtype == GGUF_TYPE_Q4_K;
+            let use_q8k_attn_out = use_q8k_path && layer.attn_output_weight.qtype == GGUF_TYPE_Q4_K;
 
             if use_q8k_attn_out {
-                use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+                use crate::quantize::{
+                    fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into,
+                };
                 let hidden_sb = hidden_dim / 256;
                 // Quantize attention output to Q8K (reuse hidden Q8K buffers)
                 quantize_activations_q8k_into(
@@ -14937,7 +12273,9 @@ impl OwnedQuantizedModel {
                     && layer.ffn_down_weight.qtype == GGUF_TYPE_Q4_K;
 
                 if use_q8k_down {
-                    use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+                    use crate::quantize::{
+                        fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into,
+                    };
                     let inter_sb = intermediate_dim / 256;
                     quantize_activations_q8k_into(
                         &scratch.ffn_gate[..intermediate_dim],
@@ -14967,8 +12305,7 @@ impl OwnedQuantizedModel {
             } else {
                 // GELU path (phi-2)
                 // PAR-129: Use Q8K-accelerated FFN for GELU models (Q4K only)
-                let use_q8k_gelu_up = use_q8k_path
-                    && layer.ffn_up_weight.qtype == GGUF_TYPE_Q4_K;
+                let use_q8k_gelu_up = use_q8k_path && layer.ffn_up_weight.qtype == GGUF_TYPE_Q4_K;
                 let use_q8k_gelu_down = intermediate_dim.is_multiple_of(256)
                     && layer.ffn_down_weight.qtype == GGUF_TYPE_Q4_K;
 
@@ -14999,7 +12336,9 @@ impl OwnedQuantizedModel {
                 self.gelu(&mut scratch.ffn_up[..intermediate_dim]);
 
                 if use_q8k_gelu_down {
-                    use crate::quantize::{fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into};
+                    use crate::quantize::{
+                        fused_q4k_q8k_parallel_matvec_into, quantize_activations_q8k_into,
+                    };
                     let inter_sb = intermediate_dim / 256;
                     quantize_activations_q8k_into(
                         &scratch.ffn_up[..intermediate_dim],
@@ -15062,186 +12401,6 @@ impl OwnedQuantizedModel {
         Ok(())
     }
 
-    /// Forward pass with contiguous KV cache (PARITY-005)
-    ///
-    /// This variant uses `ContiguousKVCache` which provides:
-    /// - Single contiguous allocation (better prefetching)
-    /// - 64-byte cache line alignment (reduced cache misses)
-    /// - Sequential memory access pattern
-    ///
-    /// # Arguments
-    /// * `token_id` - Token to process
-    /// * `cache` - Contiguous KV cache
-    /// * `position` - Position in sequence
-    ///
-    /// # Returns
-    /// Logits for next token prediction [vocab_size]
-    pub fn forward_single_with_contiguous_cache(
-        &self,
-        token_id: u32,
-        cache: &mut ContiguousKVCache,
-        position: usize,
-    ) -> Result<Vec<f32>> {
-        let hidden_dim = self.config.hidden_dim;
-
-        // 1. Token embedding lookup
-        let mut hidden = self.embed(&[token_id]);
-
-        // 2. Process through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // 2a. Attention layer norm
-            let normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // 2b. QKV projection
-            let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
-            if let Some(ref bias) = layer.qkv_bias {
-                self.add_bias(&mut qkv, bias);
-            }
-
-            // 2c. Extract Q, K, V and apply RoPE
-            // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
-            let mut q = qkv[0..hidden_dim].to_vec();
-            let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
-            let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
-
-            self.apply_rope(&mut q, position, self.config.num_heads);
-            self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
-
-            // 2d. Get cached K/V and compute attention (PARITY-005: contiguous access)
-            let k_cache = cache.get_k(layer_idx);
-            let v_cache = cache.get_v(layer_idx);
-
-            let attn_out = if k_cache.is_empty() {
-                // First token - no cache yet, output is just weighted V
-                v.clone()
-            } else {
-                // Use cached K/V for attention (sequential memory access)
-                self.attention_with_cache(&q, k_cache, v_cache, &k, &v)
-            };
-
-            // 2e. Store K and V in cache (PARITY-005: contiguous storage)
-            cache.append(layer_idx, &k, &v);
-
-            // 2f. Attention output projection
-            let mut attn_output = self.fused_matmul(&attn_out, &layer.attn_output_weight)?;
-            if let Some(ref bias) = layer.attn_output_bias {
-                self.add_bias(&mut attn_output, bias);
-            }
-
-            // 2g. Residual connection
-            for i in 0..hidden_dim {
-                hidden[i] += attn_output[i];
-            }
-
-            // 2h. FFN
-            let mut ffn_hidden = self.fused_matmul(&hidden, &layer.ffn_up_weight)?;
-            if let Some(ref bias) = layer.ffn_up_bias {
-                self.add_bias(&mut ffn_hidden, bias);
-            }
-            self.gelu(&mut ffn_hidden);
-
-            let mut ffn_output = self.fused_matmul(&ffn_hidden, &layer.ffn_down_weight)?;
-            if let Some(ref bias) = layer.ffn_down_bias {
-                self.add_bias(&mut ffn_output, bias);
-            }
-
-            // Residual
-            for i in 0..hidden_dim {
-                hidden[i] += ffn_output[i];
-            }
-        }
-
-        // Advance cache position after processing all layers
-        cache.advance();
-
-        // 3. Final layer norm
-        let normed = self.layer_norm(
-            &hidden,
-            &self.output_norm_weight,
-            self.output_norm_bias.as_deref(),
-            self.config.eps,
-        );
-
-        // 4. LM head projection
-        let mut logits = self.fused_matmul(&normed, &self.lm_head_weight)?;
-        if let Some(ref bias) = self.lm_head_bias {
-            self.add_bias(&mut logits, bias);
-        }
-
-        Ok(logits)
-    }
-
-    /// Generate tokens with contiguous KV cache (PARITY-005)
-    ///
-    /// This variant uses `ContiguousKVCache` which provides:
-    /// - Single contiguous allocation (better prefetching)
-    /// - 64-byte cache line alignment (reduced cache misses)
-    /// - Sequential memory access pattern
-    ///
-    /// # Arguments
-    /// * `prompt` - Initial token IDs
-    /// * `config` - Generation configuration
-    ///
-    /// # Returns
-    /// Generated token sequence including prompt
-    ///
-    /// # Performance
-    /// Target: L2 cache hit rate >90% (vs <70% with Vec<Vec<f32>>)
-    pub fn generate_with_contiguous_cache(
-        &self,
-        prompt: &[u32],
-        config: &QuantizedGenerateConfig,
-    ) -> Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Err(RealizarError::InvalidShape {
-                reason: "Prompt cannot be empty".to_string(),
-            });
-        }
-
-        let max_seq_len = prompt.len() + config.max_tokens;
-        let mut cache = ContiguousKVCache::from_config(&self.config, max_seq_len);
-        let mut tokens = prompt.to_vec();
-
-        // Process prompt tokens (prefill)
-        for (pos, &token_id) in prompt.iter().enumerate() {
-            let _ = self.forward_single_with_contiguous_cache(token_id, &mut cache, pos)?;
-        }
-
-        // Generate new tokens
-        for gen_idx in 0..config.max_tokens {
-            let position = prompt.len() + gen_idx;
-            let last_token = *tokens.last().expect("tokens must be non-empty");
-
-            let logits =
-                self.forward_single_with_contiguous_cache(last_token, &mut cache, position)?;
-
-            // Sample next token
-            let next_token = if config.temperature == 0.0 || config.top_k == 1 {
-                Self::argmax(&logits)
-            } else {
-                Self::sample_topk(&logits, config.temperature, config.top_k)
-            };
-
-            // Check stop condition
-            if config.stop_tokens.contains(&next_token) {
-                break;
-            }
-
-            tokens.push(next_token);
-
-            // Check max length
-            if tokens.len() >= max_seq_len {
-                break;
-            }
-        }
-
-        Ok(tokens)
-    }
 
     /// Generate tokens with adaptive CPU/GPU attention (IMP-125)
     ///
@@ -15510,114 +12669,6 @@ impl OwnedQuantizedModel {
         self.cpu_batched_attention(
             all_q, all_k, all_v, cached_k, cached_v, cache_len, hidden_dim, num_heads, head_dim,
         )
-    }
-
-    /// GPU-accelerated batched attention using trueno GpuBackend::matmul (PARITY-002)
-    ///
-    /// This uses actual GPU matrix multiplication for Q @ K^T, which is the
-    /// computationally expensive part of attention.
-    ///
-    /// NOTE: Currently disabled because GPU is 6.6x SLOWER than CPU for attention.
-    /// Reason: Attention = per-head MATVEC, GPU overhead dominates for small matrices.
-    /// See batched_attention_with_cache() for details on why CPU path is used.
-    ///
-    /// Kept for future use with FlashAttention or batched multi-request inference.
-    #[cfg(feature = "gpu")]
-    #[allow(dead_code)] // Intentionally unused - CPU path is faster for attention MATVEC
-    #[allow(clippy::too_many_arguments)] // Attention requires all these parameters
-    fn gpu_batched_attention(
-        &self,
-        all_q: &[Vec<f32>],
-        all_k: &[Vec<f32>],
-        all_v: &[Vec<f32>],
-        cached_k: &[f32],
-        cached_v: &[f32],
-        cache_len: usize,
-        hidden_dim: usize,
-        num_heads: usize,
-        head_dim: usize,
-    ) -> Result<Vec<Vec<f32>>> {
-        let seq_len = all_q.len();
-        let total_len = cache_len + seq_len;
-
-        // Initialize GPU backend (lazy)
-        let mut gpu = GpuBackend::new();
-
-        // Build flattened K and V matrices: [total_len, hidden_dim]
-        let mut k_flat = Vec::with_capacity(total_len * hidden_dim);
-        let mut v_flat = Vec::with_capacity(total_len * hidden_dim);
-
-        // Add cached K/V first
-        k_flat.extend_from_slice(cached_k);
-        v_flat.extend_from_slice(cached_v);
-
-        // Add current sequence K/V
-        for k in all_k {
-            k_flat.extend_from_slice(k);
-        }
-        for v in all_v {
-            v_flat.extend_from_slice(v);
-        }
-
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut outputs = Vec::with_capacity(seq_len);
-
-        // Process each query position with causal masking
-        for (q_pos, q) in all_q.iter().enumerate() {
-            // For causal attention, only attend to positions <= q_pos
-            let attend_len = cache_len + q_pos + 1;
-            let mut output = vec![0.0; hidden_dim];
-
-            // Process each head using GPU matmul for Q @ K^T
-            for head in 0..num_heads {
-                let head_start = head * head_dim;
-
-                // Extract Q for this head: [1, head_dim]
-                let q_head: Vec<f32> = q[head_start..head_start + head_dim].to_vec();
-
-                // Extract K for this head: [attend_len, head_dim] -> transpose to [head_dim, attend_len]
-                let mut k_head_t = vec![0.0f32; head_dim * attend_len];
-                for (pos, k_pos) in (0..attend_len).enumerate() {
-                    let k_offset = k_pos * hidden_dim + head_start;
-                    for d in 0..head_dim {
-                        // K^T: [head_dim, attend_len] = K transposed
-                        k_head_t[d * attend_len + pos] = k_flat[k_offset + d];
-                    }
-                }
-
-                // GPU matmul: Q[1, head_dim] @ K^T[head_dim, attend_len] = scores[1, attend_len]
-                let scores_raw = gpu
-                    .matmul(&q_head, &k_head_t, 1, head_dim, attend_len)
-                    .map_err(|e| RealizarError::GpuError { reason: e })?;
-
-                // Scale scores
-                let mut scores: Vec<f32> = scores_raw.iter().map(|&s| s * scale).collect();
-
-                // Softmax (SIMD-optimized, in-place)
-                crate::quantize::softmax_simd(&mut scores);
-
-                // Weighted sum of values using GPU matmul
-                // scores[1, attend_len] @ V[attend_len, head_dim] = output[1, head_dim]
-                let mut v_head = vec![0.0f32; attend_len * head_dim];
-                for (pos, v_pos) in (0..attend_len).enumerate() {
-                    let v_offset = v_pos * hidden_dim + head_start;
-                    for d in 0..head_dim {
-                        v_head[pos * head_dim + d] = v_flat[v_offset + d];
-                    }
-                }
-
-                let head_output = gpu
-                    .matmul(&scores, &v_head, 1, attend_len, head_dim)
-                    .map_err(|e| RealizarError::GpuError { reason: e })?;
-
-                // Copy to output
-                output[head_start..head_start + head_dim].copy_from_slice(&head_output);
-            }
-
-            outputs.push(output);
-        }
-
-        Ok(outputs)
     }
 
     /// CPU-based batched attention (fallback for small workloads)
@@ -15896,8 +12947,8 @@ impl OwnedQuantizedModel {
         let max_seq_len = max_prompt_len + config.max_tokens;
 
         // Create KV caches for each request
-        let mut caches: Vec<ContiguousKVCache> = (0..batch_size)
-            .map(|_| ContiguousKVCache::from_config(&self.config, max_seq_len))
+        let mut caches: Vec<OwnedQuantizedKVCache> = (0..batch_size)
+            .map(|_| OwnedQuantizedKVCache::from_config(&self.config, max_seq_len))
             .collect();
 
         // Initialize token sequences with prompts
@@ -15910,7 +12961,7 @@ impl OwnedQuantizedModel {
         for (req_idx, prompt) in prompts.iter().enumerate() {
             for (pos, &token_id) in prompt.iter().enumerate() {
                 let _ =
-                    self.forward_single_with_contiguous_cache(token_id, &mut caches[req_idx], pos)?;
+                    self.forward_single_with_cache(token_id, &mut caches[req_idx], pos)?;
             }
         }
 
@@ -15939,7 +12990,7 @@ impl OwnedQuantizedModel {
                     .last()
                     .expect("tokens must be non-empty");
 
-                let logits = self.forward_single_with_contiguous_cache(
+                let logits = self.forward_single_with_cache(
                     last_token,
                     &mut caches[req_idx],
                     position,
@@ -15971,146 +13022,6 @@ impl OwnedQuantizedModel {
         }
 
         Ok(all_tokens)
-    }
-
-    /// Batched forward pass for multiple requests (PARITY-006)
-    ///
-    /// Processes the same position across multiple requests in parallel.
-    /// This enables GPU GEMM acceleration for the matmul operations.
-    ///
-    /// # Arguments
-    /// * `token_ids` - Token IDs for each request at the current position
-    /// * `caches` - KV caches for each request (mutable)
-    /// * `positions` - Position in sequence for each request
-    ///
-    /// # Returns
-    /// Logits for each request [batch_size, vocab_size]
-    ///
-    /// # Errors
-    /// Returns error if forward pass fails
-    #[allow(dead_code)] // Will be used when batched matmul is fully integrated
-    fn forward_batch_multi_request(
-        &self,
-        token_ids: &[u32],
-        caches: &mut [ContiguousKVCache],
-        positions: &[usize],
-    ) -> Result<Vec<Vec<f32>>> {
-        let batch_size = token_ids.len();
-        if batch_size != caches.len() || batch_size != positions.len() {
-            return Err(RealizarError::InvalidShape {
-                reason: format!(
-                    "Batch size mismatch: tokens={}, caches={}, positions={}",
-                    batch_size,
-                    caches.len(),
-                    positions.len()
-                ),
-            });
-        }
-
-        let hidden_dim = self.config.hidden_dim;
-
-        // 1. Embed all tokens: [batch_size, hidden_dim]
-        let mut hidden_batch: Vec<Vec<f32>> = token_ids
-            .iter()
-            .map(|&token_id| self.embed(&[token_id]))
-            .collect();
-
-        // 2. Process through transformer layers
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Process each request in batch
-            for (req_idx, hidden) in hidden_batch.iter_mut().enumerate() {
-                let position = positions[req_idx];
-
-                // 2a. Attention layer norm
-                let normed = self.layer_norm(
-                    hidden,
-                    &layer.attn_norm_weight,
-                    layer.attn_norm_bias.as_deref(),
-                    self.config.eps,
-                );
-
-                // 2b. QKV projection
-                let mut qkv = self.qkv_matmul(&normed, &layer.qkv_weight)?;
-                if let Some(ref bias) = layer.qkv_bias {
-                    self.add_bias(&mut qkv, bias);
-                }
-
-                // 2c. Extract Q, K, V and apply RoPE
-                // Note: This uses hidden_dim for all (assumes non-GQA or fused QKV)
-                let mut q = qkv[0..hidden_dim].to_vec();
-                let mut k = qkv[hidden_dim..2 * hidden_dim].to_vec();
-                let v = qkv[2 * hidden_dim..3 * hidden_dim].to_vec();
-
-                self.apply_rope(&mut q, position, self.config.num_heads);
-                self.apply_rope(&mut k, position, self.config.num_heads); // Same as Q for non-GQA
-
-                // 2d. Get cached K/V and compute attention
-                let k_cache = caches[req_idx].get_k(layer_idx);
-                let v_cache = caches[req_idx].get_v(layer_idx);
-
-                let attn_out = if k_cache.is_empty() {
-                    v.clone()
-                } else {
-                    self.attention_with_cache(&q, k_cache, v_cache, &k, &v)
-                };
-
-                // 2e. Store K and V in cache
-                caches[req_idx].append(layer_idx, &k, &v);
-
-                // 2f. Attention output projection
-                let mut attn_output = self.fused_matmul(&attn_out, &layer.attn_output_weight)?;
-                if let Some(ref bias) = layer.attn_output_bias {
-                    self.add_bias(&mut attn_output, bias);
-                }
-
-                // 2g. Residual connection
-                for i in 0..hidden_dim {
-                    hidden[i] += attn_output[i];
-                }
-
-                // 2h. FFN
-                let mut ffn_hidden = self.fused_matmul(hidden, &layer.ffn_up_weight)?;
-                if let Some(ref bias) = layer.ffn_up_bias {
-                    self.add_bias(&mut ffn_hidden, bias);
-                }
-                self.gelu(&mut ffn_hidden);
-
-                let mut ffn_output = self.fused_matmul(&ffn_hidden, &layer.ffn_down_weight)?;
-                if let Some(ref bias) = layer.ffn_down_bias {
-                    self.add_bias(&mut ffn_output, bias);
-                }
-
-                // Residual
-                for i in 0..hidden_dim {
-                    hidden[i] += ffn_output[i];
-                }
-            }
-
-            // Advance all caches after processing layer
-            for cache in caches.iter_mut() {
-                cache.advance();
-            }
-        }
-
-        // 3. Final layer norm and LM head for each request
-        let mut all_logits = Vec::with_capacity(batch_size);
-        for hidden in &hidden_batch {
-            let normed = self.layer_norm(
-                hidden,
-                &self.output_norm_weight,
-                self.output_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            let mut logits = self.fused_matmul(&normed, &self.lm_head_weight)?;
-            if let Some(ref bias) = self.lm_head_bias {
-                self.add_bias(&mut logits, bias);
-            }
-
-            all_logits.push(logits);
-        }
-
-        Ok(all_logits)
     }
 
     /// Get the batch throughput improvement factor (PARITY-006)
@@ -16429,158 +13340,6 @@ impl OwnedQuantizedModel {
         Ok(logits)
     }
 
-    /// Forward pass with fused dequant-matmul kernels (IMP-109)
-    ///
-    /// Uses fused CPU kernels for small batches (typical LLM inference)
-    /// to avoid intermediate buffer allocations. For large batches,
-    /// falls back to GPU path after single dequantization.
-    ///
-    /// Key optimizations vs `forward_batch_gpu`:
-    /// - FFN projections use fused kernels (no dequant buffer)
-    /// - Memory bandwidth reduction from streaming quantized data
-    /// - Better cache utilization in CPU fused path
-    ///
-    /// # Arguments
-    /// * `token_ids` - Token IDs for the batch
-    ///
-    /// # Returns
-    /// Logits tensor [batch_size, vocab_size]
-    ///
-    /// # Errors
-    /// Returns error if forward pass fails
-    #[cfg(feature = "gpu")]
-    pub fn forward_batch_gpu_fused(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        use crate::gpu::HybridScheduler;
-
-        let batch_size = token_ids.len();
-        let hidden_dim = self.config.hidden_dim;
-        let vocab_size = self.config.vocab_size;
-
-        // Initialize HybridScheduler with reasonable threshold
-        let mut scheduler = HybridScheduler::with_threshold(1000).map_err(|e| {
-            RealizarError::UnsupportedOperation {
-                operation: "HybridScheduler::with_threshold".to_string(),
-                reason: format!("GPU scheduler initialization failed: {e}"),
-            }
-        })?;
-
-        // 1. Token embedding lookup for all tokens
-        let mut hidden = self.embed(token_ids);
-
-        // 2. Process through transformer layers
-        for layer in &self.layers {
-            // Pre-attention LayerNorm
-            let normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // QKV projection - use GPU (this is required for Q, K, V split)
-            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
-                &normed,
-                &layer.qkv_weight,
-                batch_size,
-                hidden_dim,
-                &mut scheduler,
-            )?;
-
-            // Split Q, K, V for batch - simplified attention
-            let qkv_dim = qkv.len() / batch_size;
-            let q_dim = hidden_dim;
-            let kv_dim = (qkv_dim - q_dim) / 2;
-
-            // Process attention for each position
-            let mut attn_out = Vec::with_capacity(batch_size * hidden_dim);
-            for pos in 0..batch_size {
-                let qkv_start = pos * qkv_dim;
-                let q = &qkv[qkv_start..qkv_start + q_dim];
-                let k = &qkv[qkv_start + q_dim..qkv_start + q_dim + kv_dim];
-                let v = &qkv[qkv_start + q_dim + kv_dim..qkv_start + qkv_dim];
-
-                let head_dim = hidden_dim / self.config.num_heads;
-
-                let mut out = vec![0.0f32; hidden_dim];
-                for h in 0..self.config.num_heads {
-                    let kv_h = h * self.config.num_kv_heads / self.config.num_heads;
-                    let q_h = &q[h * head_dim..(h + 1) * head_dim];
-                    let k_h = &k[kv_h * head_dim..(kv_h + 1) * head_dim];
-                    let v_h = &v[kv_h * head_dim..(kv_h + 1) * head_dim];
-
-                    let mut score = 0.0f32;
-                    for d in 0..head_dim {
-                        score += q_h[d] * k_h[d];
-                    }
-                    let _weight = (score / (head_dim as f32).sqrt()).exp();
-
-                    for d in 0..head_dim {
-                        out[h * head_dim + d] = v_h[d];
-                    }
-                }
-                attn_out.extend_from_slice(&out);
-            }
-
-            // Output projection - use GPU for batch ops
-            let projected = self.batch_matmul_gpu(
-                &attn_out,
-                &layer.attn_output_weight,
-                batch_size,
-                hidden_dim,
-                layer.attn_output_weight.out_dim,
-                &mut scheduler,
-            )?;
-
-            // Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += projected[i];
-            }
-
-            // FFN (pre-norm style)
-            let ffn_normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // FFN up projection - USE FUSED KERNEL (IMP-109 optimization)
-            let mut ffn_hidden =
-                self.fused_batch_matmul_gpu(&ffn_normed, &layer.ffn_up_weight, batch_size)?;
-
-            // GELU activation
-            self.gelu(&mut ffn_hidden);
-
-            // FFN down projection - USE FUSED KERNEL (IMP-109 optimization)
-            let ffn_output =
-                self.fused_batch_matmul_gpu(&ffn_hidden, &layer.ffn_down_weight, batch_size)?;
-
-            // Residual
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_output[i];
-            }
-        }
-
-        // 3. Final layer norm
-        let normed = self.layer_norm(
-            &hidden,
-            &self.output_norm_weight,
-            self.output_norm_bias.as_deref(),
-            self.config.eps,
-        );
-
-        // 4. LM head projection - use GPU for large vocab
-        let logits = self.batch_matmul_gpu(
-            &normed,
-            &self.lm_head_weight,
-            batch_size,
-            hidden_dim,
-            vocab_size,
-            &mut scheduler,
-        )?;
-
-        Ok(logits)
-    }
 
     /// Batch matmul with GPU acceleration via HybridScheduler (IMP-107)
     ///
@@ -16882,87 +13641,6 @@ impl OwnedQuantizedModel {
             // Copy head output to final output
             for pos in 0..seq_len {
                 let out_start = pos * hidden_dim + head_offset;
-                let head_start = pos * head_dim;
-                output[out_start..out_start + head_dim]
-                    .copy_from_slice(&head_output[head_start..head_start + head_dim]);
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// PAR-104: GQA-aware batched causal attention with GPU acceleration
-    ///
-    /// Unlike `batched_causal_attention_gpu`, this handles Grouped Query Attention
-    /// where Q has more heads than K and V:
-    /// - Q: [seq_len, q_dim] where q_dim = num_heads * head_dim
-    /// - K: [seq_len, kv_dim] where kv_dim = num_kv_heads * head_dim
-    /// - V: [seq_len, kv_dim] where kv_dim = num_kv_heads * head_dim
-    ///
-    /// Each K/V head is shared by (num_heads / num_kv_heads) Q heads.
-    #[cfg(feature = "gpu")]
-    pub fn batched_causal_attention_gpu_gqa(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        seq_len: usize,
-        q_dim: usize,
-        kv_dim: usize,
-    ) -> Result<Vec<f32>> {
-        use crate::gpu::HybridScheduler;
-
-        let num_heads = self.config.num_heads;
-        let head_dim = q_dim / num_heads;
-        let num_kv_heads = kv_dim / head_dim;
-        let groups = num_heads / num_kv_heads; // Q heads per KV head
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let mut scheduler = HybridScheduler::with_threshold(1000).map_err(|e| {
-            RealizarError::UnsupportedOperation {
-                operation: "HybridScheduler::with_threshold".to_string(),
-                reason: format!("GPU scheduler initialization failed: {e}"),
-            }
-        })?;
-
-        let mut output = vec![0.0f32; seq_len * q_dim];
-
-        // Process each Q head
-        for q_head in 0..num_heads {
-            let q_head_offset = q_head * head_dim;
-            let kv_head = q_head / groups; // Which KV head this Q head uses
-            let kv_head_offset = kv_head * head_dim;
-
-            // Extract Q_h: [seq_len, head_dim] from Q
-            let mut q_h = Vec::with_capacity(seq_len * head_dim);
-            for pos in 0..seq_len {
-                let start = pos * q_dim + q_head_offset;
-                q_h.extend_from_slice(&q[start..start + head_dim]);
-            }
-
-            // Extract K_h, V_h: [seq_len, head_dim] from K, V using KV head index
-            let mut k_h = Vec::with_capacity(seq_len * head_dim);
-            let mut v_h = Vec::with_capacity(seq_len * head_dim);
-            for pos in 0..seq_len {
-                let start = pos * kv_dim + kv_head_offset;
-                k_h.extend_from_slice(&k[start..start + head_dim]);
-                v_h.extend_from_slice(&v[start..start + head_dim]);
-            }
-
-            // Compute attention scores: Q_h @ K_h^T -> [seq_len, seq_len]
-            let scores =
-                self.batched_qk_scores(&q_h, &k_h, seq_len, head_dim, scale, &mut scheduler)?;
-
-            // Apply causal mask and softmax
-            let attn_weights = self.apply_causal_mask_softmax(&scores, seq_len);
-
-            // Compute output: attn_weights @ V_h -> [seq_len, head_dim]
-            let head_output =
-                self.batched_attn_v(&attn_weights, &v_h, seq_len, head_dim, &mut scheduler)?;
-
-            // Copy head output to final output
-            for pos in 0..seq_len {
-                let out_start = pos * q_dim + q_head_offset;
                 let head_start = pos * head_dim;
                 output[out_start..out_start + head_dim]
                     .copy_from_slice(&head_output[head_start..head_start + head_dim]);
@@ -17274,292 +13952,7 @@ impl OwnedQuantizedModel {
         Ok(output)
     }
 
-    /// Forward pass with parallel multi-head attention (IMP-110)
-    ///
-    /// IMP-110d: Complete forward pass using parallel attention processing.
-    /// Uses `parallel_multihead_attention_gpu` instead of sequential head iteration.
-    ///
-    /// # Arguments
-    /// * `token_ids` - Batch of input token IDs [batch_size]
-    ///
-    /// # Returns
-    /// Logits for all positions [batch_size * vocab_size]
-    #[cfg(feature = "gpu")]
-    pub fn forward_batch_gpu_parallel_attention(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        use crate::gpu::HybridScheduler;
 
-        let batch_size = token_ids.len();
-        let hidden_dim = self.config.hidden_dim;
-        let vocab_size = self.config.vocab_size;
-
-        let mut scheduler = HybridScheduler::with_threshold(1000).map_err(|e| {
-            RealizarError::UnsupportedOperation {
-                operation: "HybridScheduler::with_threshold".to_string(),
-                reason: format!("GPU scheduler initialization failed: {e}"),
-            }
-        })?;
-
-        // 1. Token embedding lookup for all tokens
-        let mut hidden = self.embed(token_ids);
-
-        // 2. Process through transformer layers
-        for layer in &self.layers {
-            // Pre-attention LayerNorm
-            let normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // QKV projection - use GPU for batch ops
-            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
-                &normed,
-                &layer.qkv_weight,
-                batch_size,
-                hidden_dim,
-                &mut scheduler,
-            )?;
-
-            // Split Q, K, V
-            let qkv_dim = qkv.len() / batch_size;
-            let q_dim = hidden_dim;
-            let kv_dim = (qkv_dim - q_dim) / 2;
-
-            // Gather Q, K, V for all positions
-            let mut q_all = Vec::with_capacity(batch_size * q_dim);
-            let mut k_all = Vec::with_capacity(batch_size * kv_dim);
-            let mut v_all = Vec::with_capacity(batch_size * kv_dim);
-
-            for pos in 0..batch_size {
-                let qkv_start = pos * qkv_dim;
-                q_all.extend_from_slice(&qkv[qkv_start..qkv_start + q_dim]);
-                k_all.extend_from_slice(&qkv[qkv_start + q_dim..qkv_start + q_dim + kv_dim]);
-                v_all.extend_from_slice(&qkv[qkv_start + q_dim + kv_dim..qkv_start + qkv_dim]);
-            }
-
-            // Apply PARALLEL batched causal attention (IMP-110)
-            let attn_out =
-                self.parallel_multihead_attention_gpu(&q_all, &k_all, &v_all, batch_size)?;
-
-            // Output projection - use GPU for batch ops
-            let projected = self.batch_matmul_gpu(
-                &attn_out,
-                &layer.attn_output_weight,
-                batch_size,
-                hidden_dim,
-                layer.attn_output_weight.out_dim,
-                &mut scheduler,
-            )?;
-
-            // Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += projected[i];
-            }
-
-            // Pre-FFN LayerNorm (re-use attn norm weights for pre-norm style)
-            let ffn_normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // FFN: up projection
-            let up = self.batch_matmul_gpu(
-                &ffn_normed,
-                &layer.ffn_up_weight,
-                batch_size,
-                hidden_dim,
-                layer.ffn_up_weight.out_dim,
-                &mut scheduler,
-            )?;
-
-            // Activation (GELU)
-            let activated: Vec<f32> = up
-                .iter()
-                .map(|&x| 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x.powi(3))).tanh()))
-                .collect();
-
-            // FFN: down projection
-            let down = self.batch_matmul_gpu(
-                &activated,
-                &layer.ffn_down_weight,
-                batch_size,
-                layer.ffn_down_weight.in_dim,
-                layer.ffn_down_weight.out_dim,
-                &mut scheduler,
-            )?;
-
-            // Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += down[i];
-            }
-        }
-
-        // 3. Final layer norm
-        let final_normed = self.layer_norm(
-            &hidden,
-            &self.output_norm_weight,
-            self.output_norm_bias.as_deref(),
-            self.config.eps,
-        );
-
-        // 4. LM head projection - use GPU for large vocab
-        let logits = self.batch_matmul_gpu(
-            &final_normed,
-            &self.lm_head_weight,
-            batch_size,
-            hidden_dim,
-            vocab_size,
-            &mut scheduler,
-        )?;
-
-        Ok(logits)
-    }
-
-    /// Forward pass for batch with proper causal attention and GPU (IMP-108)
-    ///
-    /// This is an improved version of forward_batch_gpu that uses proper
-    /// causal attention instead of simplified per-position attention.
-    ///
-    /// # Arguments
-    /// * `token_ids` - Batch of input token IDs [batch_size]
-    ///
-    /// # Returns
-    /// Logits for all positions [batch_size * vocab_size]
-    ///
-    /// # Errors
-    /// Returns error if GPU operations fail
-    #[cfg(feature = "gpu")]
-    pub fn forward_batch_gpu_causal(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        use crate::gpu::HybridScheduler;
-
-        let batch_size = token_ids.len();
-        let hidden_dim = self.config.hidden_dim;
-        let vocab_size = self.config.vocab_size;
-
-        let mut scheduler = HybridScheduler::with_threshold(1000).map_err(|e| {
-            RealizarError::UnsupportedOperation {
-                operation: "HybridScheduler::with_threshold".to_string(),
-                reason: format!("GPU scheduler initialization failed: {e}"),
-            }
-        })?;
-
-        // 1. Token embedding lookup for all tokens
-        let mut hidden = self.embed(token_ids);
-
-        // 2. Process through transformer layers
-        for layer in &self.layers {
-            // Pre-attention LayerNorm
-            let normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // QKV projection - use GPU for batch ops
-            let qkv = self.batch_qkv_matmul_gpu_with_scheduler(
-                &normed,
-                &layer.qkv_weight,
-                batch_size,
-                hidden_dim,
-                &mut scheduler,
-            )?;
-
-            // Split Q, K, V
-            let qkv_dim = qkv.len() / batch_size;
-            let q_dim = hidden_dim;
-            let kv_dim = (qkv_dim - q_dim) / 2;
-
-            // Gather Q, K, V for all positions
-            let mut q_all = Vec::with_capacity(batch_size * q_dim);
-            let mut k_all = Vec::with_capacity(batch_size * kv_dim);
-            let mut v_all = Vec::with_capacity(batch_size * kv_dim);
-
-            for pos in 0..batch_size {
-                let qkv_start = pos * qkv_dim;
-                q_all.extend_from_slice(&qkv[qkv_start..qkv_start + q_dim]);
-                k_all.extend_from_slice(&qkv[qkv_start + q_dim..qkv_start + q_dim + kv_dim]);
-                v_all.extend_from_slice(&qkv[qkv_start + q_dim + kv_dim..qkv_start + qkv_dim]);
-            }
-
-            // Apply batched causal attention with GPU acceleration
-            let attn_out = self.batched_causal_attention_gpu(&q_all, &k_all, &v_all, batch_size)?;
-
-            // Output projection - use GPU for batch ops
-            let projected = self.batch_matmul_gpu(
-                &attn_out,
-                &layer.attn_output_weight,
-                batch_size,
-                hidden_dim,
-                layer.attn_output_weight.out_dim,
-                &mut scheduler,
-            )?;
-
-            // Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += projected[i];
-            }
-
-            // FFN (pre-norm style)
-            let ffn_normed = self.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.config.eps,
-            );
-
-            // FFN up projection - use GPU
-            let mut ffn_hidden = self.batch_matmul_gpu(
-                &ffn_normed,
-                &layer.ffn_up_weight,
-                batch_size,
-                hidden_dim,
-                layer.ffn_up_weight.out_dim,
-                &mut scheduler,
-            )?;
-
-            // GELU activation
-            self.gelu(&mut ffn_hidden);
-
-            // FFN down projection - use GPU
-            let ffn_output = self.batch_matmul_gpu(
-                &ffn_hidden,
-                &layer.ffn_down_weight,
-                batch_size,
-                layer.ffn_up_weight.out_dim,
-                hidden_dim,
-                &mut scheduler,
-            )?;
-
-            // Residual
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_output[i];
-            }
-        }
-
-        // 3. Final layer norm
-        let normed = self.layer_norm(
-            &hidden,
-            &self.output_norm_weight,
-            self.output_norm_bias.as_deref(),
-            self.config.eps,
-        );
-
-        // 4. LM head projection - use GPU for large vocab
-        let logits = self.batch_matmul_gpu(
-            &normed,
-            &self.lm_head_weight,
-            batch_size,
-            hidden_dim,
-            vocab_size,
-            &mut scheduler,
-        )?;
-
-        Ok(logits)
-    }
 
     // =========================================================================
     // IMP-111: Flash Attention-style Tiled Computation
@@ -18314,1184 +14707,7 @@ impl OwnedQuantizedModelCuda {
         Ok(logits)
     }
 
-    /// PAR-096: Batched forward pass for speculative decode verification
-    ///
-    /// Processes M tokens in batch using L2 cache reuse for weight data.
-    /// Uses `batched_q4k_gemv_cached` for all linear projections.
-    ///
-    /// # Arguments
-    ///
-    /// * `token_ids` - Batch of input token IDs [M]
-    ///
-    /// # Returns
-    ///
-    /// Logits for all positions [M, vocab_size]
-    ///
-    /// # Performance
-    ///
-    /// Expected ~2-3x speedup over M sequential forward calls due to L2 caching.
-    /// Key for speculative decode verification where we verify k speculative tokens.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if CUDA operations fail or weights not pre-cached
-    pub fn forward_batch_cuda_native(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
-        let batch_size = token_ids.len();
-        let hidden_dim = self.model.config.hidden_dim;
-        let vocab_size = self.model.config.vocab_size;
 
-        // 1. Token embedding lookup (CPU - fast enough)
-        let mut hidden = self.model.embed(token_ids);
-
-        // 2. Process through transformer layers using batched GEMV
-        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("layer.{}", layer_idx);
-
-            // 2a. Pre-attention RMSNorm (CPU)
-            let normed = self.model.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.model.config.eps,
-            );
-
-            // 2b. QKV projection using batched GEMV
-            // Uses L2 cache reuse for weight data
-            // PAR-103: Returns (qkv_data, q_dim, k_dim, v_dim) to handle GQA correctly
-            let (mut qkv, q_dim, k_dim, v_dim) = match &layer.qkv_weight {
-                OwnedQKVWeights::Separate { q, k, v } => {
-                    let q_name = format!("{}.attn_q.weight", prefix);
-                    let k_name = format!("{}.attn_k.weight", prefix);
-                    let v_name = format!("{}.attn_v.weight", prefix);
-
-                    let mut q_out = vec![0.0f32; batch_size * q.out_dim];
-                    let mut k_out = vec![0.0f32; batch_size * k.out_dim];
-                    let mut v_out = vec![0.0f32; batch_size * v.out_dim];
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &q_name,
-                            &normed,
-                            &mut q_out,
-                            batch_size as u32,
-                            hidden_dim as u32,
-                            q.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_cuda_native".to_string(),
-                            reason: format!("Q projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &k_name,
-                            &normed,
-                            &mut k_out,
-                            batch_size as u32,
-                            hidden_dim as u32,
-                            k.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_cuda_native".to_string(),
-                            reason: format!("K projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &v_name,
-                            &normed,
-                            &mut v_out,
-                            batch_size as u32,
-                            hidden_dim as u32,
-                            v.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_cuda_native".to_string(),
-                            reason: format!("V projection failed: {}", e),
-                        })?;
-
-                    // Interleave Q, K, V for each position
-                    let qkv_total_dim = q.out_dim + k.out_dim + v.out_dim;
-                    let mut qkv_data = vec![0.0f32; batch_size * qkv_total_dim];
-                    for b in 0..batch_size {
-                        let out_start = b * qkv_total_dim;
-                        qkv_data[out_start..out_start + q.out_dim]
-                            .copy_from_slice(&q_out[b * q.out_dim..(b + 1) * q.out_dim]);
-                        qkv_data[out_start + q.out_dim..out_start + q.out_dim + k.out_dim]
-                            .copy_from_slice(&k_out[b * k.out_dim..(b + 1) * k.out_dim]);
-                        qkv_data[out_start + q.out_dim + k.out_dim..out_start + qkv_total_dim]
-                            .copy_from_slice(&v_out[b * v.out_dim..(b + 1) * v.out_dim]);
-                    }
-                    (qkv_data, q.out_dim, k.out_dim, v.out_dim)
-                },
-                OwnedQKVWeights::Fused(_) => {
-                    return Err(RealizarError::UnsupportedOperation {
-                        operation: "forward_batch_cuda_native".to_string(),
-                        reason: "Fused QKV not supported, use separate Q/K/V".to_string(),
-                    });
-                },
-            };
-
-            // 2c. Split Q, K, V and apply RoPE
-            // PAR-103: Use actual dimensions for GQA-aware splitting
-            let qkv_dim = q_dim + k_dim + v_dim;
-
-            // Add QKV bias if present (must use actual qkv_dim, not 3*hidden_dim for GQA)
-            if let Some(ref bias) = layer.qkv_bias {
-                // Only add bias if dimensions match (GQA may have different sizes)
-                let bias_len = bias.len().min(qkv_dim);
-                for b in 0..batch_size {
-                    let start = b * qkv_dim;
-                    for (i, b_val) in bias.iter().enumerate().take(bias_len) {
-                        qkv[start + i] += b_val;
-                    }
-                }
-            }
-            // PAR-103: Use actual K/V dimensions for GQA
-            let mut q_all = Vec::with_capacity(batch_size * q_dim);
-            let mut k_all = Vec::with_capacity(batch_size * k_dim);
-            let mut v_all = Vec::with_capacity(batch_size * v_dim);
-
-            for s in 0..batch_size {
-                let qkv_start = s * qkv_dim;
-                let mut q = qkv[qkv_start..qkv_start + q_dim].to_vec();
-                let mut k = qkv[qkv_start + q_dim..qkv_start + q_dim + k_dim].to_vec();
-                let v = &qkv[qkv_start + q_dim + k_dim..qkv_start + qkv_dim];
-
-                self.model
-                    .apply_rope(&mut q, s, self.model.config.num_heads);
-                self.model
-                    .apply_rope(&mut k, s, self.model.config.num_heads);
-
-                q_all.extend_from_slice(&q);
-                k_all.extend_from_slice(&k);
-                v_all.extend_from_slice(v);
-            }
-
-            // 2d. Batched causal attention
-            // PAR-104: GPU attention only beneficial for seq_len >= 64 due to kernel launch overhead
-            // For small batch sizes (typical decode), CPU is faster
-            // GPU wins only when amortizing across many positions (prefill, large context)
-            let attn_out = self
-                .model
-                .causal_attention(&q_all, &k_all, &v_all, batch_size);
-
-            // 2e. Output projection using batched GEMV
-            let o_name = format!("{}.attn_output.weight", prefix);
-            let mut attn_output = vec![0.0f32; batch_size * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &o_name,
-                    &attn_out,
-                    &mut attn_output,
-                    batch_size as u32,
-                    hidden_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_cuda_native".to_string(),
-                    reason: format!("O projection failed: {}", e),
-                })?;
-
-            // Add O bias if present
-            if let Some(ref bias) = layer.attn_output_bias {
-                for b in 0..batch_size {
-                    for (i, b_val) in bias.iter().enumerate().take(hidden_dim) {
-                        attn_output[b * hidden_dim + i] += b_val;
-                    }
-                }
-            }
-
-            // 2f. Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += attn_output[i];
-            }
-
-            // 2g. Pre-FFN RMSNorm (CPU)
-            let ffn_normed = self.model.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.model.config.eps,
-            );
-
-            // 2h. FFN up projection using batched GEMV
-            let up_name = format!("{}.ffn_up.weight", prefix);
-            let intermediate_dim = layer.ffn_up_weight.out_dim;
-            let mut ffn_hidden = vec![0.0f32; batch_size * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &up_name,
-                    &ffn_normed,
-                    &mut ffn_hidden,
-                    batch_size as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_cuda_native".to_string(),
-                    reason: format!("FFN up projection failed: {}", e),
-                })?;
-
-            // 2i. GELU activation
-            self.model.gelu(&mut ffn_hidden);
-
-            // 2j. FFN down projection using batched GEMV
-            let down_name = format!("{}.ffn_down.weight", prefix);
-            let mut ffn_output = vec![0.0f32; batch_size * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &down_name,
-                    &ffn_hidden,
-                    &mut ffn_output,
-                    batch_size as u32,
-                    intermediate_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_cuda_native".to_string(),
-                    reason: format!("FFN down projection failed: {}", e),
-                })?;
-
-            // 2k. Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_output[i];
-            }
-        }
-
-        // 3. Final layer norm (CPU)
-        let normed = self.model.layer_norm(
-            &hidden,
-            &self.model.output_norm_weight,
-            self.model.output_norm_bias.as_deref(),
-            self.model.config.eps,
-        );
-
-        // 4. LM head projection using batched GEMV
-        let mut logits = vec![0.0f32; batch_size * vocab_size];
-        self.executor
-            .batched_q4k_gemv_cached(
-                "output.weight",
-                &normed,
-                &mut logits,
-                batch_size as u32,
-                hidden_dim as u32,
-                vocab_size as u32,
-            )
-            .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "forward_batch_cuda_native".to_string(),
-                reason: format!("LM head projection failed: {}", e),
-            })?;
-
-        // Add LM head bias if present
-        if let Some(ref bias) = self.model.lm_head_bias {
-            for b in 0..batch_size {
-                for (i, b_val) in bias.iter().enumerate().take(vocab_size) {
-                    logits[b * vocab_size + i] += b_val;
-                }
-            }
-        }
-
-        Ok(logits)
-    }
-
-    /// PAR-097: Forward pass for k speculative tokens with KV cache integration
-    ///
-    /// This is used for speculative decode verification where we need to:
-    /// 1. Take existing KV cache from previous decode
-    /// 2. Process k draft tokens with proper causal attention
-    /// 3. Return logits for verification
-    ///
-    /// # Arguments
-    /// * `token_ids` - Token IDs for k speculative positions
-    /// * `cache` - KV cache from previous decode (updated with new K/V)
-    /// * `start_pos` - Starting position for RoPE
-    ///
-    /// # Returns
-    /// Logits for each position [k × vocab_size]
-    pub fn forward_batch_with_cache_cuda_native(
-        &mut self,
-        token_ids: &[u32],
-        cache: &mut OwnedQuantizedKVCache,
-        start_pos: usize,
-    ) -> Result<Vec<f32>> {
-        if token_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let batch_size = token_ids.len();
-        let hidden_dim = self.model.config.hidden_dim;
-        let num_kv_heads = self.model.config.num_kv_heads;
-        let head_dim = hidden_dim / self.model.config.num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-
-        // 1. Token embedding (CPU)
-        let mut hidden = self.model.embed(token_ids);
-
-        // 2. Process through all layers
-        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("blk.{}", layer_idx);
-
-            // 2a. Pre-attention RMSNorm (CPU)
-            let normed = self.model.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.model.config.eps,
-            );
-
-            // 2b. QKV projection using batched GEMV
-            let mut qkv = match &layer.qkv_weight {
-                OwnedQKVWeights::Separate { q, k, v } => {
-                    let q_name = format!("{}.attn_q.weight", prefix);
-                    let k_name = format!("{}.attn_k.weight", prefix);
-                    let v_name = format!("{}.attn_v.weight", prefix);
-
-                    let mut q_out = vec![0.0f32; batch_size * q.out_dim];
-                    let mut k_out = vec![0.0f32; batch_size * k.out_dim];
-                    let mut v_out = vec![0.0f32; batch_size * v.out_dim];
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &q_name,
-                            &normed,
-                            &mut q_out,
-                            batch_size as u32,
-                            q.in_dim as u32,
-                            q.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_with_cache_cuda_native".to_string(),
-                            reason: format!("Q projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &k_name,
-                            &normed,
-                            &mut k_out,
-                            batch_size as u32,
-                            k.in_dim as u32,
-                            k.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_with_cache_cuda_native".to_string(),
-                            reason: format!("K projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &v_name,
-                            &normed,
-                            &mut v_out,
-                            batch_size as u32,
-                            v.in_dim as u32,
-                            v.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_with_cache_cuda_native".to_string(),
-                            reason: format!("V projection failed: {}", e),
-                        })?;
-
-                    // Concatenate Q, K, V into QKV [batch_size × (q.out + k.out + v.out)]
-                    let mut qkv = vec![0.0f32; batch_size * (q.out_dim + k.out_dim + v.out_dim)];
-                    for b in 0..batch_size {
-                        qkv[b * (q.out_dim + k.out_dim + v.out_dim)
-                            ..b * (q.out_dim + k.out_dim + v.out_dim) + q.out_dim]
-                            .copy_from_slice(&q_out[b * q.out_dim..(b + 1) * q.out_dim]);
-                        qkv[b * (q.out_dim + k.out_dim + v.out_dim) + q.out_dim
-                            ..b * (q.out_dim + k.out_dim + v.out_dim) + q.out_dim + k.out_dim]
-                            .copy_from_slice(&k_out[b * k.out_dim..(b + 1) * k.out_dim]);
-                        qkv[b * (q.out_dim + k.out_dim + v.out_dim) + q.out_dim + k.out_dim
-                            ..b * (q.out_dim + k.out_dim + v.out_dim)
-                                + q.out_dim
-                                + k.out_dim
-                                + v.out_dim]
-                            .copy_from_slice(&v_out[b * v.out_dim..(b + 1) * v.out_dim]);
-                    }
-                    qkv
-                },
-                OwnedQKVWeights::Fused(_) => {
-                    return Err(RealizarError::UnsupportedOperation {
-                        operation: "forward_batch_with_cache_cuda_native".to_string(),
-                        reason: "Fused QKV not supported, use separate Q/K/V".to_string(),
-                    });
-                },
-            };
-
-            // Add QKV bias if present
-            if let Some(ref bias) = layer.qkv_bias {
-                // PAR-100-FIX: For GQA models, QKV dim is hidden_dim + 2*kv_dim, not 3*hidden_dim
-                let actual_qkv_dim = hidden_dim + 2 * kv_dim;
-                for b in 0..batch_size {
-                    let start = b * actual_qkv_dim;
-                    // Use min to handle bias size mismatch
-                    let bias_len = bias.len().min(actual_qkv_dim);
-                    for i in 0..bias_len {
-                        qkv[start + i] += bias[i];
-                    }
-                }
-            }
-
-            // 2c. Split Q, K, V and apply RoPE
-            let qkv_dim = qkv.len() / batch_size;
-            let mut q_all = Vec::with_capacity(batch_size * hidden_dim);
-            let mut k_all = Vec::with_capacity(batch_size * kv_dim);
-            let mut v_all = Vec::with_capacity(batch_size * kv_dim);
-
-            for s in 0..batch_size {
-                let qkv_start = s * qkv_dim;
-                let mut q = qkv[qkv_start..qkv_start + hidden_dim].to_vec();
-                let mut k = qkv[qkv_start + hidden_dim..qkv_start + hidden_dim + kv_dim].to_vec();
-                let v = qkv[qkv_start + hidden_dim + kv_dim..qkv_start + hidden_dim + 2 * kv_dim]
-                    .to_vec();
-
-                // Apply RoPE with correct position (cache_len + s)
-                self.model
-                    .apply_rope(&mut q, start_pos + s, self.model.config.num_heads);
-                self.model
-                    .apply_rope(&mut k, start_pos + s, self.model.config.num_kv_heads);
-
-                q_all.extend_from_slice(&q);
-                k_all.extend_from_slice(&k);
-                v_all.extend_from_slice(&v);
-            }
-
-            // 2d. Get KV cache for this layer
-            let k_cache = cache.get_k(layer_idx);
-            let v_cache = cache.get_v(layer_idx);
-
-            // 2e. Batched causal attention with cache
-            let attn_out = self.model.batched_attention_with_cache_gqa(
-                &q_all, k_cache, v_cache, &k_all, &v_all, batch_size,
-            );
-
-            // 2f. Update KV cache with new entries
-            cache.append_kv(layer_idx, &k_all, &v_all);
-
-            // 2g. Output projection using batched GEMV
-            let o_name = format!("{}.attn_output.weight", prefix);
-            let mut attn_output = vec![0.0f32; batch_size * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &o_name,
-                    &attn_out,
-                    &mut attn_output,
-                    batch_size as u32,
-                    hidden_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_with_cache_cuda_native".to_string(),
-                    reason: format!("O projection failed: {}", e),
-                })?;
-
-            // Add O bias if present
-            if let Some(ref bias) = layer.attn_output_bias {
-                for b in 0..batch_size {
-                    for (i, b_val) in bias.iter().enumerate().take(hidden_dim) {
-                        attn_output[b * hidden_dim + i] += b_val;
-                    }
-                }
-            }
-
-            // 2h. Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += attn_output[i];
-            }
-
-            // 2i. Pre-FFN RMSNorm (CPU)
-            // Use ffn_norm if available (LLaMA-style), otherwise use attn_norm
-            let ffn_norm_weight = layer
-                .ffn_norm_weight
-                .as_ref()
-                .unwrap_or(&layer.attn_norm_weight);
-            let ffn_norm_bias = layer.ffn_norm_bias.as_deref();
-            let ffn_normed = self.model.layer_norm(
-                &hidden,
-                ffn_norm_weight,
-                ffn_norm_bias,
-                self.model.config.eps,
-            );
-
-            // 2j. FFN up projection using batched GEMV
-            let up_name = format!("{}.ffn_up.weight", prefix);
-            let intermediate_dim = layer.ffn_up_weight.out_dim;
-            let mut ffn_hidden = vec![0.0f32; batch_size * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &up_name,
-                    &ffn_normed,
-                    &mut ffn_hidden,
-                    batch_size as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_with_cache_cuda_native".to_string(),
-                    reason: format!("FFN up projection failed: {}", e),
-                })?;
-
-            // 2k. FFN gate projection + SwiGLU
-            let gate_name = format!("{}.ffn_gate.weight", prefix);
-            let mut gate = vec![0.0f32; batch_size * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &gate_name,
-                    &ffn_normed,
-                    &mut gate,
-                    batch_size as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_with_cache_cuda_native".to_string(),
-                    reason: format!("FFN gate projection failed: {}", e),
-                })?;
-
-            // Apply SiLU to gate and multiply with up
-            for i in 0..gate.len() {
-                let x = gate[i];
-                gate[i] = x / (1.0 + (-x).exp()) * ffn_hidden[i];
-            }
-
-            // 2l. FFN down projection
-            let down_name = format!("{}.ffn_down.weight", prefix);
-            let mut ffn_out = vec![0.0f32; batch_size * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &down_name,
-                    &gate,
-                    &mut ffn_out,
-                    batch_size as u32,
-                    intermediate_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_with_cache_cuda_native".to_string(),
-                    reason: format!("FFN down projection failed: {}", e),
-                })?;
-
-            // 2m. Residual connection
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_out[i];
-            }
-        }
-
-        // 3. Final norm (CPU)
-        let final_hidden = self.model.layer_norm(
-            &hidden,
-            &self.model.output_norm_weight,
-            self.model.output_norm_bias.as_deref(),
-            self.model.config.eps,
-        );
-
-        // 4. LM head projection using batched GEMV
-        let vocab_size = self.model.config.vocab_size;
-        let mut logits = vec![0.0f32; batch_size * vocab_size];
-        self.executor
-            .batched_q4k_gemv_cached(
-                "output.weight",
-                &final_hidden,
-                &mut logits,
-                batch_size as u32,
-                hidden_dim as u32,
-                vocab_size as u32,
-            )
-            .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "forward_batch_with_cache_cuda_native".to_string(),
-                reason: format!("LM head projection failed: {}", e),
-            })?;
-
-        // Add LM head bias if present
-        if let Some(ref bias) = self.model.lm_head_bias {
-            for b in 0..batch_size {
-                for (i, b_val) in bias.iter().enumerate().take(vocab_size) {
-                    logits[b * vocab_size + i] += b_val;
-                }
-            }
-        }
-
-        Ok(logits)
-    }
-
-    /// PAR-108: Batched decode for multiple sequences with separate KV caches
-    ///
-    /// Uses batched GEMV for linear projections (15x speedup) while handling
-    /// attention per-sequence (each has different KV cache and position).
-    ///
-    /// # Arguments
-    /// * `tokens` - One token ID per sequence [M]
-    /// * `caches` - One KV cache per sequence [M]
-    /// * `positions` - Position for each sequence [M]
-    ///
-    /// # Returns
-    /// Token IDs for each sequence [M]
-    pub fn forward_batch_multi_cache_to_tokens(
-        &mut self,
-        tokens: &[u32],
-        caches: &mut [OwnedQuantizedKVCache],
-        positions: &[usize],
-    ) -> Result<Vec<u32>> {
-        let m = tokens.len();
-        if m == 0 || m != caches.len() || m != positions.len() {
-            return Err(RealizarError::UnsupportedOperation {
-                operation: "forward_batch_multi_cache_to_tokens".to_string(),
-                reason: format!(
-                    "Mismatched batch sizes: tokens={}, caches={}, positions={}",
-                    m,
-                    caches.len(),
-                    positions.len()
-                ),
-            });
-        }
-
-        let hidden_dim = self.model.config.hidden_dim;
-        let num_heads = self.model.config.num_heads;
-        let num_kv_heads = self.model.config.num_kv_heads;
-        let head_dim = hidden_dim / num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-        let vocab_size = self.model.config.vocab_size;
-
-        // 1. Batched token embedding [M × hidden_dim]
-        let mut hidden = self.model.embed(tokens);
-
-        // 2. Process through all layers
-        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("blk.{}", layer_idx);
-
-            // 2a. Batched RMSNorm (CPU for now)
-            let normed = self.model.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.model.config.eps,
-            );
-
-            // 2b. Batched QKV projection using efficient batched GEMV
-            let qkv = match &layer.qkv_weight {
-                OwnedQKVWeights::Separate { q, k, v } => {
-                    let q_name = format!("{}.attn_q.weight", prefix);
-                    let k_name = format!("{}.attn_k.weight", prefix);
-                    let v_name = format!("{}.attn_v.weight", prefix);
-
-                    let mut q_out = vec![0.0f32; m * q.out_dim];
-                    let mut k_out = vec![0.0f32; m * k.out_dim];
-                    let mut v_out = vec![0.0f32; m * v.out_dim];
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &q_name,
-                            &normed,
-                            &mut q_out,
-                            m as u32,
-                            hidden_dim as u32,
-                            q.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_multi_cache".to_string(),
-                            reason: format!("Q projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &k_name,
-                            &normed,
-                            &mut k_out,
-                            m as u32,
-                            hidden_dim as u32,
-                            k.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_multi_cache".to_string(),
-                            reason: format!("K projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &v_name,
-                            &normed,
-                            &mut v_out,
-                            m as u32,
-                            hidden_dim as u32,
-                            v.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_multi_cache".to_string(),
-                            reason: format!("V projection failed: {}", e),
-                        })?;
-
-                    // Concatenate Q, K, V
-                    let mut qkv = vec![0.0f32; m * (q.out_dim + k.out_dim + v.out_dim)];
-                    for s in 0..m {
-                        let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
-                        qkv[s * qkv_dim..s * qkv_dim + q.out_dim]
-                            .copy_from_slice(&q_out[s * q.out_dim..(s + 1) * q.out_dim]);
-                        qkv[s * qkv_dim + q.out_dim..s * qkv_dim + q.out_dim + k.out_dim]
-                            .copy_from_slice(&k_out[s * k.out_dim..(s + 1) * k.out_dim]);
-                        qkv[s * qkv_dim + q.out_dim + k.out_dim..s * qkv_dim + qkv_dim]
-                            .copy_from_slice(&v_out[s * v.out_dim..(s + 1) * v.out_dim]);
-                    }
-                    qkv
-                },
-                OwnedQKVWeights::Fused(_) => {
-                    return Err(RealizarError::UnsupportedOperation {
-                        operation: "forward_batch_multi_cache".to_string(),
-                        reason: "Fused QKV not supported".to_string(),
-                    });
-                },
-            };
-
-            // 2c. Per-sequence: apply RoPE and attention with each cache
-            let mut attn_outputs = vec![0.0f32; m * hidden_dim];
-            let actual_qkv_dim = hidden_dim + 2 * kv_dim;
-
-            for s in 0..m {
-                let qkv_start = s * actual_qkv_dim;
-                let mut q = qkv[qkv_start..qkv_start + hidden_dim].to_vec();
-                let mut k = qkv[qkv_start + hidden_dim..qkv_start + hidden_dim + kv_dim].to_vec();
-                let v = qkv[qkv_start + hidden_dim + kv_dim..qkv_start + actual_qkv_dim].to_vec();
-
-                // Apply RoPE at correct position for this sequence
-                self.model.apply_rope(&mut q, positions[s], num_heads);
-                self.model.apply_rope(&mut k, positions[s], num_kv_heads);
-
-                // Get and update KV cache for this sequence
-                let k_cache = caches[s].get_k(layer_idx);
-                let v_cache = caches[s].get_v(layer_idx);
-
-                // Single-token attention with cache
-                let attn_out = self
-                    .model
-                    .attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v);
-
-                // Update cache
-                caches[s].append_kv(layer_idx, &k, &v);
-
-                // Store attention output
-                attn_outputs[s * hidden_dim..(s + 1) * hidden_dim].copy_from_slice(&attn_out);
-            }
-
-            // 2d. Batched O projection
-            let o_name = format!("{}.attn_output.weight", prefix);
-            let mut o_out = vec![0.0f32; m * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &o_name,
-                    &attn_outputs,
-                    &mut o_out,
-                    m as u32,
-                    hidden_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_multi_cache".to_string(),
-                    reason: format!("O projection failed: {}", e),
-                })?;
-
-            // 2e. Residual add
-            for i in 0..hidden.len() {
-                hidden[i] += o_out[i];
-            }
-
-            // 2f. FFN RMSNorm (use attn_norm if no separate ffn_norm)
-            let ffn_normed = match &layer.ffn_norm_weight {
-                Some(ffn_norm) => self.model.layer_norm(
-                    &hidden,
-                    ffn_norm,
-                    layer.ffn_norm_bias.as_deref(),
-                    self.model.config.eps,
-                ),
-                None => hidden.clone(), // No FFN norm, use hidden directly
-            };
-
-            // 2g. Batched FFN up projection
-            let up_name = format!("{}.ffn_up.weight", prefix);
-            let intermediate_dim = layer.ffn_up_weight.out_dim;
-            let mut ffn_up = vec![0.0f32; m * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &up_name,
-                    &ffn_normed,
-                    &mut ffn_up,
-                    m as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_multi_cache".to_string(),
-                    reason: format!("FFN up failed: {}", e),
-                })?;
-
-            // 2h. Batched FFN gate projection + SwiGLU
-            let gate_name = format!("{}.ffn_gate.weight", prefix);
-            let mut ffn_gate = vec![0.0f32; m * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &gate_name,
-                    &ffn_normed,
-                    &mut ffn_gate,
-                    m as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_multi_cache".to_string(),
-                    reason: format!("FFN gate failed: {}", e),
-                })?;
-
-            // SwiGLU activation
-            for i in 0..ffn_gate.len() {
-                ffn_gate[i] = ffn_up[i] * (ffn_gate[i] / (1.0 + (-ffn_gate[i]).exp()));
-            }
-
-            // 2i. Batched FFN down projection
-            let down_name = format!("{}.ffn_down.weight", prefix);
-            let mut ffn_out = vec![0.0f32; m * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &down_name,
-                    &ffn_gate,
-                    &mut ffn_out,
-                    m as u32,
-                    intermediate_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_multi_cache".to_string(),
-                    reason: format!("FFN down failed: {}", e),
-                })?;
-
-            // 2j. Residual add
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_out[i];
-            }
-        }
-
-        // 3. Output RMSNorm
-        let normed = self.model.layer_norm(
-            &hidden,
-            &self.model.output_norm_weight,
-            self.model.output_norm_bias.as_deref(),
-            self.model.config.eps,
-        );
-
-        // 4. Batched LM head projection
-        let mut logits = vec![0.0f32; m * vocab_size];
-        self.executor
-            .batched_q4k_gemv_cached(
-                "output.weight",
-                &normed,
-                &mut logits,
-                m as u32,
-                hidden_dim as u32,
-                vocab_size as u32,
-            )
-            .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "forward_batch_multi_cache".to_string(),
-                reason: format!("LM head failed: {}", e),
-            })?;
-
-        // 5. Argmax for each sequence
-        let mut next_tokens = Vec::with_capacity(m);
-        for s in 0..m {
-            let logits_s = &logits[s * vocab_size..(s + 1) * vocab_size];
-            let max_idx = logits_s
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map_or(0, |(idx, _)| idx as u32);
-            next_tokens.push(max_idx);
-        }
-
-        Ok(next_tokens)
-    }
-
-    /// PAR-108: Batched forward with indexed cache access
-    ///
-    /// Takes indices into the cache array to avoid borrow checker issues.
-    /// Uses batched GEMV for linear projections.
-    fn forward_batch_indexed(
-        &mut self,
-        tokens: &[u32],
-        caches: &mut [OwnedQuantizedKVCache],
-        cache_indices: &[usize],
-        positions: &[usize],
-    ) -> Result<Vec<u32>> {
-        let m = tokens.len();
-        if m == 0 || m != cache_indices.len() || m != positions.len() {
-            return Err(RealizarError::UnsupportedOperation {
-                operation: "forward_batch_indexed".to_string(),
-                reason: format!(
-                    "Mismatched batch sizes: tokens={}, indices={}, positions={}",
-                    m,
-                    cache_indices.len(),
-                    positions.len()
-                ),
-            });
-        }
-
-        let hidden_dim = self.model.config.hidden_dim;
-        let num_heads = self.model.config.num_heads;
-        let num_kv_heads = self.model.config.num_kv_heads;
-        let head_dim = hidden_dim / num_heads;
-        let kv_dim = num_kv_heads * head_dim;
-        let vocab_size = self.model.config.vocab_size;
-
-        // 1. Batched token embedding [M × hidden_dim]
-        let mut hidden = self.model.embed(tokens);
-
-        // 2. Process through all layers
-        for (layer_idx, layer) in self.model.layers.iter().enumerate() {
-            let prefix = format!("blk.{}", layer_idx);
-
-            // 2a. Batched RMSNorm (CPU)
-            let normed = self.model.layer_norm(
-                &hidden,
-                &layer.attn_norm_weight,
-                layer.attn_norm_bias.as_deref(),
-                self.model.config.eps,
-            );
-
-            // 2b. Batched QKV projection using efficient batched GEMV
-            let qkv = match &layer.qkv_weight {
-                OwnedQKVWeights::Separate { q, k, v } => {
-                    let q_name = format!("{}.attn_q.weight", prefix);
-                    let k_name = format!("{}.attn_k.weight", prefix);
-                    let v_name = format!("{}.attn_v.weight", prefix);
-
-                    let mut q_out = vec![0.0f32; m * q.out_dim];
-                    let mut k_out = vec![0.0f32; m * k.out_dim];
-                    let mut v_out = vec![0.0f32; m * v.out_dim];
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &q_name,
-                            &normed,
-                            &mut q_out,
-                            m as u32,
-                            hidden_dim as u32,
-                            q.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_indexed".to_string(),
-                            reason: format!("Q projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &k_name,
-                            &normed,
-                            &mut k_out,
-                            m as u32,
-                            hidden_dim as u32,
-                            k.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_indexed".to_string(),
-                            reason: format!("K projection failed: {}", e),
-                        })?;
-
-                    self.executor
-                        .batched_q4k_gemv_cached(
-                            &v_name,
-                            &normed,
-                            &mut v_out,
-                            m as u32,
-                            hidden_dim as u32,
-                            v.out_dim as u32,
-                        )
-                        .map_err(|e| RealizarError::UnsupportedOperation {
-                            operation: "forward_batch_indexed".to_string(),
-                            reason: format!("V projection failed: {}", e),
-                        })?;
-
-                    // Concatenate Q, K, V
-                    let mut qkv = vec![0.0f32; m * (q.out_dim + k.out_dim + v.out_dim)];
-                    for s in 0..m {
-                        let qkv_dim = q.out_dim + k.out_dim + v.out_dim;
-                        qkv[s * qkv_dim..s * qkv_dim + q.out_dim]
-                            .copy_from_slice(&q_out[s * q.out_dim..(s + 1) * q.out_dim]);
-                        qkv[s * qkv_dim + q.out_dim..s * qkv_dim + q.out_dim + k.out_dim]
-                            .copy_from_slice(&k_out[s * k.out_dim..(s + 1) * k.out_dim]);
-                        qkv[s * qkv_dim + q.out_dim + k.out_dim..s * qkv_dim + qkv_dim]
-                            .copy_from_slice(&v_out[s * v.out_dim..(s + 1) * v.out_dim]);
-                    }
-                    qkv
-                },
-                OwnedQKVWeights::Fused(_) => {
-                    return Err(RealizarError::UnsupportedOperation {
-                        operation: "forward_batch_indexed".to_string(),
-                        reason: "Fused QKV not supported".to_string(),
-                    });
-                },
-            };
-
-            // 2c. Per-sequence: apply RoPE and attention with each cache
-            let mut attn_outputs = vec![0.0f32; m * hidden_dim];
-            let actual_qkv_dim = hidden_dim + 2 * kv_dim;
-
-            for s in 0..m {
-                let cache_idx = cache_indices[s];
-                let qkv_start = s * actual_qkv_dim;
-                let mut q = qkv[qkv_start..qkv_start + hidden_dim].to_vec();
-                let mut k = qkv[qkv_start + hidden_dim..qkv_start + hidden_dim + kv_dim].to_vec();
-                let v = qkv[qkv_start + hidden_dim + kv_dim..qkv_start + actual_qkv_dim].to_vec();
-
-                // Apply RoPE at correct position for this sequence
-                self.model.apply_rope(&mut q, positions[s], num_heads);
-                self.model.apply_rope(&mut k, positions[s], num_kv_heads);
-
-                // Get KV cache for this sequence
-                let k_cache = caches[cache_idx].get_k(layer_idx);
-                let v_cache = caches[cache_idx].get_v(layer_idx);
-
-                // Single-token attention with cache
-                let attn_out = self
-                    .model
-                    .attention_with_cache_gqa(&q, k_cache, v_cache, &k, &v);
-
-                // Update cache
-                caches[cache_idx].append_kv(layer_idx, &k, &v);
-
-                // Store attention output
-                attn_outputs[s * hidden_dim..(s + 1) * hidden_dim].copy_from_slice(&attn_out);
-            }
-
-            // 2d. Batched O projection
-            let o_name = format!("{}.attn_output.weight", prefix);
-            let mut o_out = vec![0.0f32; m * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &o_name,
-                    &attn_outputs,
-                    &mut o_out,
-                    m as u32,
-                    hidden_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_indexed".to_string(),
-                    reason: format!("O projection failed: {}", e),
-                })?;
-
-            // 2e. Residual add
-            for i in 0..hidden.len() {
-                hidden[i] += o_out[i];
-            }
-
-            // 2f. FFN RMSNorm (use attn_norm if no separate ffn_norm)
-            let ffn_normed = match &layer.ffn_norm_weight {
-                Some(ffn_norm) => self.model.layer_norm(
-                    &hidden,
-                    ffn_norm,
-                    layer.ffn_norm_bias.as_deref(),
-                    self.model.config.eps,
-                ),
-                None => hidden.clone(), // No FFN norm, use hidden directly
-            };
-
-            // 2g. Batched FFN up projection
-            let up_name = format!("{}.ffn_up.weight", prefix);
-            let intermediate_dim = layer.ffn_up_weight.out_dim;
-            let mut ffn_up = vec![0.0f32; m * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &up_name,
-                    &ffn_normed,
-                    &mut ffn_up,
-                    m as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_indexed".to_string(),
-                    reason: format!("FFN up failed: {}", e),
-                })?;
-
-            // 2h. Batched FFN gate projection + SwiGLU
-            let gate_name = format!("{}.ffn_gate.weight", prefix);
-            let mut ffn_gate = vec![0.0f32; m * intermediate_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &gate_name,
-                    &ffn_normed,
-                    &mut ffn_gate,
-                    m as u32,
-                    hidden_dim as u32,
-                    intermediate_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_indexed".to_string(),
-                    reason: format!("FFN gate failed: {}", e),
-                })?;
-
-            // SwiGLU activation
-            for i in 0..ffn_gate.len() {
-                ffn_gate[i] = ffn_up[i] * (ffn_gate[i] / (1.0 + (-ffn_gate[i]).exp()));
-            }
-
-            // 2i. Batched FFN down projection
-            let down_name = format!("{}.ffn_down.weight", prefix);
-            let mut ffn_out = vec![0.0f32; m * hidden_dim];
-            self.executor
-                .batched_q4k_gemv_cached(
-                    &down_name,
-                    &ffn_gate,
-                    &mut ffn_out,
-                    m as u32,
-                    intermediate_dim as u32,
-                    hidden_dim as u32,
-                )
-                .map_err(|e| RealizarError::UnsupportedOperation {
-                    operation: "forward_batch_indexed".to_string(),
-                    reason: format!("FFN down failed: {}", e),
-                })?;
-
-            // 2j. Residual add
-            for i in 0..hidden.len() {
-                hidden[i] += ffn_out[i];
-            }
-        }
-
-        // 3. Output RMSNorm
-        let normed = self.model.layer_norm(
-            &hidden,
-            &self.model.output_norm_weight,
-            self.model.output_norm_bias.as_deref(),
-            self.model.config.eps,
-        );
-
-        // 4. Batched LM head projection
-        let mut logits = vec![0.0f32; m * vocab_size];
-        self.executor
-            .batched_q4k_gemv_cached(
-                "output.weight",
-                &normed,
-                &mut logits,
-                m as u32,
-                hidden_dim as u32,
-                vocab_size as u32,
-            )
-            .map_err(|e| RealizarError::UnsupportedOperation {
-                operation: "forward_batch_indexed".to_string(),
-                reason: format!("LM head failed: {}", e),
-            })?;
-
-        // 5. Argmax for each sequence
-        let mut next_tokens = Vec::with_capacity(m);
-        for s in 0..m {
-            let logits_s = &logits[s * vocab_size..(s + 1) * vocab_size];
-            let max_idx = logits_s
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map_or(0, |(idx, _)| idx as u32);
-            next_tokens.push(max_idx);
-        }
-
-        Ok(next_tokens)
-    }
 
     /// Generate tokens using CUDA acceleration (IMP-800a)
     ///
@@ -21666,7 +16882,7 @@ impl OwnedQuantizedModelCuda {
                         OwnedQKVWeights::Fused(w) => {
                             let dim = w.out_dim / 3;
                             (dim, dim)
-                        }
+                        },
                     };
                     &b[q_dim..q_dim + k_dim]
                 })
@@ -21683,7 +16899,7 @@ impl OwnedQuantizedModelCuda {
                         OwnedQKVWeights::Fused(w) => {
                             let dim = w.out_dim / 3;
                             (dim, dim, dim)
-                        }
+                        },
                     };
                     &b[q_dim + k_dim..q_dim + k_dim + v_dim]
                 })
@@ -22005,12 +17221,10 @@ impl OwnedQuantizedModelCuda {
                 // Greedy sampling - use GPU-side argmax (4 bytes transfer vs 600KB)
                 self.forward_gpu_resident_to_token_id(last_token, &mut cache, position)?
             } else {
-                // Non-greedy sampling - need full logits for top-k
+                // Non-greedy sampling - need full logits for proper temperature + top-k sampling
+                // PAR-063: Fixed bug where GPU path always took top token instead of sampling
                 let logits = self.forward_gpu_resident(last_token, &mut cache, position)?;
-                let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                indexed.truncate(config.top_k);
-                indexed[0].0 as u32
+                OwnedQuantizedModel::sample_topk(&logits, config.temperature, config.top_k)
             };
 
             // Check stop tokens
@@ -22128,6 +17342,7 @@ impl OwnedQuantizedModelCuda {
 
         Ok(sequences)
     }
+
 }
 
 /// Configuration for quantized generation
@@ -23626,1127 +18841,12 @@ impl CudaBackend {
     }
 }
 
-/// Small, always-compiled vocabulary tests (no OOM risk)
-#[cfg(test)]
-mod vocab_tests {
-    use super::*;
-
-    #[test]
-    fn test_vocabulary_from_metadata() {
-        // Build GGUF with tokenizer.ggml.tokens array
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes()); // version 3
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
-
-        // Key: "tokenizer.ggml.tokens"
-        let key = "tokenizer.ggml.tokens";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes()); // value_type = Array
-        data.extend_from_slice(&8u32.to_le_bytes()); // element_type = String
-        data.extend_from_slice(&3u64.to_le_bytes()); // array_len = 3
-
-        // Token 0: "<pad>"
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"<pad>");
-        // Token 1: "hello"
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"hello");
-        // Token 2: "world"
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"world");
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let vocab = model.vocabulary().expect("Should have vocabulary");
-
-        assert_eq!(vocab.len(), 3);
-        assert_eq!(vocab[0], "<pad>");
-        assert_eq!(vocab[1], "hello");
-        assert_eq!(vocab[2], "world");
-    }
-
-    #[test]
-    fn test_decode_with_vocabulary() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "tokenizer.ggml.tokens";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes());
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&4u64.to_le_bytes());
-
-        // Tokens: "The ", "capital ", "of ", "France"
-        for token in ["The ", "capital ", "of ", "France"] {
-            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
-            data.extend_from_slice(token.as_bytes());
-        }
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let decoded = model.decode(&[0, 1, 2, 3]);
-
-        assert_eq!(decoded, "The capital of France");
-    }
-
-    #[test]
-    fn test_decode_unknown_token() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "tokenizer.ggml.tokens";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes());
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&2u64.to_le_bytes());
-
-        data.extend_from_slice(&1u64.to_le_bytes());
-        data.extend_from_slice(b"a");
-        data.extend_from_slice(&1u64.to_le_bytes());
-        data.extend_from_slice(b"b");
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        // Token ID 5 is out of range (vocab only has 0, 1)
-        let decoded = model.decode(&[0, 5, 1]);
-
-        assert_eq!(decoded, "a�b");
-    }
-
-    #[test]
-    fn test_vocabulary_none_when_missing() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert!(model.vocabulary().is_none());
-    }
-
-    #[test]
-    fn test_decode_fallback_ascii() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes()); // No metadata
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        // Falls back to ASCII: 72=H, 105=i
-        let decoded = model.decode(&[72, 105]);
-
-        assert_eq!(decoded, "Hi");
-    }
-
-    #[test]
-    fn test_encode_simple() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "tokenizer.ggml.tokens";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes());
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&3u64.to_le_bytes());
-
-        // Tokens with SentencePiece-style ▁ prefix for word boundaries
-        // Token 0: "▁Hello", Token 1: "▁world", Token 2: unused
-        // With SentencePiece prepending, "Hello world" → "▁Hello▁world"
-        for token in ["▁Hello", "▁world", "unused"] {
-            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
-            data.extend_from_slice(token.as_bytes());
-        }
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let tokens = model.encode("Hello world").expect("test");
-
-        assert_eq!(tokens, vec![0, 1]); // "▁Hello" + "▁world"
-    }
-
-    #[test]
-    fn test_encode_longest_match() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "tokenizer.ggml.tokens";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes());
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&3u64.to_le_bytes());
-
-        // Tokens: "▁a", "▁ab", "▁abc" - should pick longest match
-        // With SentencePiece prepending, "abc" → "▁abc"
-        for token in ["▁a", "▁ab", "▁abc"] {
-            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
-            data.extend_from_slice(token.as_bytes());
-        }
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let tokens = model.encode("abc").expect("test");
-
-        assert_eq!(tokens, vec![2]); // Should pick "▁abc" (longest match)
-    }
-
-    #[test]
-    fn test_encode_roundtrip() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "tokenizer.ggml.tokens";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes());
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&4u64.to_le_bytes());
-
-        // SentencePiece-style vocabulary with ▁ prefix for word boundaries
-        // With SentencePiece prepending, "The capital..." → "▁The▁capital..."
-        for token in ["▁The", "▁capital", "▁of", "▁France"] {
-            data.extend_from_slice(&(token.len() as u64).to_le_bytes());
-            data.extend_from_slice(token.as_bytes());
-        }
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let text = "The capital of France";
-        let tokens = model.encode(text).expect("test");
-        let decoded = model.decode(&tokens);
-
-        // Decoded text converts ▁ to spaces for human-readable output
-        assert_eq!(decoded, " The capital of France");
-    }
-
-    /// Test that sample_topk produces varied outputs (non-deterministic)
-    #[test]
-    fn test_sample_topk_produces_varied_outputs() {
-        // Create logits with multiple high-probability tokens
-        let mut logits = vec![0.0f32; 100];
-        logits[0] = 5.0;
-        logits[1] = 4.8;
-        logits[2] = 4.6;
-        logits[3] = 4.4;
-        logits[4] = 4.2;
-
-        // Sample multiple times and collect results
-        let mut samples = std::collections::HashSet::new();
-        for _ in 0..50 {
-            let token = OwnedQuantizedModel::sample_topk(&logits, 1.0, 5);
-            samples.insert(token);
-        }
-
-        // With true randomness, we should get multiple different tokens
-        // (with high probability, more than 1 unique token in 50 samples)
-        assert!(
-            samples.len() > 1,
-            "Expected varied sampling, got only {} unique tokens: {:?}. \
-            This indicates deterministic sampling instead of random.",
-            samples.len(),
-            samples
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "cuda")]
     use serial_test::serial;
-
-    #[test]
-    fn test_gguf_magic_constant() {
-        // "GGUF" in little-endian
-        assert_eq!(GGUF_MAGIC, 0x4655_4747);
-        // Verify it spells "GGUF"
-        let bytes = GGUF_MAGIC.to_le_bytes();
-        assert_eq!(&bytes, b"GGUF");
-    }
-
-    #[test]
-    fn test_parse_valid_header() {
-        // Minimal valid GGUF v3 header
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF"); // magic
-        data.extend_from_slice(&3u32.to_le_bytes()); // version 3
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.header.magic, GGUF_MAGIC);
-        assert_eq!(model.header.version, 3);
-        assert_eq!(model.header.tensor_count, 0);
-        assert_eq!(model.header.metadata_count, 0);
-    }
-
-    #[test]
-    fn test_invalid_magic() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"BAAD"); // Invalid magic
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        let result = GGUFModel::from_bytes(&data);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RealizarError::InvalidShape { .. }
-        ));
-    }
-
-    #[test]
-    fn test_unsupported_version() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&999u32.to_le_bytes()); // Unsupported version
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        let result = GGUFModel::from_bytes(&data);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RealizarError::UnsupportedOperation { .. }
-        ));
-    }
-
-    #[test]
-    fn test_truncated_data() {
-        // Only 4 bytes (magic only)
-        let data = b"GGUF";
-        let result = GGUFModel::from_bytes(data);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_empty_file() {
-        let data = &[];
-        let result = GGUFModel::from_bytes(data);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_uint32_metadata() {
-        // GGUF header with 1 metadata item (UInt32)
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF"); // magic
-        data.extend_from_slice(&3u32.to_le_bytes()); // version 3
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
-
-        // Metadata: key = "test.value", value_type = UInt32 (4), value = 42
-        let key = "test.value";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes()); // key length
-        data.extend_from_slice(key.as_bytes()); // key string
-        data.extend_from_slice(&4u32.to_le_bytes()); // value_type = UInt32
-        data.extend_from_slice(&42u32.to_le_bytes()); // value = 42
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 1);
-        assert_eq!(
-            model.metadata.get("test.value"),
-            Some(&GGUFValue::UInt32(42))
-        );
-    }
-
-    #[test]
-    fn test_parse_string_metadata() {
-        // GGUF header with 1 metadata item (String)
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
-
-        // Metadata: key = "model.name", value_type = String (8), value = "TestModel"
-        let key = "model.name";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&8u32.to_le_bytes()); // value_type = String
-        let value = "TestModel";
-        data.extend_from_slice(&(value.len() as u64).to_le_bytes()); // string length
-        data.extend_from_slice(value.as_bytes()); // string data
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 1);
-        assert_eq!(
-            model.metadata.get("model.name"),
-            Some(&GGUFValue::String("TestModel".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_multiple_metadata() {
-        // GGUF header with 2 metadata items
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&2u64.to_le_bytes()); // metadata_count = 2
-
-        // First: key = "version", value = UInt32(1)
-        data.extend_from_slice(&7u64.to_le_bytes());
-        data.extend_from_slice(b"version");
-        data.extend_from_slice(&4u32.to_le_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes());
-
-        // Second: key = "arch", value = String("llama")
-        data.extend_from_slice(&4u64.to_le_bytes());
-        data.extend_from_slice(b"arch");
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"llama");
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 2);
-        assert_eq!(model.metadata.get("version"), Some(&GGUFValue::UInt32(1)));
-        assert_eq!(
-            model.metadata.get("arch"),
-            Some(&GGUFValue::String("llama".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_single_tensor_info() {
-        // GGUF header with 1 tensor
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
-        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
-
-        // Tensor: name = "weight", n_dims = 2, dims = [128, 256], qtype = 0, offset = 1024
-        let name = "weight";
-        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        data.extend_from_slice(name.as_bytes());
-        data.extend_from_slice(&2u32.to_le_bytes()); // n_dims = 2
-        data.extend_from_slice(&128u64.to_le_bytes()); // dim[0] = 128
-        data.extend_from_slice(&256u64.to_le_bytes()); // dim[1] = 256
-        data.extend_from_slice(&0u32.to_le_bytes()); // qtype = 0
-        data.extend_from_slice(&1024u64.to_le_bytes()); // offset = 1024
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.tensors.len(), 1);
-        let tensor = &model.tensors[0];
-        assert_eq!(tensor.name, "weight");
-        assert_eq!(tensor.n_dims, 2);
-        // GGUF stores dims in row-major order, parser returns them reversed
-        assert_eq!(tensor.dims, vec![256, 128]);
-        assert_eq!(tensor.qtype, 0);
-        assert_eq!(tensor.offset, 1024);
-    }
-
-    #[test]
-    fn test_parse_tensor_3d() {
-        // GGUF header with 1 tensor (3D)
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
-        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
-
-        // Tensor: name = "conv.weight", n_dims = 3, dims = [64, 64, 3]
-        let name = "conv.weight";
-        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        data.extend_from_slice(name.as_bytes());
-        data.extend_from_slice(&3u32.to_le_bytes()); // n_dims = 3
-        data.extend_from_slice(&64u64.to_le_bytes());
-        data.extend_from_slice(&64u64.to_le_bytes());
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(&2u32.to_le_bytes()); // qtype = 2 (quantized)
-        data.extend_from_slice(&2048u64.to_le_bytes()); // offset = 2048
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.tensors.len(), 1);
-        let tensor = &model.tensors[0];
-        assert_eq!(tensor.name, "conv.weight");
-        assert_eq!(tensor.n_dims, 3);
-        // GGUF stores dims in row-major order, parser returns them reversed
-        assert_eq!(tensor.dims, vec![3, 64, 64]);
-        assert_eq!(tensor.qtype, 2);
-        assert_eq!(tensor.offset, 2048);
-    }
-
-    #[test]
-    fn test_parse_metadata_and_tensors() {
-        // GGUF with both metadata and tensors
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
-        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
-
-        // Metadata: model.type = String("llama")
-        data.extend_from_slice(&10u64.to_le_bytes());
-        data.extend_from_slice(b"model.type");
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"llama");
-
-        // Tensor: embedding
-        data.extend_from_slice(&9u64.to_le_bytes());
-        data.extend_from_slice(b"embedding");
-        data.extend_from_slice(&2u32.to_le_bytes());
-        data.extend_from_slice(&32000u64.to_le_bytes());
-        data.extend_from_slice(&4096u64.to_le_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 1);
-        assert_eq!(model.tensors.len(), 1);
-        assert_eq!(
-            model.metadata.get("model.type"),
-            Some(&GGUFValue::String("llama".to_string()))
-        );
-        assert_eq!(model.tensors[0].name, "embedding");
-    }
-
-    #[test]
-    fn test_parse_uint8_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
-
-        // Metadata: key = "byte_val", value_type = UInt8 (0), value = 255
-        let key = "byte_val";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes()); // value_type = UInt8
-        data.push(255u8); // value = 255
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.get("byte_val"), Some(&GGUFValue::UInt8(255)));
-    }
-
-    #[test]
-    fn test_parse_int8_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "signed_byte";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes()); // value_type = Int8
-        data.extend_from_slice(&(-42i8).to_le_bytes()); // value = -42
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("signed_byte"),
-            Some(&GGUFValue::Int8(-42))
-        );
-    }
-
-    #[test]
-    fn test_parse_uint16_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "short_val";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&2u32.to_le_bytes()); // value_type = UInt16
-        data.extend_from_slice(&65535u16.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("short_val"),
-            Some(&GGUFValue::UInt16(65535))
-        );
-    }
-
-    #[test]
-    fn test_parse_int16_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "signed_short";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&3u32.to_le_bytes()); // value_type = Int16
-        data.extend_from_slice(&(-1000i16).to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("signed_short"),
-            Some(&GGUFValue::Int16(-1000))
-        );
-    }
-
-    #[test]
-    fn test_parse_int32_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "signed_int";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&5u32.to_le_bytes()); // value_type = Int32
-        data.extend_from_slice(&(-100_000_i32).to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("signed_int"),
-            Some(&GGUFValue::Int32(-100_000))
-        );
-    }
-
-    #[test]
-    fn test_parse_float32_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "float_val";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&6u32.to_le_bytes()); // value_type = Float32
-        data.extend_from_slice(&1.25f32.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        if let Some(GGUFValue::Float32(val)) = model.metadata.get("float_val") {
-            assert!((val - 1.25).abs() < 1e-5);
-        } else {
-            panic!("Expected Float32 value");
-        }
-    }
-
-    #[test]
-    fn test_parse_bool_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "is_enabled";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&7u32.to_le_bytes()); // value_type = Bool
-        data.push(1u8); // true
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("is_enabled"),
-            Some(&GGUFValue::Bool(true))
-        );
-    }
-
-    #[test]
-    fn test_parse_bool_false_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "is_disabled";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&7u32.to_le_bytes()); // value_type = Bool
-        data.push(0u8); // false
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("is_disabled"),
-            Some(&GGUFValue::Bool(false))
-        );
-    }
-
-    #[test]
-    fn test_parse_uint64_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "big_uint";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&10u32.to_le_bytes()); // value_type = UInt64
-        data.extend_from_slice(&(u64::MAX).to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("big_uint"),
-            Some(&GGUFValue::UInt64(u64::MAX))
-        );
-    }
-
-    #[test]
-    fn test_parse_int64_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "big_int";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&11u32.to_le_bytes()); // value_type = Int64
-        data.extend_from_slice(&(i64::MIN).to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(
-            model.metadata.get("big_int"),
-            Some(&GGUFValue::Int64(i64::MIN))
-        );
-    }
-
-    #[test]
-    fn test_parse_float64_metadata() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "double_val";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&12u32.to_le_bytes()); // value_type = Float64
-        data.extend_from_slice(&1.125f64.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        if let Some(GGUFValue::Float64(val)) = model.metadata.get("double_val") {
-            assert!((val - 1.125).abs() < 1e-10);
-        } else {
-            panic!("Expected Float64 value");
-        }
-    }
-
-    #[test]
-    fn test_parse_unsupported_value_type() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "unknown";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&99u32.to_le_bytes()); // Invalid value_type
-
-        let result = GGUFModel::from_bytes(&data);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            RealizarError::UnsupportedOperation { .. }
-        ));
-    }
-
-    #[test]
-    fn test_parse_all_value_types() {
-        // Test file with all supported value types
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&12u64.to_le_bytes()); // metadata_count = 12
-
-        // UInt8
-        data.extend_from_slice(&2u64.to_le_bytes());
-        data.extend_from_slice(b"u8");
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.push(100u8);
-
-        // Int8
-        data.extend_from_slice(&2u64.to_le_bytes());
-        data.extend_from_slice(b"i8");
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&(-50i8).to_le_bytes());
-
-        // UInt16
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"u16");
-        data.extend_from_slice(&2u32.to_le_bytes());
-        data.extend_from_slice(&1000u16.to_le_bytes());
-
-        // Int16
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"i16");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&(-500i16).to_le_bytes());
-
-        // UInt32
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"u32");
-        data.extend_from_slice(&4u32.to_le_bytes());
-        data.extend_from_slice(&100_000_u32.to_le_bytes());
-
-        // Int32
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"i32");
-        data.extend_from_slice(&5u32.to_le_bytes());
-        data.extend_from_slice(&(-50000i32).to_le_bytes());
-
-        // Float32
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"f32");
-        data.extend_from_slice(&6u32.to_le_bytes());
-        data.extend_from_slice(&1.5f32.to_le_bytes());
-
-        // Bool
-        data.extend_from_slice(&4u64.to_le_bytes());
-        data.extend_from_slice(b"bool");
-        data.extend_from_slice(&7u32.to_le_bytes());
-        data.push(1u8);
-
-        // String
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"str");
-        data.extend_from_slice(&8u32.to_le_bytes());
-        data.extend_from_slice(&4u64.to_le_bytes());
-        data.extend_from_slice(b"test");
-
-        // UInt64
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"u64");
-        data.extend_from_slice(&10u32.to_le_bytes());
-        data.extend_from_slice(&1_000_000u64.to_le_bytes());
-
-        // Int64
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"i64");
-        data.extend_from_slice(&11u32.to_le_bytes());
-        data.extend_from_slice(&(-500_000_i64).to_le_bytes());
-
-        // Float64
-        data.extend_from_slice(&3u64.to_le_bytes());
-        data.extend_from_slice(b"f64");
-        data.extend_from_slice(&12u32.to_le_bytes());
-        data.extend_from_slice(&2.5f64.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 12);
-        assert_eq!(model.metadata.get("u8"), Some(&GGUFValue::UInt8(100)));
-        assert_eq!(model.metadata.get("i8"), Some(&GGUFValue::Int8(-50)));
-        assert_eq!(model.metadata.get("u16"), Some(&GGUFValue::UInt16(1000)));
-        assert_eq!(model.metadata.get("i16"), Some(&GGUFValue::Int16(-500)));
-        assert_eq!(model.metadata.get("u32"), Some(&GGUFValue::UInt32(100_000)));
-        assert_eq!(model.metadata.get("i32"), Some(&GGUFValue::Int32(-50000)));
-        assert_eq!(model.metadata.get("bool"), Some(&GGUFValue::Bool(true)));
-        assert_eq!(
-            model.metadata.get("str"),
-            Some(&GGUFValue::String("test".to_string()))
-        );
-        assert_eq!(
-            model.metadata.get("u64"),
-            Some(&GGUFValue::UInt64(1_000_000))
-        );
-        assert_eq!(model.metadata.get("i64"), Some(&GGUFValue::Int64(-500_000)));
-
-        // Check floats with tolerance
-        if let Some(GGUFValue::Float32(val)) = model.metadata.get("f32") {
-            assert!((val - 1.5).abs() < 1e-5);
-        } else {
-            panic!("Expected f32");
-        }
-        if let Some(GGUFValue::Float64(val)) = model.metadata.get("f64") {
-            assert!((val - 2.5).abs() < 1e-10);
-        } else {
-            panic!("Expected f64");
-        }
-    }
-
-    #[test]
-    fn test_parse_array_uint32() {
-        // GGUF header with 1 metadata item (Array of UInt32)
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF"); // magic
-        data.extend_from_slice(&3u32.to_le_bytes()); // version 3
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
-
-        // Metadata: key = "test.array", value_type = Array (9)
-        let key = "test.array";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes()); // key length
-        data.extend_from_slice(key.as_bytes()); // key string
-        data.extend_from_slice(&9u32.to_le_bytes()); // value_type = Array
-        data.extend_from_slice(&4u32.to_le_bytes()); // element_type = UInt32
-        data.extend_from_slice(&3u64.to_le_bytes()); // array_len = 3
-        data.extend_from_slice(&1u32.to_le_bytes()); // element 0
-        data.extend_from_slice(&2u32.to_le_bytes()); // element 1
-        data.extend_from_slice(&3u32.to_le_bytes()); // element 2
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 1);
-        if let Some(GGUFValue::Array(arr)) = model.metadata.get("test.array") {
-            assert_eq!(arr.len(), 3);
-            assert_eq!(arr[0], GGUFValue::UInt32(1));
-            assert_eq!(arr[1], GGUFValue::UInt32(2));
-            assert_eq!(arr[2], GGUFValue::UInt32(3));
-        } else {
-            panic!("Expected Array value");
-        }
-    }
-
-    #[test]
-    fn test_parse_array_string() {
-        // GGUF header with 1 metadata item (Array of strings)
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        // Metadata: key = "test.strings", value_type = Array (9)
-        let key = "test.strings";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes()); // value_type = Array
-        data.extend_from_slice(&8u32.to_le_bytes()); // element_type = String
-        data.extend_from_slice(&2u64.to_le_bytes()); // array_len = 2
-
-        // String element 0: "hello"
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"hello");
-
-        // String element 1: "world"
-        data.extend_from_slice(&5u64.to_le_bytes());
-        data.extend_from_slice(b"world");
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        assert_eq!(model.metadata.len(), 1);
-        if let Some(GGUFValue::Array(arr)) = model.metadata.get("test.strings") {
-            assert_eq!(arr.len(), 2);
-            assert_eq!(arr[0], GGUFValue::String("hello".to_string()));
-            assert_eq!(arr[1], GGUFValue::String("world".to_string()));
-        } else {
-            panic!("Expected Array value");
-        }
-    }
-
-    #[test]
-    fn test_parse_empty_array() {
-        // GGUF header with empty array
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-
-        let key = "empty";
-        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        data.extend_from_slice(key.as_bytes());
-        data.extend_from_slice(&9u32.to_le_bytes()); // value_type = Array
-        data.extend_from_slice(&4u32.to_le_bytes()); // element_type = UInt32
-        data.extend_from_slice(&0u64.to_le_bytes()); // array_len = 0
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        if let Some(GGUFValue::Array(arr)) = model.metadata.get("empty") {
-            assert_eq!(arr.len(), 0);
-        } else {
-            panic!("Expected empty Array");
-        }
-    }
-
-    #[test]
-    fn test_get_tensor_f32_unquantized() {
-        // Create a GGUF file with F32 tensor
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes()); // version = 3
-        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
-        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
-
-        // Tensor: name = "weights", dims = [2, 3], qtype = F32 (0)
-        let tensor_name = "weights";
-        data.extend_from_slice(&(tensor_name.len() as u64).to_le_bytes());
-        data.extend_from_slice(tensor_name.as_bytes());
-        data.extend_from_slice(&2u32.to_le_bytes()); // n_dims = 2
-        data.extend_from_slice(&2u64.to_le_bytes()); // dim[0] = 2
-        data.extend_from_slice(&3u64.to_le_bytes()); // dim[1] = 3
-        data.extend_from_slice(&GGUF_TYPE_F32.to_le_bytes()); // qtype = F32
-
-        // Tensor offset is 0 (relative to tensor data section start)
-        data.extend_from_slice(&0u64.to_le_bytes()); // offset = 0
-
-        // Pad to 32-byte alignment
-        while data.len() % GGUF_ALIGNMENT != 0 {
-            data.push(0);
-        }
-
-        // Add F32 tensor data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-        for val in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
-            data.extend_from_slice(&val.to_le_bytes());
-        }
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let values = model.get_tensor_f32("weights", &data).expect("test");
-
-        assert_eq!(values.len(), 6);
-        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_get_tensor_f32_not_found() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let result = model.get_tensor_f32("nonexistent", &data);
-
-        assert!(result.is_err());
-        if let Err(RealizarError::UnsupportedOperation { reason, .. }) = result {
-            assert!(reason.contains("not found"));
-        }
-    }
-
-    #[test]
-    fn test_get_tensor_f32_q4_0() {
-        // Create a GGUF file with Q4_0 tensor
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        // Tensor: name = "quant_weights", dims = [64] (2 blocks), qtype = Q4_0 (2)
-        let tensor_name = "quant_weights";
-        data.extend_from_slice(&(tensor_name.len() as u64).to_le_bytes());
-        data.extend_from_slice(tensor_name.as_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes()); // n_dims = 1
-        data.extend_from_slice(&64u64.to_le_bytes()); // dim[0] = 64 (2 blocks of 32)
-        data.extend_from_slice(&GGUF_TYPE_Q4_0.to_le_bytes());
-
-        // Tensor offset is 0 (relative to tensor data section start)
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        // Pad to 32-byte alignment
-        while data.len() % GGUF_ALIGNMENT != 0 {
-            data.push(0);
-        }
-
-        // Add Q4_0 data: 2 blocks (18 bytes each)
-        // Q4_0 layout: 1×f16 scale (2 bytes) + 16 bytes (32×4-bit quants) = 18 bytes/block
-        // Block 1: scale = 1.0 as f16, quants = 16 bytes
-        data.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
-        data.extend_from_slice(&[0x10; 16]); // 4-bit values
-
-        // Block 2: scale = 2.0 as f16, quants = 16 bytes
-        data.extend_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
-        data.extend_from_slice(&[0x21; 16]);
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let values = model.get_tensor_f32("quant_weights", &data).expect("test");
-
-        // Verify size is correct
-        assert_eq!(values.len(), 64);
-
-        // Values should be dequantized (non-zero)
-        assert!(values.iter().any(|&v| v != 0.0));
-    }
-
-    #[test]
-    fn test_get_tensor_f32_q8_0() {
-        // Create a GGUF file with Q8_0 tensor
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        // Tensor: dims = [32] (1 block), qtype = Q8_0 (8)
-        let tensor_name = "q8_weights";
-        data.extend_from_slice(&(tensor_name.len() as u64).to_le_bytes());
-        data.extend_from_slice(tensor_name.as_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&32u64.to_le_bytes()); // dim[0] = 32 (1 block)
-        data.extend_from_slice(&GGUF_TYPE_Q8_0.to_le_bytes());
-
-        // Tensor offset is 0 (relative to tensor data section start)
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        // Pad to 32-byte alignment
-        while data.len() % GGUF_ALIGNMENT != 0 {
-            data.push(0);
-        }
-
-        // Add Q8_0 data: 1 block (36 bytes: 4 for scale + 32 for quants)
-        data.extend_from_slice(&0.5f32.to_le_bytes());
-        for i in 0i32..32 {
-            // Test data uses i8 range [0, 31] - safe to convert
-            data.push(u8::try_from(i).expect("test"));
-        }
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let values = model.get_tensor_f32("q8_weights", &data).expect("test");
-
-        assert_eq!(values.len(), 32);
-        // First value should be approximately 0.5 * 0 = 0.0
-        assert!((values[0] - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_get_tensor_f32_unsupported_qtype() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-
-        // Tensor with unsupported qtype
-        let tensor_name = "bad_tensor";
-        data.extend_from_slice(&(tensor_name.len() as u64).to_le_bytes());
-        data.extend_from_slice(tensor_name.as_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&4u64.to_le_bytes());
-        data.extend_from_slice(&999u32.to_le_bytes()); // Invalid qtype
-
-        // Calculate offset
-        let tensor_offset = (data.len() + 8) as u64;
-        data.extend_from_slice(&tensor_offset.to_le_bytes());
-
-        let model = GGUFModel::from_bytes(&data).expect("test");
-        let result = model.get_tensor_f32("bad_tensor", &data);
-
-        assert!(result.is_err());
-        if let Err(RealizarError::UnsupportedOperation { reason, .. }) = result {
-            assert!(reason.contains("Unsupported quantization type"));
-        }
-    }
 
     // ============================================================
     // QuantizedGGUFTransformer::generate() tests
@@ -25969,52 +20069,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(feature = "gpu")]
-    fn test_imp_108d_forward_batch_gpu_with_causal() {
-        // IMP-108d: Verify forward_batch_gpu uses proper causal attention
-        let config = GGUFConfig {
-            architecture: "test".to_string(),
-            hidden_dim: 64,
-            intermediate_dim: 128,
-            num_layers: 1,
-            num_heads: 4,
-            num_kv_heads: 4,
-            vocab_size: 100,
-            context_length: 1024,
-            rope_theta: 10000.0,
-            eps: 1e-5,
-            rope_type: 0,
-        };
-
-        let model = create_test_model_with_config(&config);
-
-        // Batch of 8 tokens
-        let tokens = vec![1u32, 5, 10, 20, 30, 40, 50, 60];
-        let logits = model.forward_batch_gpu_causal(&tokens).expect("test");
-
-        // Should return [batch_size * vocab_size] logits
-        assert_eq!(
-            logits.len(),
-            tokens.len() * config.vocab_size,
-            "IMP-108d: forward_batch_gpu_causal should return batch_size * vocab_size logits"
-        );
-
-        // All logits should be finite
-        assert!(
-            logits.iter().all(|x| x.is_finite()),
-            "IMP-108d: All logits should be finite"
-        );
-
-        // Verify determinism
-        let logits2 = model.forward_batch_gpu_causal(&tokens).expect("test");
-        for i in 0..logits.len() {
-            assert!(
-                (logits[i] - logits2[i]).abs() < 1e-5,
-                "IMP-108d: GPU causal forward should be deterministic"
-            );
-        }
-    }
 
     // =========================================================================
     // IMP-109: Fused Dequantize-Matmul Kernel (GPU-Accelerated)
@@ -26268,68 +20322,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(feature = "gpu")]
-    fn test_imp_109d_fused_forward_uses_fused_kernel() {
-        // IMP-109d: Verify that forward_batch_gpu_fused uses fused kernels
-        // This eliminates intermediate buffer allocation for weights
-        let config = GGUFConfig {
-            architecture: "test".to_string(),
-            hidden_dim: 256,
-            intermediate_dim: 512,
-            num_layers: 1,
-            num_heads: 4,
-            num_kv_heads: 4,
-            vocab_size: 100,
-            context_length: 1024,
-            rope_theta: 10000.0,
-            eps: 1e-5,
-            rope_type: 0,
-        };
-
-        let model = create_test_model_with_config(&config);
-
-        // Batch of 4 tokens
-        let tokens = vec![1u32, 5, 10, 20];
-
-        // Use fused forward pass (GPU with fused kernels)
-        let fused_logits = model
-            .forward_batch_gpu_fused(&tokens)
-            .expect("IMP-109d: Fused forward should succeed");
-
-        // Verify output shape
-        assert_eq!(
-            fused_logits.len(),
-            tokens.len() * config.vocab_size,
-            "IMP-109d: Fused forward should return batch_size * vocab_size logits"
-        );
-
-        // Verify finite values
-        assert!(
-            fused_logits.iter().all(|x| x.is_finite()),
-            "IMP-109d: All fused logits should be finite"
-        );
-
-        // Compare with non-fused version for correctness
-        let reference_logits = model
-            .forward_batch_gpu(&tokens)
-            .expect("Reference forward should succeed");
-
-        // Results should be very close (same computation, different path)
-        // Note: GPU kernel optimizations may cause minor precision differences
-        // Threshold set to 3e-3 to account for fused kernel precision variance
-        for i in 0..fused_logits.len() {
-            let diff = (fused_logits[i] - reference_logits[i]).abs();
-            assert!(
-                diff < 3e-3,
-                "IMP-109d: Position {} differs: fused={}, reference={}, diff={}",
-                i,
-                fused_logits[i],
-                reference_logits[i],
-                diff
-            );
-        }
-    }
 
     // =========================================================================
     // IMP-110: Multi-Head Parallel Attention
@@ -26539,65 +20531,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(feature = "gpu")]
-    fn test_imp_110d_forward_with_parallel_attention() {
-        // IMP-110d: End-to-end verification with parallel attention in forward pass
-        let config = GGUFConfig {
-            architecture: "test".to_string(),
-            hidden_dim: 64,
-            intermediate_dim: 128,
-            num_layers: 1,
-            num_heads: 4,
-            num_kv_heads: 4,
-            vocab_size: 100,
-            context_length: 256,
-            rope_theta: 10000.0,
-            eps: 1e-5,
-            rope_type: 0,
-        };
-
-        let model = create_test_model_with_config(&config);
-
-        // Batch of tokens
-        let tokens = vec![1u32, 5, 10, 20, 30, 40];
-
-        // Use parallel attention forward pass
-        let parallel_logits = model
-            .forward_batch_gpu_parallel_attention(&tokens)
-            .expect("IMP-110d: Parallel attention forward should succeed");
-
-        // Verify output shape
-        assert_eq!(
-            parallel_logits.len(),
-            tokens.len() * config.vocab_size,
-            "IMP-110d: Should return batch_size * vocab_size logits"
-        );
-
-        // Verify finite values
-        assert!(
-            parallel_logits.iter().all(|x| x.is_finite()),
-            "IMP-110d: All logits should be finite"
-        );
-
-        // Compare with sequential attention for correctness
-        let sequential_logits = model
-            .forward_batch_gpu(&tokens)
-            .expect("Sequential forward should succeed");
-
-        // Results should match (same computation, different execution order)
-        for i in 0..parallel_logits.len() {
-            let diff = (parallel_logits[i] - sequential_logits[i]).abs();
-            assert!(
-                diff < 1e-3,
-                "IMP-110d: Position {} differs: parallel={}, sequential={}, diff={}",
-                i,
-                parallel_logits[i],
-                sequential_logits[i],
-                diff
-            );
-        }
-    }
 
     // =========================================================================
     // IMP-112: HybridScheduler Caching
@@ -30003,98 +23936,6 @@ mod tests {
         );
     }
 
-    /// Test PARITY-005: Contiguous cache with OwnedQuantizedModel
-    #[test]
-    fn test_parity005g_generate_with_contiguous_cache() {
-        let config = GGUFConfig {
-            architecture: "test".to_string(),
-            hidden_dim: 64,
-            intermediate_dim: 128,
-            num_layers: 2,
-            num_heads: 4,
-            num_kv_heads: 4,
-            vocab_size: 100,
-            context_length: 256,
-            rope_theta: 10000.0,
-            eps: 1e-5,
-            rope_type: 0,
-        };
-
-        let model = create_test_model_with_config(&config);
-
-        // Test generate_with_contiguous_cache
-        let gen_config = QuantizedGenerateConfig {
-            max_tokens: 5,
-            temperature: 0.0,
-            top_k: 1,
-            stop_tokens: vec![],
-        };
-
-        let prompt = vec![1u32, 2, 3];
-        let result = model.generate_with_contiguous_cache(&prompt, &gen_config);
-
-        assert!(
-            result.is_ok(),
-            "PARITY-005g: generate_with_contiguous_cache should succeed"
-        );
-        let tokens = result.expect("test");
-        assert!(
-            tokens.len() >= prompt.len(),
-            "PARITY-005g: Output should include prompt tokens"
-        );
-    }
-
-    /// Test PARITY-005: Contiguous vs Vec<Vec> output equivalence
-    #[test]
-    fn test_parity005h_contiguous_vs_original_equivalence() {
-        let config = GGUFConfig {
-            architecture: "test".to_string(),
-            hidden_dim: 64,
-            intermediate_dim: 128,
-            num_layers: 2,
-            num_heads: 4,
-            num_kv_heads: 4,
-            vocab_size: 100,
-            context_length: 256,
-            rope_theta: 10000.0,
-            eps: 1e-5,
-            rope_type: 0,
-        };
-
-        let model = create_test_model_with_config(&config);
-
-        // Test both cache implementations produce equivalent output
-        let gen_config = QuantizedGenerateConfig {
-            max_tokens: 5,
-            temperature: 0.0,
-            top_k: 1,
-            stop_tokens: vec![],
-        };
-
-        let prompt = vec![1u32, 2, 3];
-
-        // Generate with original Vec<Vec<f32>> cache
-        let result_original = model
-            .generate_with_cache(&prompt, &gen_config)
-            .expect("test");
-
-        // Generate with contiguous cache
-        let result_contiguous = model
-            .generate_with_contiguous_cache(&prompt, &gen_config)
-            .expect("test");
-
-        // Both should produce the same output (deterministic greedy sampling)
-        assert_eq!(
-            result_original.len(),
-            result_contiguous.len(),
-            "PARITY-005h: Both cache types should produce same length output"
-        );
-
-        assert_eq!(
-            result_original, result_contiguous,
-            "PARITY-005h: Both cache types should produce identical tokens"
-        );
-    }
 
     /// Test PARITY-005: Performance comparison - contiguous vs Vec<Vec> cache
     ///
@@ -54104,15 +47945,25 @@ mod tests {
     #[test]
     fn test_dispatch_metrics_new_cov() {
         let metrics = DispatchMetrics::new();
-        // Metrics created with atomic counters
-        drop(metrics);
+        // Metrics created with atomic counters - verify cpu_dispatches is zero
+        assert_eq!(
+            metrics
+                .cpu_dispatches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
     fn test_dispatch_metrics_default_cov() {
         let metrics = DispatchMetrics::default();
-        // Default metrics created
-        drop(metrics);
+        // Default metrics created - verify cpu_dispatches is zero
+        assert_eq!(
+            metrics
+                .cpu_dispatches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     // =========================================================================
@@ -54163,5 +48014,843 @@ mod tests {
     #[test]
     fn test_gguf_alignment_constant_cov() {
         assert_eq!(GGUF_ALIGNMENT, 32);
+    }
+
+    // =========================================================================
+    // Coverage Tests: MappedGGUFModel (file-based)
+    // =========================================================================
+
+    #[test]
+    fn test_mapped_gguf_model_from_path() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a minimal valid GGUF file
+        let mut temp = NamedTempFile::new().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF"); // magic
+        data.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count = 0
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let mapped = MappedGGUFModel::from_path(temp.path()).expect("from_path");
+        assert_eq!(mapped.model.header.magic, GGUF_MAGIC);
+        assert_eq!(mapped.model.header.version, 3);
+    }
+
+    #[test]
+    fn test_mapped_gguf_model_data() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let mapped = MappedGGUFModel::from_path(temp.path()).unwrap();
+        let mmap_data = mapped.data();
+        assert!(!mmap_data.is_empty());
+        assert_eq!(&mmap_data[0..4], b"GGUF");
+    }
+
+    #[test]
+    fn test_mapped_gguf_model_tensor_slice() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let mapped = MappedGGUFModel::from_path(temp.path()).unwrap();
+
+        // Valid slice
+        let slice = mapped.tensor_slice(0, 4);
+        assert!(slice.is_some());
+        assert_eq!(slice.unwrap(), b"GGUF");
+
+        // Out of bounds
+        let oob = mapped.tensor_slice(100, 100);
+        assert!(oob.is_none());
+
+        // Overflow
+        let overflow = mapped.tensor_slice(usize::MAX, 10);
+        assert!(overflow.is_none());
+    }
+
+    #[test]
+    fn test_mapped_gguf_model_file_size() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        let len = data.len();
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let mapped = MappedGGUFModel::from_path(temp.path()).unwrap();
+        assert_eq!(mapped.file_size(), len);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_mapped_gguf_model_advise_methods() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let mapped = MappedGGUFModel::from_path(temp.path()).unwrap();
+        // These just call madvise, shouldn't panic
+        mapped.advise_sequential();
+        mapped.advise_random();
+        mapped.advise_willneed();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_mapped_gguf_model_lock_memory() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+
+        let mapped = MappedGGUFModel::from_path(temp.path()).unwrap();
+        // May succeed or fail depending on ulimit
+        let _ = mapped.lock_memory();
+    }
+
+    #[test]
+    fn test_mapped_gguf_model_from_path_nonexistent() {
+        let result = MappedGGUFModel::from_path("/nonexistent/path/to/model.gguf");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mapped_gguf_model_from_path_string() {
+        let result = MappedGGUFModel::from_path(String::from("/nonexistent/model.gguf"));
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Coverage Tests: Parsing error paths
+    // =========================================================================
+
+    #[test]
+    fn test_parse_truncated_tensor_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        // Missing tensor_count and metadata_count
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_metadata_key() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        data.extend_from_slice(&1u64.to_le_bytes()); // metadata_count = 1
+        // Truncated key length
+        data.extend_from_slice(&100u64.to_le_bytes()); // key_len but no key data
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_metadata_type() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        // Missing value_type
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_string_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes()); // String type
+        data.extend_from_slice(&100u64.to_le_bytes()); // string len but no data
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_utf8_string() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes()); // String type
+        data.extend_from_slice(&4u64.to_le_bytes()); // string len
+        data.extend_from_slice(&[0xff, 0xfe, 0xff, 0xfe]); // Invalid UTF-8
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_u8_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // UInt8 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_i8_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // Int8 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_u16_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes()); // UInt16 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_i16_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes()); // Int16 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_u32_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes()); // UInt32 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_i32_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes()); // Int32 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_f32_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&6u32.to_le_bytes()); // Float32 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_bool_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&7u32.to_le_bytes()); // Bool type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_u64_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&10u32.to_le_bytes()); // UInt64 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_i64_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&11u32.to_le_bytes()); // Int64 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_f64_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&12u32.to_le_bytes()); // Float64 type
+        // Missing value
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_array_truncated_elements() {
+        // Test array with claimed length but missing element data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let key = "test";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes()); // Array type
+        data.extend_from_slice(&4u32.to_le_bytes()); // Element type = UInt32
+        data.extend_from_slice(&5u64.to_le_bytes()); // 5 elements claimed
+        // Only provide 1 element worth of data
+        data.extend_from_slice(&42u32.to_le_bytes());
+        let result = GGUFModel::from_bytes(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bos_eos_token_id() {
+        // Test bos_token_id and eos_token_id metadata parsing
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // no tensors
+        data.extend_from_slice(&2u64.to_le_bytes()); // 2 metadata
+
+        // Add bos_token_id
+        let key = "tokenizer.ggml.bos_token_id";
+        data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes()); // UInt32 type
+        data.extend_from_slice(&1u32.to_le_bytes()); // value = 1
+
+        // Add eos_token_id
+        let key2 = "tokenizer.ggml.eos_token_id";
+        data.extend_from_slice(&(key2.len() as u64).to_le_bytes());
+        data.extend_from_slice(key2.as_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes()); // UInt32 type
+        data.extend_from_slice(&2u32.to_le_bytes()); // value = 2
+
+        let model = GGUFModel::from_bytes(&data).expect("valid GGUF");
+        assert_eq!(model.bos_token_id(), Some(1));
+        assert_eq!(model.eos_token_id(), Some(2));
+    }
+
+    #[test]
+    fn test_bos_eos_token_id_missing() {
+        // Test bos_token_id and eos_token_id when missing
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let model = GGUFModel::from_bytes(&data).expect("valid GGUF");
+        assert_eq!(model.bos_token_id(), None);
+        assert_eq!(model.eos_token_id(), None);
+    }
+
+    // =========================================================================
+    // Coverage Tests: get_tensor_f32 error paths
+    // =========================================================================
+
+    #[test]
+    fn test_get_tensor_f32_truncated_f32_data() {
+        // Build GGUF with F32 tensor but truncated data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes()); // version
+        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
+
+        // Tensor info
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // 1 dimension
+        data.extend_from_slice(&16u64.to_le_bytes()); // dim[0] = 16 (needs 64 bytes)
+        data.extend_from_slice(&GGUF_TYPE_F32.to_le_bytes()); // F32 type
+        data.extend_from_slice(&0u64.to_le_bytes()); // offset = 0
+
+        // Align to 32 bytes
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+        // Only provide 4 bytes of tensor data (needs 64)
+        data.extend_from_slice(&[1.0f32.to_le_bytes()].concat());
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_tensor_f32_truncated_q4_0_data() {
+        // Build GGUF with Q4_0 tensor but truncated data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
+        data.extend_from_slice(&0u64.to_le_bytes()); // metadata_count = 0
+
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // 1 dimension
+        data.extend_from_slice(&64u64.to_le_bytes()); // dim[0] = 64 (needs 36 bytes for Q4_0)
+        data.extend_from_slice(&GGUF_TYPE_Q4_0.to_le_bytes()); // Q4_0 type
+        data.extend_from_slice(&0u64.to_le_bytes()); // offset = 0
+
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+        // Only provide 4 bytes (needs 36)
+        data.extend_from_slice(&[0u8; 4]);
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_tensor_f32_truncated_q8_0_data() {
+        // Build GGUF with Q8_0 tensor but truncated data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&64u64.to_le_bytes()); // dim = 64 (needs 68 bytes for Q8_0)
+        data.extend_from_slice(&GGUF_TYPE_Q8_0.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&[0u8; 4]); // Only 4 bytes
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_tensor_f32_truncated_q4_k_data() {
+        // Build GGUF with Q4_K tensor but truncated data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&256u64.to_le_bytes()); // Q4_K needs 144 bytes for 256 elements
+        data.extend_from_slice(&GGUF_TYPE_Q4_K.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&[0u8; 4]); // Only 4 bytes
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_tensor_f32_truncated_q5_k_data() {
+        // Build GGUF with Q5_K tensor but truncated data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&256u64.to_le_bytes()); // Q5_K needs 176 bytes for 256 elements
+        data.extend_from_slice(&GGUF_TYPE_Q5_K.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&[0u8; 4]); // Only 4 bytes
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_tensor_f32_truncated_q6_k_data() {
+        // Build GGUF with Q6_K tensor but truncated data
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&256u64.to_le_bytes()); // Q6_K needs 210 bytes for 256 elements
+        data.extend_from_slice(&GGUF_TYPE_Q6_K.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&[0u8; 4]); // Only 4 bytes
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_tensor_f32_dimension_overflow() {
+        // Build GGUF with tensor dimensions that overflow
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        let name = "test.weight";
+        data.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes()); // 2 dimensions
+        data.extend_from_slice(&0x7FFF_FFFF_FFFF_FFFFu64.to_le_bytes()); // huge dim
+        data.extend_from_slice(&0x7FFF_FFFF_FFFF_FFFFu64.to_le_bytes()); // huge dim
+        data.extend_from_slice(&GGUF_TYPE_F32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        while data.len() % 32 != 0 {
+            data.push(0);
+        }
+
+        let model = GGUFModel::from_bytes(&data).expect("valid header");
+        let result = model.get_tensor_f32("test.weight", &data);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Coverage Tests: Metadata accessor methods
+    // =========================================================================
+
+    fn build_gguf_with_metadata(metadata: Vec<(&str, GGUFValue)>) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        data.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+
+        for (key, value) in metadata {
+            data.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            data.extend_from_slice(key.as_bytes());
+            match value {
+                GGUFValue::UInt32(v) => {
+                    data.extend_from_slice(&4u32.to_le_bytes());
+                    data.extend_from_slice(&v.to_le_bytes());
+                },
+                GGUFValue::Float32(v) => {
+                    data.extend_from_slice(&6u32.to_le_bytes());
+                    data.extend_from_slice(&v.to_le_bytes());
+                },
+                GGUFValue::String(ref s) => {
+                    data.extend_from_slice(&8u32.to_le_bytes());
+                    data.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                    data.extend_from_slice(s.as_bytes());
+                },
+                _ => {},
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_embedding_dim_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.embedding_length", GGUFValue::UInt32(4096)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.embedding_dim(), Some(4096));
+    }
+
+    #[test]
+    fn test_embedding_dim_missing() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.embedding_dim(), None);
+    }
+
+    #[test]
+    fn test_num_layers_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.block_count", GGUFValue::UInt32(32)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.num_layers(), Some(32));
+    }
+
+    #[test]
+    fn test_num_heads_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.attention.head_count", GGUFValue::UInt32(32)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.num_heads(), Some(32));
+    }
+
+    #[test]
+    fn test_context_length_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.context_length", GGUFValue::UInt32(4096)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.context_length(), Some(4096));
+    }
+
+    #[test]
+    fn test_num_kv_heads_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.attention.head_count_kv", GGUFValue::UInt32(8)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.num_kv_heads(), Some(8));
+    }
+
+    #[test]
+    fn test_rope_freq_base_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.rope.freq_base", GGUFValue::Float32(10000.0)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.rope_freq_base(), Some(10000.0));
+    }
+
+    #[test]
+    fn test_rms_epsilon_present() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.attention.layer_norm_rms_epsilon", GGUFValue::Float32(1e-5)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.rms_epsilon(), Some(1e-5));
+    }
+
+    #[test]
+    fn test_rope_type_from_scaling_type_none() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.rope.scaling.type", GGUFValue::String("none".to_string())),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.rope_type(), Some(0));
+    }
+
+    #[test]
+    fn test_rope_type_from_scaling_type_linear() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.rope.scaling.type", GGUFValue::String("linear".to_string())),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.rope_type(), Some(0));
+    }
+
+    #[test]
+    fn test_rope_type_from_scaling_type_yarn() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.rope.scaling.type", GGUFValue::String("yarn".to_string())),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.rope_type(), Some(2));
+    }
+
+    #[test]
+    fn test_rope_type_from_scaling_type_neox() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("llama".to_string())),
+            ("llama.rope.scaling.type", GGUFValue::String("neox".to_string())),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.rope_type(), Some(2));
+    }
+
+    #[test]
+    fn test_all_metadata_accessors_missing_architecture() {
+        let data = build_gguf_with_metadata(vec![]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.architecture(), None);
+        assert_eq!(model.embedding_dim(), None);
+        assert_eq!(model.num_layers(), None);
+        assert_eq!(model.num_heads(), None);
+        assert_eq!(model.context_length(), None);
+        assert_eq!(model.num_kv_heads(), None);
+        assert_eq!(model.rope_freq_base(), None);
+        assert_eq!(model.rms_epsilon(), None);
+        assert_eq!(model.rope_type(), None);
+    }
+
+    #[test]
+    fn test_metadata_with_qwen_architecture() {
+        let data = build_gguf_with_metadata(vec![
+            ("general.architecture", GGUFValue::String("qwen2".to_string())),
+            ("qwen2.embedding_length", GGUFValue::UInt32(3584)),
+            ("qwen2.block_count", GGUFValue::UInt32(28)),
+        ]);
+        let model = GGUFModel::from_bytes(&data).expect("valid");
+        assert_eq!(model.architecture(), Some("qwen2"));
+        assert_eq!(model.embedding_dim(), Some(3584));
+        assert_eq!(model.num_layers(), Some(28));
     }
 }
