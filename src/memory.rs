@@ -179,7 +179,7 @@ mod tests {
             max_locked_bytes: 100,
         };
         let data = vec![0u8; 1024]; // Exceeds limit
-        // SAFETY: Memory safety ensured by bounds checking and alignment
+                                    // SAFETY: Memory safety ensured by bounds checking and alignment
         let (region, result) = unsafe { PinnedRegion::new(data.as_ptr(), data.len(), &config) };
         assert_eq!(result, MlockResult::ResourceLimit);
         assert!(!region.is_locked());
@@ -264,5 +264,63 @@ mod tests {
                 || result == MlockResult::Unsupported
         );
         assert_eq!(region.len(), 64);
+    }
+
+    // ========================================================================
+    // Coverage Tests
+    // ========================================================================
+
+    #[test]
+    fn test_mlock_config_debug() {
+        let config = MlockConfig {
+            enabled: true,
+            max_locked_bytes: 1024,
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("MlockConfig"));
+        assert!(debug.contains("1024"));
+    }
+
+    #[test]
+    fn test_mlock_config_clone() {
+        let config = MlockConfig {
+            enabled: true,
+            max_locked_bytes: 2048,
+        };
+        let cloned = config.clone();
+        assert_eq!(config.enabled, cloned.enabled);
+        assert_eq!(config.max_locked_bytes, cloned.max_locked_bytes);
+    }
+
+    #[test]
+    fn test_mlock_result_debug() {
+        let result = MlockResult::Locked;
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("Locked"));
+
+        let result2 = MlockResult::InsufficientPrivileges;
+        let debug2 = format!("{:?}", result2);
+        assert!(debug2.contains("InsufficientPrivileges"));
+    }
+
+    #[test]
+    fn test_mlock_result_clone() {
+        let result = MlockResult::Locked;
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+    }
+
+    #[test]
+    fn test_expert_tier_debug() {
+        let tier = ExpertTier::Hot;
+        let debug = format!("{:?}", tier);
+        assert!(debug.contains("Hot"));
+    }
+
+    #[test]
+    fn test_expert_tier_clone() {
+        let tier = ExpertTier::Warm;
+        let cloned = tier;
+        assert_eq!(tier, cloned);
     }
 }

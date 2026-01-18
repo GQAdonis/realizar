@@ -1828,6 +1828,18 @@ pub struct IndexedLayerWeights {
     pub ffn_norm_ptr: u64,
     /// FFN RMSNorm gamma size in elements
     pub ffn_norm_len: usize,
+    /// Q projection bias device pointer (FP32, optional - 0 if no bias)
+    pub attn_q_bias_ptr: u64,
+    /// Q projection bias size in elements (0 if no bias)
+    pub attn_q_bias_len: usize,
+    /// K projection bias device pointer (FP32, optional - 0 if no bias)
+    pub attn_k_bias_ptr: u64,
+    /// K projection bias size in elements (0 if no bias)
+    pub attn_k_bias_len: usize,
+    /// V projection bias device pointer (FP32, optional - 0 if no bias)
+    pub attn_v_bias_ptr: u64,
+    /// V projection bias size in elements (0 if no bias)
+    pub attn_v_bias_len: usize,
 }
 
 /// Weight quantization type for GGUF tensors
@@ -2024,6 +2036,10 @@ pub struct CudaExecutor {
     // Key format: "blk.{layer_idx}.{attn|ffn}_norm.gamma"
     // Pre-cached at model load to avoid per-token uploads
     rmsnorm_cache: HashMap<String, GpuBuffer<f32>>,
+    // BIAS-FIX: Cached QKV and other bias vectors on GPU (FP32)
+    // Key format: "blk.{layer_idx}.attn_{q|k|v}.bias"
+    // Qwen2.5 models have QKV bias that must be added after GEMV
+    bias_cache: HashMap<String, GpuBuffer<f32>>,
     // PAR-043: Pre-indexed layer weights for O(1) access during decode
     // Eliminates ~10ms per-token overhead from string formatting + HashMap lookups
     indexed_layer_weights: Vec<IndexedLayerWeights>,
@@ -2165,6 +2181,7 @@ impl CudaExecutor {
             quantized_weight_cache: HashMap::new(), // PAR-005: quantized weight cache
             quantized_weight_types: HashMap::new(), // PAR-058: weight quant types
             rmsnorm_cache: HashMap::new(),          // PAR-023: RMSNorm gamma cache
+            bias_cache: HashMap::new(),             // BIAS-FIX: QKV bias cache
             // PAR-043: Pre-indexed layer weights for O(1) access
             indexed_layer_weights: Vec::new(),
             output_norm_ptr: 0,
@@ -2291,7 +2308,7 @@ impl CudaExecutor {
         self.profiler.summary()
     }
 
-    /// Start timing a brick (internal use).
+    /// Start timing a brick (internal use, legacy string API).
     ///
     /// When profiling is enabled, syncs the stream and starts a timer.
     /// Returns the timer handle for use with `stop_brick_timer()`.
@@ -2300,8 +2317,10 @@ impl CudaExecutor {
         if !self.profiler.is_enabled() {
             return None;
         }
-        // Sync to ensure previous work is complete
-        let _ = self.stream.synchronize();
+        // Sync to ensure previous work is complete (immediate mode)
+        if self.profiler.sync_mode() == trueno::SyncMode::Immediate {
+            let _ = self.stream.synchronize();
+        }
         Some(self.profiler.start(name))
     }
 
@@ -2310,10 +2329,254 @@ impl CudaExecutor {
     /// When profiling is enabled, syncs the stream and records the elapsed time.
     fn stop_brick_timer(&mut self, timer: Option<trueno::BrickTimer>, elements: u64) {
         if let Some(t) = timer {
-            // Sync to capture real GPU time
-            let _ = self.stream.synchronize();
+            // Sync to capture real GPU time (immediate mode)
+            if self.profiler.sync_mode() == trueno::SyncMode::Immediate {
+                let _ = self.stream.synchronize();
+            }
             self.profiler.stop(t, elements);
         }
+    }
+
+    // ========================================================================
+    // PAR-200: BrickId-based profiling (O(1) hot path)
+    // ========================================================================
+
+    /// Start timing a brick using BrickId (PAR-200 fast path).
+    ///
+    /// This is the preferred API for known brick types.
+    #[inline]
+    #[must_use]
+    fn start_brick_id(&mut self, brick_id: trueno::BrickId) -> Option<trueno::BrickIdTimer> {
+        if !self.profiler.is_enabled() {
+            return None;
+        }
+        if self.profiler.sync_mode() == trueno::SyncMode::Immediate {
+            let _ = self.stream.synchronize();
+        }
+        Some(self.profiler.start_brick(brick_id))
+    }
+
+    /// Stop timing a brick using BrickId (PAR-200 fast path).
+    #[inline]
+    fn stop_brick_id(&mut self, timer: Option<trueno::BrickIdTimer>, elements: u64) {
+        if let Some(t) = timer {
+            if self.profiler.sync_mode() == trueno::SyncMode::Immediate {
+                let _ = self.stream.synchronize();
+            }
+            self.profiler.stop_brick(t, elements);
+        }
+    }
+
+    /// Record a deferred measurement (PAR-200, ~5% overhead).
+    ///
+    /// Use this for production profiling. Call `finalize_profiling()` after
+    /// GPU sync to apply all pending measurements.
+    #[inline]
+    fn record_brick_deferred(&mut self, brick_id: trueno::BrickId, start_ns: u64, elements: u64) {
+        self.profiler.record_deferred(brick_id, start_ns, elements);
+    }
+
+    /// Finalize all pending profiling measurements.
+    ///
+    /// Must be called after `stream.synchronize()` when using deferred mode.
+    #[inline]
+    fn finalize_profiling(&mut self) {
+        if self.profiler.has_pending() {
+            let end_ns = self.profiler.elapsed_ns();
+            self.profiler.finalize(end_ns);
+        }
+    }
+
+    /// Reset profiler epoch for deferred timing.
+    #[inline]
+    fn reset_profiler_epoch(&mut self) {
+        self.profiler.reset_epoch();
+    }
+
+    /// Get profiler category breakdown (PAR-200).
+    #[must_use]
+    pub fn profiler_category_stats(&self) -> [trueno::CategoryStats; trueno::BrickCategory::COUNT] {
+        self.profiler.category_stats()
+    }
+
+    /// Print profiler category breakdown (PAR-200).
+    pub fn print_profiler_categories(&self) {
+        self.profiler.print_category_stats();
+    }
+
+    /// Set profiler sync mode (PAR-200).
+    ///
+    /// # Modes
+    /// - `Immediate`: Sync after each kernel (accurate, ~200% overhead)
+    /// - `PerLayer`: Sync once per layer (~20% overhead)
+    /// - `Deferred`: Sync once per forward pass (~5% overhead)
+    /// - `None`: No profiling overhead
+    pub fn set_profiler_sync_mode(&mut self, mode: trueno::SyncMode) {
+        self.profiler.set_sync_mode(mode);
+    }
+
+    /// Get current profiler sync mode.
+    #[must_use]
+    pub fn profiler_sync_mode(&self) -> trueno::SyncMode {
+        self.profiler.sync_mode()
+    }
+
+    // ========================================================================
+    // PAR-201: Execution Graph Tracking (ASCII tree visualization)
+    // ========================================================================
+
+    /// Enable execution graph tracking for brick→kernel→PTX relationships.
+    ///
+    /// When enabled, each brick operation is recorded in a hierarchical graph
+    /// that can be visualized as an ASCII tree for CI/CD and debugging.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// cuda_model.enable_graph_tracking();
+    /// cuda_model.forward_gpu_resident(token, &mut cache, pos)?;
+    /// println!("{}", cuda_model.execution_graph_ascii());
+    /// // Output:
+    /// // Layer 0
+    /// // ├── RmsNorm  50.0µs (4096 elem)
+    /// // │   └── rmsnorm_kernel  <<<16,256,1>>> smem=1024B
+    /// // └── QkvProjection  200.0µs (4096 elem)
+    /// ```
+    pub fn enable_graph_tracking(&mut self) {
+        self.profiler.enable_graph();
+    }
+
+    /// Disable execution graph tracking.
+    pub fn disable_graph_tracking(&mut self) {
+        self.profiler.disable_graph();
+    }
+
+    /// Check if execution graph tracking is enabled.
+    #[must_use]
+    pub fn is_graph_tracking_enabled(&self) -> bool {
+        self.profiler.is_graph_enabled()
+    }
+
+    /// Get the execution graph (immutable).
+    #[must_use]
+    pub fn execution_graph(&self) -> &trueno::ExecutionGraph {
+        self.profiler.execution_graph()
+    }
+
+    /// Get the execution graph as ASCII tree (headless mode for CI/CD).
+    ///
+    /// PAR-201: Zero-dependency tree visualization for snapshot tests, logging,
+    /// and CI pipelines.
+    #[must_use]
+    pub fn execution_graph_ascii(&self) -> String {
+        self.profiler.execution_graph().to_ascii_tree()
+    }
+
+    // ========================================================================
+    // TILING-SPEC-001: Tile-Level Profiling (Phase 15)
+    // ========================================================================
+
+    /// Enable tile-level profiling for hierarchical cache analysis.
+    ///
+    /// When enabled, `start_tile_timer()`/`stop_tile_timer()` record per-tile
+    /// statistics (GFLOP/s, arithmetic intensity, throughput) at Macro/Midi/Micro
+    /// levels for identifying memory-bound vs compute-bound bottlenecks.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// cuda_model.enable_tile_profiling();
+    /// cuda_model.forward_tiled_profiled(...)?;
+    /// println!("{}", cuda_model.tile_summary());
+    /// // Output:
+    /// // === Tile Profiling Summary (TILING-SPEC-001) ===
+    /// // Level       Samples   Avg µs    GFLOP/s   AI      Elements
+    /// // macro            28    5280.0      0.40  0.50    1048576
+    /// ```
+    pub fn enable_tile_profiling(&mut self) {
+        self.profiler.enable_tile_profiling();
+    }
+
+    /// Disable tile-level profiling.
+    pub fn disable_tile_profiling(&mut self) {
+        self.profiler.disable_tile_profiling();
+    }
+
+    /// Check if tile profiling is enabled.
+    #[must_use]
+    pub fn is_tile_profiling_enabled(&self) -> bool {
+        self.profiler.is_tile_profiling_enabled()
+    }
+
+    /// Start timing a tile operation.
+    ///
+    /// # Arguments
+    /// * `level` - Tile hierarchy level (Macro/Midi/Micro)
+    /// * `layer_idx` - Layer index (for Macro tiles) or head index (for Midi tiles)
+    /// * `op_idx` - Operation index within the layer (0=QKV, 1=Attn, 2=FFN)
+    ///
+    /// # Returns
+    /// Timer handle to pass to `stop_tile_timer()`.
+    #[must_use]
+    fn start_tile_timer(
+        &mut self,
+        level: trueno::TileLevel,
+        layer_idx: u32,
+        op_idx: u32,
+    ) -> Option<trueno::TileTimer> {
+        if !self.profiler.is_tile_profiling_enabled() {
+            return None;
+        }
+        // Sync to ensure previous work is complete
+        let _ = self.stream.synchronize();
+        Some(self.profiler.start_tile(level, layer_idx, op_idx))
+    }
+
+    /// Stop timing a tile operation and record statistics.
+    ///
+    /// # Arguments
+    /// * `timer` - Timer handle from `start_tile_timer()`
+    /// * `elements` - Number of elements processed (for throughput calculation)
+    /// * `flops` - Number of floating-point operations (for GFLOP/s calculation)
+    fn stop_tile_timer(
+        &mut self,
+        timer: Option<trueno::TileTimer>,
+        elements: u64,
+        flops: u64,
+    ) {
+        if let Some(t) = timer {
+            // Sync to capture real GPU time
+            let _ = self.stream.synchronize();
+            self.profiler.stop_tile(t, elements, flops);
+        }
+    }
+
+    /// Get tile statistics for a given level.
+    #[must_use]
+    pub fn tile_stats(&self, level: trueno::TileLevel) -> &trueno::TileStats {
+        self.profiler.tile_stats(level)
+    }
+
+    /// Get tile profiling summary report.
+    #[must_use]
+    pub fn tile_summary(&self) -> String {
+        self.profiler.tile_summary()
+    }
+
+    /// Get tile statistics as JSON (PMAT integration).
+    #[must_use]
+    pub fn tile_stats_json(&self) -> String {
+        self.profiler.tile_stats_to_json()
+    }
+
+    /// Reset tile statistics.
+    pub fn reset_tile_stats(&mut self) {
+        self.profiler.reset_tile_stats();
+    }
+
+    /// Clear the execution graph.
+    pub fn clear_execution_graph(&mut self) {
+        self.profiler.execution_graph_mut().clear();
     }
 
     /// Get device name
@@ -2660,6 +2923,40 @@ impl CudaExecutor {
                 );
             }
 
+            // BIAS-FIX: Get QKV bias pointers from bias_cache (optional - 0/0 if not present)
+            let q_bias_name = format!("{}.attn_q.bias", prefix);
+            let k_bias_name = format!("{}.attn_k.bias", prefix);
+            let v_bias_name = format!("{}.attn_v.bias", prefix);
+
+            let (attn_q_bias_ptr, attn_q_bias_len) = self
+                .bias_cache
+                .get(&q_bias_name)
+                .map(|b| (b.as_ptr(), b.len()))
+                .unwrap_or((0, 0));
+            let (attn_k_bias_ptr, attn_k_bias_len) = self
+                .bias_cache
+                .get(&k_bias_name)
+                .map(|b| (b.as_ptr(), b.len()))
+                .unwrap_or((0, 0));
+            let (attn_v_bias_ptr, attn_v_bias_len) = self
+                .bias_cache
+                .get(&v_bias_name)
+                .map(|b| (b.as_ptr(), b.len()))
+                .unwrap_or((0, 0));
+
+            // Log if bias detected (for debugging)
+            if attn_q_bias_len > 0 && (layer_idx == 0 || layer_idx == 4 || layer_idx == 27) {
+                eprintln!(
+                    "[BIAS-FIX] Layer {}: Q bias len={}, K bias len={}, V bias len={}",
+                    layer_idx, attn_q_bias_len, attn_k_bias_len, attn_v_bias_len
+                );
+            } else if attn_q_bias_len == 0 && layer_idx <= 10 {
+                eprintln!(
+                    "[BIAS-FIX] Layer {}: NO BIAS (q_bias_len=0)",
+                    layer_idx
+                );
+            }
+
             indexed.push(IndexedLayerWeights {
                 attn_q_ptr,
                 attn_q_len,
@@ -2686,6 +2983,13 @@ impl CudaExecutor {
                 attn_norm_len,
                 ffn_norm_ptr,
                 ffn_norm_len,
+                // BIAS-FIX: QKV bias pointers
+                attn_q_bias_ptr,
+                attn_q_bias_len,
+                attn_k_bias_ptr,
+                attn_k_bias_len,
+                attn_v_bias_ptr,
+                attn_v_bias_len,
             });
         }
 
@@ -9107,6 +9411,126 @@ impl CudaExecutor {
         Ok(output)
     }
 
+    /// TILING-SPEC-001: Tile-profiled transformer layer for bottleneck identification.
+    ///
+    /// This method wraps `transformer_layer_gpu` with tile-level profiling instrumentation
+    /// to identify whether the 0.07% efficiency bottleneck is:
+    /// - Kernel launch overhead (many small kernels)
+    /// - CPU dequantization in the hot path
+    /// - Memory transfer overhead (H2D/D2H)
+    /// - Specific operation bottlenecks (QKV, attention, FFN)
+    ///
+    /// # Profiling Levels
+    ///
+    /// | Level | Operation | FLOPs Formula |
+    /// |-------|-----------|---------------|
+    /// | Macro | QKV Projections | 2 × M × K × 3 |
+    /// | Macro | Output Projection | 2 × M × K |
+    /// | Midi  | Attention | 2 × seq × head_dim × num_heads |
+    /// | Macro | FFN (SwiGLU) | 2 × M × K × 3 |
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// cuda_model.enable_tile_profiling();
+    /// let output = cuda_model.transformer_layer_gpu_tiled_profiled(...)?;
+    /// println!("{}", cuda_model.tile_summary());
+    /// // Output shows per-operation GFLOP/s and identifies bottlenecks
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn transformer_layer_gpu_tiled_profiled(
+        &mut self,
+        input: &GpuBuffer<f32>,
+        layer_idx: usize,
+        layer_prefix: &str,
+        hidden_dim: u32,
+        intermediate_dim: u32,
+        attn_norm_gamma: &GpuBuffer<f32>,
+        ffn_norm_gamma: &GpuBuffer<f32>,
+        epsilon: f32,
+    ) -> Result<GpuBuffer<f32>, GpuError> {
+        // Weight names follow GGML convention
+        let q_name = format!("{}.attn_q.weight", layer_prefix);
+        let k_name = format!("{}.attn_k.weight", layer_prefix);
+        let v_name = format!("{}.attn_v.weight", layer_prefix);
+        let o_name = format!("{}.attn_output.weight", layer_prefix);
+        let gate_name = format!("{}.ffn_gate.weight", layer_prefix);
+        let up_name = format!("{}.ffn_up.weight", layer_prefix);
+        let down_name = format!("{}.ffn_down.weight", layer_prefix);
+
+        // Q/K/V dimensions
+        let q_dim = (self.kv_num_heads * self.kv_head_dim) as u32;
+        let kv_dim = (self.kv_num_kv_heads * self.kv_head_dim) as u32;
+
+        // 1. Pre-attention RMSNorm (tracked as Micro - very fast)
+        let timer_norm1 = self.start_tile_timer(trueno::TileLevel::Micro, layer_idx as u32, 0);
+        let normed = self.rmsnorm_gpu(input, attn_norm_gamma, hidden_dim, epsilon)?;
+        // RMSNorm FLOPs: 5N (square, sum, rsqrt, multiply, multiply) per element
+        let norm_flops = (hidden_dim as u64) * 5;
+        self.stop_tile_timer(timer_norm1, hidden_dim as u64, norm_flops);
+
+        // 2. Q/K/V projections (Macro tile - largest compute block)
+        // FLOPs: 2 * M * K for each matrix-vector multiply (M=1 for single token)
+        let timer_qkv = self.start_tile_timer(trueno::TileLevel::Macro, layer_idx as u32, 1);
+
+        let q = self.q4k_gemv_cached_async(&q_name, &normed, q_dim, hidden_dim)?;
+        let k = self.q4k_gemv_cached_async(&k_name, &normed, kv_dim, hidden_dim)?;
+        let v = self.q4k_gemv_cached_async(&v_name, &normed, kv_dim, hidden_dim)?;
+
+        // QKV FLOPs: Q(hidden→q) + K(hidden→kv) + V(hidden→kv)
+        let qkv_flops =
+            2 * (hidden_dim as u64) * (q_dim as u64 + kv_dim as u64 + kv_dim as u64);
+        let qkv_elements = (q_dim + kv_dim + kv_dim) as u64;
+        self.stop_tile_timer(timer_qkv, qkv_elements, qkv_flops);
+
+        // 3. Incremental attention (Midi tile - head-level parallelism)
+        let timer_attn = self.start_tile_timer(trueno::TileLevel::Midi, layer_idx as u32, 2);
+        let (attn_out, seq_len) = self.incremental_attention_async(layer_idx, &q, &k, &v)?;
+        // Attention FLOPs: 2 * seq * head_dim * num_heads (Q×K^T + softmax×V)
+        let attn_flops =
+            2 * (seq_len as u64) * (self.kv_head_dim as u64) * (self.kv_num_heads as u64) * 2;
+        self.stop_tile_timer(timer_attn, q_dim as u64, attn_flops);
+
+        // 4. Output projection (Macro tile)
+        let timer_proj = self.start_tile_timer(trueno::TileLevel::Macro, layer_idx as u32, 3);
+        let projected = self.q4k_gemv_cached_async(&o_name, &attn_out, hidden_dim, q_dim)?;
+        let proj_flops = 2 * (q_dim as u64) * (hidden_dim as u64);
+        self.stop_tile_timer(timer_proj, hidden_dim as u64, proj_flops);
+
+        // 5. First residual add (Micro - very fast)
+        let timer_res1 = self.start_tile_timer(trueno::TileLevel::Micro, layer_idx as u32, 4);
+        let residual1 = self.residual_add_gpu(input, &projected, hidden_dim)?;
+        self.stop_tile_timer(timer_res1, hidden_dim as u64, hidden_dim as u64);
+
+        // 6. Pre-FFN RMSNorm (Micro)
+        let timer_norm2 = self.start_tile_timer(trueno::TileLevel::Micro, layer_idx as u32, 5);
+        let ffn_normed = self.rmsnorm_gpu(&residual1, ffn_norm_gamma, hidden_dim, epsilon)?;
+        self.stop_tile_timer(timer_norm2, hidden_dim as u64, norm_flops);
+
+        // 7. FFN SwiGLU (Macro tile - second largest compute block)
+        // FLOPs: gate(hidden→inter) + up(hidden→inter) + down(inter→hidden) + SiLU
+        let timer_ffn = self.start_tile_timer(trueno::TileLevel::Macro, layer_idx as u32, 6);
+        let ffn_out = self.fused_ffn_swiglu_gpu(
+            &ffn_normed,
+            &gate_name,
+            &up_name,
+            &down_name,
+            hidden_dim,
+            intermediate_dim,
+        )?;
+        // FFN FLOPs: 3 GEMV (gate+up+down) + SiLU (~3 ops per element)
+        let ffn_flops = 2 * (hidden_dim as u64) * (intermediate_dim as u64) * 3
+            + (intermediate_dim as u64) * 3;
+        self.stop_tile_timer(timer_ffn, hidden_dim as u64, ffn_flops);
+
+        // 8. Second residual add (Micro)
+        let timer_res2 = self.start_tile_timer(trueno::TileLevel::Micro, layer_idx as u32, 7);
+        let output = self.residual_add_gpu(&residual1, &ffn_out, hidden_dim)?;
+        self.stop_tile_timer(timer_res2, hidden_dim as u64, hidden_dim as u64);
+
+        Ok(output)
+    }
+
     /// PAR-063-V5: Transformer layer using TRUE DP4A kernels (async, no sync)
     ///
     /// Uses Q8 activation quantization + Q4K×Q8 integer dot product for 4x instruction reduction.
@@ -9268,6 +9692,108 @@ impl CudaExecutor {
     #[must_use]
     pub fn has_output_norm(&self) -> bool {
         self.rmsnorm_cache.contains_key("output_norm.gamma")
+    }
+
+    /// Cache a single RMSNorm gamma weight by name.
+    ///
+    /// This is used by APR model loading to cache per-layer norm weights
+    /// with arbitrary naming conventions. The gamma values are uploaded
+    /// to GPU and stored in rmsnorm_cache for O(1) lookup during forward.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Cache key name (e.g., "blk.0.attn_norm.gamma")
+    /// * `gamma` - RMSNorm scale weights [hidden_dim]
+    ///
+    /// # Returns
+    ///
+    /// Total bytes uploaded to GPU (0 if already cached)
+    pub fn cache_rmsnorm_gamma(&mut self, name: &str, gamma: &[f32]) -> Result<usize, GpuError> {
+        if !self.rmsnorm_cache.contains_key(name) {
+            let buf = GpuBuffer::from_host(&self.context, gamma)?;
+            let bytes = buf.size_bytes();
+            self.rmsnorm_cache.insert(name.to_string(), buf);
+            Ok(bytes)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// BIAS-FIX: Cache QKV bias vectors on GPU for all layers
+    ///
+    /// Pre-uploads Q, K, V bias vectors (when present) to avoid per-layer uploads.
+    /// Uses naming convention: `blk.{i}.attn_q.bias`, `blk.{i}.attn_k.bias`, `blk.{i}.attn_v.bias`
+    ///
+    /// Qwen2.5 models have QKV bias that must be added after GEMV.
+    /// Models without bias pass empty slices.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_layers` - Number of transformer layers
+    /// * `q_biases` - Slice of Q bias vectors (or None for each layer)
+    /// * `k_biases` - Slice of K bias vectors (or None for each layer)
+    /// * `v_biases` - Slice of V bias vectors (or None for each layer)
+    ///
+    /// # Returns
+    ///
+    /// Total bytes uploaded to GPU
+    pub fn preload_qkv_bias(
+        &mut self,
+        num_layers: usize,
+        q_biases: &[Option<&[f32]>],
+        k_biases: &[Option<&[f32]>],
+        v_biases: &[Option<&[f32]>],
+    ) -> Result<usize, GpuError> {
+        let mut total_bytes = 0usize;
+
+        for layer_idx in 0..num_layers {
+            // Q bias
+            if let Some(q_bias) = q_biases.get(layer_idx).and_then(|b| *b) {
+                let name = format!("blk.{}.attn_q.bias", layer_idx);
+                if !self.bias_cache.contains_key(&name) {
+                    let buf = GpuBuffer::from_host(&self.context, q_bias)?;
+                    total_bytes += buf.size_bytes();
+                    self.bias_cache.insert(name, buf);
+                }
+            }
+
+            // K bias
+            if let Some(k_bias) = k_biases.get(layer_idx).and_then(|b| *b) {
+                let name = format!("blk.{}.attn_k.bias", layer_idx);
+                if !self.bias_cache.contains_key(&name) {
+                    let buf = GpuBuffer::from_host(&self.context, k_bias)?;
+                    total_bytes += buf.size_bytes();
+                    self.bias_cache.insert(name, buf);
+                }
+            }
+
+            // V bias
+            if let Some(v_bias) = v_biases.get(layer_idx).and_then(|b| *b) {
+                let name = format!("blk.{}.attn_v.bias", layer_idx);
+                if !self.bias_cache.contains_key(&name) {
+                    let buf = GpuBuffer::from_host(&self.context, v_bias)?;
+                    total_bytes += buf.size_bytes();
+                    self.bias_cache.insert(name, buf);
+                }
+            }
+        }
+
+        if total_bytes > 0 {
+            eprintln!(
+                "[BIAS-FIX] Preloaded QKV bias for {} layers ({} bytes)",
+                num_layers, total_bytes
+            );
+        }
+
+        Ok(total_bytes)
+    }
+
+    /// BIAS-FIX: Check if QKV bias is cached for a layer
+    #[must_use]
+    pub fn has_qkv_bias(&self, layer_idx: usize) -> bool {
+        // Check if at least one bias exists (Qwen2.5 has all three)
+        let q_name = format!("blk.{}.attn_q.bias", layer_idx);
+        self.bias_cache.contains_key(&q_name)
     }
 
     /// PAR-023: Run ALL transformer layers GPU-resident (minimal syncs)
@@ -12523,7 +13049,7 @@ impl CudaExecutor {
         }
 
         // PAR-058-DEBUG: Check after RMSNorm (skip during graph capture)
-        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3) {
             self.stream.synchronize()?;
             let mut rmsnorm_out = vec![0.0f32; hidden_buf1.len()];
             hidden_buf1.copy_to_host(&mut rmsnorm_out)?;
@@ -12606,6 +13132,15 @@ impl CudaExecutor {
                 )?;
             },
             WeightQuantType::Q4K => {
+                // CORRECTNESS-011: Debug Q4K GEMV parameters
+                if !skip_debug && layer_idx == 0 {
+                    self.stream.synchronize()?;
+                    let mut input_check = vec![0.0f32; hidden_buf1.len()];
+                    hidden_buf1.copy_to_host(&mut input_check)?;
+                    eprintln!("[CORRECTNESS-011-L0] Q4K GEMV params: n={}, k={}", q_dim, hidden_dim);
+                    eprintln!("[CORRECTNESS-011-L0] Input (hidden_buf1): first 5 = {:?}", &input_check[..5.min(input_check.len())]);
+                    eprintln!("[CORRECTNESS-011-L0] Weight ptr = {:#x}, len = {}", layer_weights.attn_q_ptr, layer_weights.attn_q_len);
+                }
                 self.q4k_gemv_into(
                     layer_weights.attn_q_ptr,
                     &hidden_buf1,
@@ -12613,6 +13148,13 @@ impl CudaExecutor {
                     q_dim,
                     hidden_dim,
                 )?;
+                // CORRECTNESS-011: Debug Q output
+                if !skip_debug && layer_idx == 0 {
+                    self.stream.synchronize()?;
+                    let mut q_check = vec![0.0f32; q_buf.len()];
+                    q_buf.copy_to_host(&mut q_check)?;
+                    eprintln!("[CORRECTNESS-011-L0] Q output: first 5 = {:?}", &q_check[..5.min(q_check.len())]);
+                }
             },
         }
         match layer_weights.attn_k_qtype {
@@ -12750,8 +13292,80 @@ impl CudaExecutor {
             self.stop_brick_timer(timer_qkv, 1);
         }
 
+        // BIAS-FIX: Add QKV bias after GEMV (Qwen2.5 models have QKV bias)
+        // Only add if bias exists (len > 0)
+        if layer_weights.attn_q_bias_len > 0 {
+            // Create non-owning buffer wrapper from device pointer
+            // SAFETY: bias_ptr is valid device memory owned by bias_cache
+            let q_bias_buf = unsafe {
+                GpuBuffer::<f32>::from_raw_parts(
+                    layer_weights.attn_q_bias_ptr,
+                    layer_weights.attn_q_bias_len,
+                )
+            };
+
+            // Add bias in-place: q_buf = q_buf + q_bias
+            self.residual_add_into(&q_buf, &q_bias_buf, &q_buf, q_dim)?;
+
+            // Prevent Drop from freeing borrowed memory
+            std::mem::forget(q_bias_buf);
+
+            // Debug log for layer 0, 4, 5
+            if !skip_debug && (layer_idx == 0 || layer_idx == 4 || layer_idx == 5) {
+                self.stream.synchronize()?;
+                let mut q_check = vec![0.0f32; q_buf.len()];
+                q_buf.copy_to_host(&mut q_check)?;
+                eprintln!(
+                    "[BIAS-FIX-L{}] Q after bias: first 5 = {:?}",
+                    layer_idx, &q_check[..5.min(q_check.len())]
+                );
+            }
+        }
+        if layer_weights.attn_k_bias_len > 0 {
+            let k_bias_buf = unsafe {
+                GpuBuffer::<f32>::from_raw_parts(
+                    layer_weights.attn_k_bias_ptr,
+                    layer_weights.attn_k_bias_len,
+                )
+            };
+            self.residual_add_into(&k_buf, &k_bias_buf, &k_buf, kv_dim)?;
+            std::mem::forget(k_bias_buf);
+
+            // Debug log for layer 0, 4, 5
+            if !skip_debug && (layer_idx == 0 || layer_idx == 4 || layer_idx == 5) {
+                self.stream.synchronize()?;
+                let mut k_check = vec![0.0f32; k_buf.len()];
+                k_buf.copy_to_host(&mut k_check)?;
+                eprintln!(
+                    "[BIAS-FIX-L{}] K after bias: first 5 = {:?}",
+                    layer_idx, &k_check[..5.min(k_check.len())]
+                );
+            }
+        }
+        if layer_weights.attn_v_bias_len > 0 {
+            let v_bias_buf = unsafe {
+                GpuBuffer::<f32>::from_raw_parts(
+                    layer_weights.attn_v_bias_ptr,
+                    layer_weights.attn_v_bias_len,
+                )
+            };
+            self.residual_add_into(&v_buf, &v_bias_buf, &v_buf, kv_dim)?;
+            std::mem::forget(v_bias_buf);
+
+            // Debug log for layer 0, 4, 5
+            if !skip_debug && (layer_idx == 0 || layer_idx == 4 || layer_idx == 5) {
+                self.stream.synchronize()?;
+                let mut v_check = vec![0.0f32; v_buf.len()];
+                v_buf.copy_to_host(&mut v_check)?;
+                eprintln!(
+                    "[BIAS-FIX-L{}] V after bias: first 5 = {:?}",
+                    layer_idx, &v_check[..5.min(v_check.len())]
+                );
+            }
+        }
+
         // PAR-058-DEBUG: Check Q/K/V after projections (skip during graph capture)
-        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3 || layer_idx == 5) {
             self.stream.synchronize()?;
             // Print weight pointers
             eprintln!(
@@ -12895,7 +13509,7 @@ impl CudaExecutor {
                 }
             }
 
-            if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+            if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3) {
                 // Debug: download and print (only for layer 0/2, skip during graph capture)
                 self.stream.synchronize()?;
                 let mut q_host = vec![0.0f32; q_buf.len()];
@@ -12934,7 +13548,7 @@ impl CudaExecutor {
         }
 
         // PAR-058-DEBUG: Check attention output (skip during graph capture)
-        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3) {
             // PAR-058: Must sync on compute_stream since attention kernel runs there
             self.compute_stream.synchronize()?;
             let mut attn_out = vec![0.0f32; attn_out_buf.len()];
@@ -13020,7 +13634,7 @@ impl CudaExecutor {
         }
 
         // PAR-058-DEBUG: Check output projection (skip during graph capture)
-        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3) {
             self.stream.synchronize()?;
             let mut out_proj = vec![0.0f32; hidden_buf1.len()];
             hidden_buf1.copy_to_host(&mut out_proj)?;
@@ -13054,7 +13668,7 @@ impl CudaExecutor {
         }
 
         // PAR-058-DEBUG: Check residual1 output (skip during graph capture)
-        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3) {
             self.stream.synchronize()?;
             let mut resid1 = vec![0.0f32; input_staging.len()];
             input_staging.copy_to_host(&mut resid1)?;
@@ -13142,7 +13756,7 @@ impl CudaExecutor {
         }
 
         // PAR-058-DEBUG: Check FFN gate/up outputs (skip during graph capture)
-        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2) {
+        if !skip_debug && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3) {
             self.stream.synchronize()?;
             let mut gate_out = vec![0.0f32; ffn_gate_buf.len()];
             ffn_gate_buf.copy_to_host(&mut gate_out)?;
@@ -14243,6 +14857,62 @@ impl CudaExecutor {
 
         // Run GPU-resident layer
         let output_gpu = self.transformer_layer_gpu(
+            &input_gpu,
+            layer_idx,
+            layer_prefix,
+            hidden_dim,
+            intermediate_dim,
+            &attn_gamma_gpu,
+            &ffn_gamma_gpu,
+            epsilon,
+        )?;
+
+        // Single sync and download
+        self.stream.synchronize()?;
+        output_gpu.copy_to_host(output)?;
+
+        Ok(())
+    }
+
+    /// TILING-SPEC-001: Tile-profiled transformer layer with host input/output.
+    ///
+    /// Convenience method for profiling single-layer execution to identify bottlenecks.
+    /// Enable tile profiling first with `enable_tile_profiling()`, then call this method,
+    /// then examine results with `tile_summary()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// cuda_model.enable_tile_profiling();
+    /// cuda_model.transformer_layer_host_profiled(...)?;
+    /// println!("{}", cuda_model.tile_summary());
+    /// // Output:
+    /// // === Tile Profiling Summary (TILING-SPEC-001) ===
+    /// // Level       Samples   Avg µs    GFLOP/s   AI      Elements
+    /// // macro             3    1500.0     26.67  0.50    4096
+    /// // midi              1     200.0      5.12  0.25    1024
+    /// // micro             4      10.0      2.05  4.00     512
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn transformer_layer_host_profiled(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        layer_idx: usize,
+        layer_prefix: &str,
+        hidden_dim: u32,
+        intermediate_dim: u32,
+        attn_norm_gamma: &[f32],
+        ffn_norm_gamma: &[f32],
+        epsilon: f32,
+    ) -> Result<(), GpuError> {
+        // Upload inputs
+        let input_gpu = GpuBuffer::from_host(&self.context, input)?;
+        let attn_gamma_gpu = GpuBuffer::from_host(&self.context, attn_norm_gamma)?;
+        let ffn_gamma_gpu = GpuBuffer::from_host(&self.context, ffn_norm_gamma)?;
+
+        // Run GPU-resident tiled profiled layer
+        let output_gpu = self.transformer_layer_gpu_tiled_profiled(
             &input_gpu,
             layer_idx,
             layer_prefix,
